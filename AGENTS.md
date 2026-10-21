@@ -68,6 +68,22 @@ Every mutating queue operation has a variant that takes
 - The result of a variant is valid before the commit of the caller but not
   durable until it.
 
+## Addressed claims
+
+`claim_by_id` and `claim_by_id_in` claim exactly one task of the queue, chosen
+by its identifier.
+
+- An addressed claim never falls back to another task. A target that is
+  absent, of another namespace or queue, terminal, not ready, already running
+  or locked by another transaction reports `None` and changes nothing.
+- An addressed claim shares the statement and the lease, attempt and fencing
+  mechanics of the ordinary claim: `sql/store_claim.sql` takes the target as
+  an optional bind, `src/store.rs::claim_task` takes an optional `TaskId` and
+  the private `claim_on` helper of `src/queue.rs` forwards `None` or `Some`.
+- An addressed claim bypasses the order of the queue, never the rules of the
+  queue. The decision which task is eligible stays with the caller, together
+  with the locks that guard that decision.
+
 ## Tests
 
 The live tests of `tests/postgres.rs` are ignored by default and run against

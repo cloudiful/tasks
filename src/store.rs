@@ -269,12 +269,17 @@ pub(crate) async fn list_attempts(
 }
 
 /// Claims the next ready task of the queue.
+///
+/// A target restricts the claim to one task of the queue. The claim is `None`
+/// when the target is not ready, not of this queue or locked by another
+/// transaction, never another task of the queue.
 pub(crate) async fn claim_task(
     connection: &mut PgConnection,
     namespace: &Namespace,
     queue: &QueueName,
     worker_id: &str,
     lease_ttl: Duration,
+    target: Option<TaskId>,
 ) -> Result<Option<crate::model::Claim>> {
     let row = sqlx::query_file_as!(
         AttemptRow,
@@ -285,6 +290,7 @@ pub(crate) async fn claim_task(
         Uuid::new_v4(),
         Uuid::new_v4(),
         duration_millis(lease_ttl),
+        target.map(|task_id| task_id.as_uuid()),
     )
     .fetch_optional(&mut *connection)
     .await?;

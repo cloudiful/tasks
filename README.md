@@ -112,10 +112,22 @@ The semantics of the store:
 | --- | --- |
 | Idempotency | The same key with the same request returns the existing task, also when it already finished. The same key with a different request is an `IdempotencyConflict`. A request without a key always creates a task. |
 | Claim | Only a ready task is claimed, highest priority first, then the oldest ready one. The claim holds the lease of the task and carries a fresh fencing token. |
+| Addressed claim | `claim_by_id` claims exactly the requested task and never another one. The task must be ready and of the queue, otherwise the call reports `None` and claims nothing. The call bypasses the order of the queue, the decision which task is eligible stays with the caller. `claim_by_id_in` runs in the transaction of the caller. |
 | Lease | The lease expires on the clock of the database. A renewal, a progress report, a completion and a failure need the attempt, its token and an unexpired lease, otherwise the call reports `LeaseLost` and changes nothing. The lease is checked against the clock of the database after the locks of the operation are taken, so a call that waits for a lock cannot use an expired lease. |
 | Recovery | An expired attempt is sealed as interrupted and its task is scheduled again while the budget of the task allows it, otherwise the task fails. The recovery is idempotent. |
 | Cancellation | A queued task is cancelled at once, a running task is marked for cancellation. A cancellation that was requested before the completion wins: the task ends as cancelled and its result is discarded. External side effects cannot be undone. |
 | Retry | A failure is permanent unless the caller marks it retryable, and a task is only retried again when the caller grants additional attempts with `retry_failed`. The new budget is the number of the attempts that ran plus the granted attempts, an unused budget is not granted again and the budget can shrink. The attempt history and the request of the task stay untouched. |
+
+A caller that admits a task itself claims that task by its identifier:
+
+```rust
+if let Some(claim) = queue.claim_by_id(task_id, "worker-1").await? {
+    queue.complete(claim.attempt(), Some(json!({"ok": true}))).await?;
+}
+```
+
+The claim needs the same lease and the same fencing token as every other
+claim, and the caller keeps the decision which task is eligible.
 
 ### The worker
 

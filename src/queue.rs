@@ -160,7 +160,7 @@ impl Queue {
     pub async fn claim(&self, worker_id: &str) -> Result<Option<Claim>> {
         let worker_id = validate_worker_id(worker_id)?;
         let mut connection = self.pool.acquire().await?;
-        self.claim_on(&mut connection, worker_id).await
+        self.claim_on(&mut connection, worker_id, None).await
     }
 
     /// Claims the next ready task of the queue in the transaction of the
@@ -176,7 +176,40 @@ impl Queue {
     ) -> Result<Option<Claim>> {
         let worker_id = validate_worker_id(worker_id)?;
         self.verify_instance(transaction).await?;
-        self.claim_on(transaction, worker_id).await
+        self.claim_on(transaction, worker_id, None).await
+    }
+
+    /// Claims one task of the queue by its identifier.
+    ///
+    /// The task must be ready and of this queue, otherwise the call reports
+    /// `None` and never claims another task of the queue. The claim holds the
+    /// lease of the task until it expires, and carries the fencing token of
+    /// the new attempt.
+    ///
+    /// The call bypasses the order of the queue for this one task. The
+    /// decision which task is eligible stays with the caller.
+    pub async fn claim_by_id(&self, task_id: TaskId, worker_id: &str) -> Result<Option<Claim>> {
+        let worker_id = validate_worker_id(worker_id)?;
+        let mut connection = self.pool.acquire().await?;
+        self.claim_on(&mut connection, worker_id, Some(task_id))
+            .await
+    }
+
+    /// Claims one task of the queue by its identifier in the transaction of
+    /// the caller.
+    ///
+    /// The claim and the business write of the caller are only durable when
+    /// the caller commits the transaction. The transaction must belong to the
+    /// schema instance of this queue, otherwise the call is refused.
+    pub async fn claim_by_id_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        task_id: TaskId,
+        worker_id: &str,
+    ) -> Result<Option<Claim>> {
+        let worker_id = validate_worker_id(worker_id)?;
+        self.verify_instance(transaction).await?;
+        self.claim_on(transaction, worker_id, Some(task_id)).await
     }
 
     /// Renews the lease of an attempt.
@@ -421,6 +454,7 @@ impl Queue {
         &self,
         connection: &mut PgConnection,
         worker_id: &str,
+        target: Option<TaskId>,
     ) -> Result<Option<Claim>> {
         store::claim_task(
             connection,
@@ -428,6 +462,7 @@ impl Queue {
             &self.queue,
             worker_id,
             self.lease_ttl,
+            target,
         )
         .await
     }

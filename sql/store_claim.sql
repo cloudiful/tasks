@@ -5,6 +5,7 @@ WITH candidate AS (
       AND queue = $2
       AND status = 'queued'
       AND available_at <= clock_timestamp()
+      AND ($7::uuid IS NULL OR id = $7)
     ORDER BY priority DESC, available_at, created_at, id
     FOR UPDATE SKIP LOCKED
     LIMIT 1

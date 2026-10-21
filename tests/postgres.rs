@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use cloudiful_tasks::{
-    AttemptStatus, EnqueueRequest, Error, Failure, ProgressUpdate, RetryPolicy, TaskKind,
+    AttemptStatus, EnqueueRequest, Error, Failure, ProgressUpdate, RetryPolicy, TaskId, TaskKind,
     TaskStatus,
 };
 use serde_json::json;
@@ -1373,4 +1373,309 @@ async fn a_lock_wait_that_crosses_the_expiry_refuses_the_borrowed_renewal() {
     assert_eq!(app_domain_count(&pool).await, 0);
     let stored = queue.get(task.task().id()).await.unwrap().unwrap();
     assert_eq!(stored.status(), TaskStatus::Running);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn an_addressed_claim_selects_the_requested_task() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+
+    let first = queue.enqueue(request().with_priority(10)).await.unwrap();
+    let second = queue.enqueue(request().with_priority(5)).await.unwrap();
+    let third = queue.enqueue(request().with_priority(0)).await.unwrap();
+
+    let claim = queue
+        .claim_by_id(third.task().id(), "worker")
+        .await
+        .unwrap()
+        .expect("the requested task must be claimed");
+    assert_eq!(claim.task().id(), third.task().id());
+    assert_eq!(claim.attempt().attempt_number(), 1);
+
+    // The earlier candidates are untouched.
+    for task in [&first, &second] {
+        assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 0);
+        let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+        assert_eq!(stored.status(), TaskStatus::Queued);
+    }
+
+    // The order of the queue is unchanged.
+    let next = queue.claim("worker").await.unwrap().unwrap();
+    assert_eq!(next.task().id(), first.task().id());
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn an_addressed_claim_of_an_ineligible_task_is_refused() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+
+    // A running task, it is the only ready task when it is claimed.
+    let running = queue.enqueue(request()).await.unwrap();
+    let claimed = queue
+        .claim("worker")
+        .await
+        .unwrap()
+        .expect("the task must be claimed");
+    assert_eq!(claimed.task().id(), running.task().id());
+
+    // The ready task that must never be claimed as a fallback.
+    let eligible = queue.enqueue(request()).await.unwrap();
+
+    let other_namespace = open_queue(&pool, "other-ns", QUEUE).await;
+    let foreign = other_namespace.enqueue(request()).await.unwrap();
+    let other_queue = open_queue(&pool, NAMESPACE, "other-q").await;
+    let elsewhere = other_queue.enqueue(request()).await.unwrap();
+    let terminal = queue.enqueue(request()).await.unwrap();
+    queue.request_cancel(terminal.task().id()).await.unwrap();
+    let later = queue
+        .enqueue(request().with_available_at(Utc::now() + ChronoDuration::hours(1)))
+        .await
+        .unwrap();
+
+    assert!(
+        queue
+            .claim_by_id(TaskId::new(), "worker")
+            .await
+            .unwrap()
+            .is_none(),
+        "an absent task must not be claimed"
+    );
+    assert!(
+        queue
+            .claim_by_id(foreign.task().id(), "worker")
+            .await
+            .unwrap()
+            .is_none(),
+        "a task of another namespace must not be claimed"
+    );
+    assert!(
+        queue
+            .claim_by_id(elsewhere.task().id(), "worker")
+            .await
+            .unwrap()
+            .is_none(),
+        "a task of another queue must not be claimed"
+    );
+    assert!(
+        queue
+            .claim_by_id(terminal.task().id(), "worker")
+            .await
+            .unwrap()
+            .is_none(),
+        "a terminal task must not be claimed"
+    );
+    assert!(
+        queue
+            .claim_by_id(later.task().id(), "worker")
+            .await
+            .unwrap()
+            .is_none(),
+        "a task that is not ready must not be claimed"
+    );
+    assert!(
+        queue
+            .claim_by_id(running.task().id(), "worker")
+            .await
+            .unwrap()
+            .is_none(),
+        "a running task must not be claimed"
+    );
+
+    // None of the refused calls fell back to another task.
+    for task in [&eligible, &foreign, &elsewhere, &terminal, &later] {
+        assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 0);
+    }
+    let stored = queue.get(eligible.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Queued);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn an_addressed_claim_of_a_locked_task_is_refused() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+
+    // Another transaction holds the lock of the task.
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query_file!(
+        "sql/tests/addressed_lock_task.sql",
+        task.task().id().as_uuid()
+    )
+    .fetch_one(&mut *blocker)
+    .await
+    .expect("the task must be lockable");
+
+    assert!(
+        queue
+            .claim_by_id(task.task().id(), "worker")
+            .await
+            .unwrap()
+            .is_none(),
+        "a locked task must not be claimed"
+    );
+    assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 0);
+    blocker.rollback().await.unwrap();
+
+    let claim = queue
+        .claim_by_id(task.task().id(), "worker")
+        .await
+        .unwrap()
+        .expect("the task must be claimed");
+    assert_eq!(claim.task().id(), task.task().id());
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn two_concurrent_addressed_claims_give_the_lease_to_one_worker() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let first_queue = queue.clone();
+    let first_barrier = barrier.clone();
+    let first_id = task.task().id();
+    let first = tokio::spawn(async move {
+        first_barrier.wait().await;
+        first_queue.claim_by_id(first_id, "worker-a").await
+    });
+    let second_queue = queue.clone();
+    let second_barrier = barrier.clone();
+    let second_id = task.task().id();
+    let second = tokio::spawn(async move {
+        second_barrier.wait().await;
+        second_queue.claim_by_id(second_id, "worker-b").await
+    });
+
+    let first = first.await.unwrap().unwrap();
+    let second = second.await.unwrap().unwrap();
+    let claims = [first, second];
+    assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
+
+    let claim = claims.iter().flatten().next().unwrap();
+    assert_eq!(claim.task().id(), task.task().id());
+    assert_eq!(claim.attempt().attempt_number(), 1);
+    assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn an_addressed_claim_and_a_generic_claim_give_the_lease_to_one_worker() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let addressed_queue = queue.clone();
+    let addressed_barrier = barrier.clone();
+    let addressed_id = task.task().id();
+    let addressed = tokio::spawn(async move {
+        addressed_barrier.wait().await;
+        addressed_queue.claim_by_id(addressed_id, "worker-a").await
+    });
+    let generic_queue = queue.clone();
+    let generic_barrier = barrier.clone();
+    let generic = tokio::spawn(async move {
+        generic_barrier.wait().await;
+        generic_queue.claim("worker-b").await
+    });
+
+    let addressed = addressed.await.unwrap().unwrap();
+    let generic = generic.await.unwrap().unwrap();
+    let claims = [addressed, generic];
+    assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
+
+    let claim = claims.iter().flatten().next().unwrap();
+    assert_eq!(claim.task().id(), task.task().id());
+    assert_eq!(claim.attempt().attempt_number(), 1);
+    assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn an_addressed_claim_in_a_transaction_is_atomic_with_the_domain_write() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+
+    // The rollback discards the claim and the domain write together.
+    let mut transaction = pool.begin().await.unwrap();
+    let claim = queue
+        .claim_by_id_in(&mut transaction, task.task().id(), "worker")
+        .await
+        .unwrap()
+        .expect("the requested task must be claimed");
+    write_app_domain(&mut transaction, "claimed").await;
+    transaction.rollback().await.unwrap();
+
+    assert_eq!(claim.task().id(), task.task().id());
+    assert_eq!(app_domain_count(&pool).await, 0);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Queued);
+    assert_eq!(
+        attempt_count(&pool, task.task().id().as_uuid()).await,
+        0,
+        "a rolled back claim must leave no attempt"
+    );
+
+    // The commit makes the claim and the domain write durable together.
+    let mut transaction = pool.begin().await.unwrap();
+    let claim = queue
+        .claim_by_id_in(&mut transaction, task.task().id(), "worker")
+        .await
+        .unwrap()
+        .expect("the requested task must be claimed");
+    write_app_domain(&mut transaction, "claimed").await;
+    transaction.commit().await.unwrap();
+
+    assert_eq!(claim.task().id(), task.task().id());
+    assert_eq!(app_domain_count(&pool).await, 1);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Running);
+    assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn an_addressed_claim_in_a_transaction_of_another_schema_instance_is_refused() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+
+    // The schema is migrated again, the queue of the caller holds the
+    // instance of the schema before the migration.
+    reset(&pool).await;
+    let task = queue.enqueue(request()).await.unwrap();
+
+    let mut transaction = pool.begin().await.unwrap();
+    write_app_domain(&mut transaction, "refused").await;
+    let error = queue
+        .claim_by_id_in(&mut transaction, task.task().id(), "worker")
+        .await
+        .expect_err("a transaction of another schema instance must be refused");
+    assert!(
+        matches!(error, Error::InstanceMismatch { .. }),
+        "unexpected error: {error}"
+    );
+    transaction.commit().await.unwrap();
+
+    assert_eq!(
+        app_domain_count(&pool).await,
+        1,
+        "the refused claim must not write the domain state"
+    );
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Queued);
+    assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 0);
 }
