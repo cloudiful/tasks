@@ -168,8 +168,20 @@ The semantics of the worker:
 
 ### The transaction API
 
-`enqueue_in`, `complete_in` and `fail_in` run inside the transaction of the
+Every mutating operation has a variant that runs inside the transaction of the
 caller, so a business write and the task share one commit:
+
+| Operation | Variant |
+| --- | --- |
+| Enqueue | `enqueue_in` |
+| Claim | `claim_in` |
+| Renew the lease | `renew_in` |
+| Progress report | `report_progress_in` |
+| Complete | `complete_in` |
+| Fail | `fail_in` |
+| Request the cancellation | `request_cancel_in` |
+| Manual retry | `retry_failed_in` |
+| Recover the expired leases | `recover_expired_in` |
 
 ```rust
 let mut transaction = pool.begin().await?;
@@ -178,10 +190,18 @@ write_business_row(&mut transaction).await?;
 transaction.commit().await?;
 ```
 
-The transaction must belong to the database of the queue, otherwise the call
-is refused. A refused completion must not be ignored: roll the transaction
-back, otherwise the business side effects of an attempt that lost its lease
-are committed.
+A variant returns the same result as its counterpart that commits on its own
+and never begins, commits or rolls back a transaction. The commit and the
+rollback stay with the caller, so the result of a variant is valid before the
+commit of the caller but not durable until it. `renew_in` and
+`report_progress_in` hold the lock of the attempt until the caller ends the
+transaction, so the lease is checked against the clock of the database after
+the lock was taken.
+
+The transaction must belong to the schema instance of the queue, otherwise the
+call is refused before it writes. A refused operation must not be ignored: roll
+the transaction back, otherwise the business side effects of an attempt that
+lost its lease are committed.
 
 Two examples show both sides of the library:
 

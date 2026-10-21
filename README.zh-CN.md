@@ -161,8 +161,20 @@ worker 的语义：
 
 ### 事务 API
 
-`enqueue_in`、`complete_in` 和 `fail_in` 运行在调用方的事务中，因此业务写入和
-任务共享同一次提交：
+每个写操作都有一个在调用方事务中运行的变体，因此业务写入和任务共享同一次
+提交：
+
+| 操作 | 变体 |
+| --- | --- |
+| 入队 | `enqueue_in` |
+| 领取 | `claim_in` |
+| 续租 | `renew_in` |
+| 进度报告 | `report_progress_in` |
+| 完成 | `complete_in` |
+| 失败 | `fail_in` |
+| 请求取消 | `request_cancel_in` |
+| 手动重试 | `retry_failed_in` |
+| 恢复过期租约 | `recover_expired_in` |
 
 ```rust
 let mut transaction = pool.begin().await?;
@@ -171,8 +183,14 @@ write_business_row(&mut transaction).await?;
 transaction.commit().await?;
 ```
 
-该事务必须属于队列所在的数据库，否则调用会被拒绝。被拒绝的完成不能被忽略：
-请回滚事务，否则已经失去租约的尝试所产生的业务副作用会被提交。
+变体返回的结果与自行提交的对应操作相同，并且从不开启、提交或回滚事务。提交和
+回滚由调用方负责，因此变体的结果在调用方提交之前是有效的，但在提交之前并不
+持久。`renew_in` 和 `report_progress_in` 会持有该尝试的行锁直到调用方结束事务，
+因此租约是在取得锁之后才按数据库的时钟校验的。
+
+该事务必须属于队列所在的 schema 实例，否则调用会在写入之前被拒绝。被拒绝的
+操作不能被忽略：请回滚事务，否则已经失去租约的尝试所产生的业务副作用会被
+提交。
 
 两个示例展示了本库的两侧：
 

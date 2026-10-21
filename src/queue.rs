@@ -113,8 +113,8 @@ impl Queue {
     /// Enqueues a task in the transaction of the caller.
     ///
     /// The task and its wake up notification are only durable when the caller
-    /// commits the transaction. The transaction must belong to the database of
-    /// this queue, otherwise the call is refused.
+    /// commits the transaction. The transaction must belong to the schema
+    /// instance of this queue, otherwise the call is refused.
     pub async fn enqueue_in(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
@@ -160,14 +160,23 @@ impl Queue {
     pub async fn claim(&self, worker_id: &str) -> Result<Option<Claim>> {
         let worker_id = validate_worker_id(worker_id)?;
         let mut connection = self.pool.acquire().await?;
-        store::claim_task(
-            &mut connection,
-            &self.namespace,
-            &self.queue,
-            worker_id,
-            self.lease_ttl,
-        )
-        .await
+        self.claim_on(&mut connection, worker_id).await
+    }
+
+    /// Claims the next ready task of the queue in the transaction of the
+    /// caller.
+    ///
+    /// The claim and the business write of the caller are only durable when
+    /// the caller commits the transaction. The transaction must belong to the
+    /// schema instance of this queue, otherwise the call is refused.
+    pub async fn claim_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        worker_id: &str,
+    ) -> Result<Option<Claim>> {
+        let worker_id = validate_worker_id(worker_id)?;
+        self.verify_instance(transaction).await?;
+        self.claim_on(transaction, worker_id).await
     }
 
     /// Renews the lease of an attempt.
@@ -177,14 +186,7 @@ impl Queue {
     /// lock was taken.
     pub async fn renew(&self, attempt: &Attempt) -> Result<DateTime<Utc>> {
         let mut transaction = self.pool.begin().await?;
-        let outcome = store::renew_attempt(
-            &mut transaction,
-            &self.namespace,
-            &self.queue,
-            attempt,
-            self.lease_ttl,
-        )
-        .await;
+        let outcome = self.renew_on(&mut transaction, attempt).await;
         match outcome {
             Ok(expiry) => {
                 transaction.commit().await?;
@@ -197,6 +199,23 @@ impl Queue {
         }
     }
 
+    /// Renews the lease of an attempt in the transaction of the caller.
+    ///
+    /// The renewal and the business write of the caller are only durable when
+    /// the caller commits the transaction. The transaction must belong to the
+    /// schema instance of this queue, otherwise the call is refused. The lock
+    /// of the attempt is held until the caller ends its transaction, so the
+    /// lease is checked against the clock of the database after the lock was
+    /// taken.
+    pub async fn renew_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        attempt: &Attempt,
+    ) -> Result<DateTime<Utc>> {
+        self.verify_instance(transaction).await?;
+        self.renew_on(transaction, attempt).await
+    }
+
     /// Writes the progress report of a running attempt.
     ///
     /// The lock of the attempt and the report run in one transaction, so that
@@ -205,26 +224,9 @@ impl Queue {
     pub async fn report_progress(&self, attempt: &Attempt, report: &ProgressUpdate) -> Result<()> {
         report.validate()?;
         let mut transaction = self.pool.begin().await?;
-        let outcome = match store::lock_attempt(
-            &mut transaction,
-            &self.namespace,
-            &self.queue,
-            attempt,
-        )
-        .await
-        {
-            Ok(()) => {
-                progress::report_progress(
-                    &mut transaction,
-                    &self.namespace,
-                    &self.queue,
-                    attempt,
-                    report,
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        };
+        let outcome = self
+            .report_progress_on(&mut transaction, attempt, report)
+            .await;
         match outcome {
             Ok(()) => {
                 transaction.commit().await?;
@@ -235,6 +237,26 @@ impl Queue {
                 Err(error)
             }
         }
+    }
+
+    /// Writes the progress report of a running attempt in the transaction of
+    /// the caller.
+    ///
+    /// The report and the business write of the caller are only durable when
+    /// the caller commits the transaction. The transaction must belong to the
+    /// schema instance of this queue, otherwise the call is refused. The lock
+    /// of the attempt is held until the caller ends its transaction, so the
+    /// lease is checked against the clock of the database after the lock was
+    /// taken.
+    pub async fn report_progress_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        attempt: &Attempt,
+        report: &ProgressUpdate,
+    ) -> Result<()> {
+        report.validate()?;
+        self.verify_instance(transaction).await?;
+        self.report_progress_on(transaction, attempt, report).await
     }
 
     /// Completes an attempt and the task it belongs to.
@@ -318,7 +340,21 @@ impl Queue {
     /// cancellation, and a terminal task is reported unchanged.
     pub async fn request_cancel(&self, task_id: TaskId) -> Result<Task> {
         let mut connection = self.pool.acquire().await?;
-        store::cancel_task(&mut connection, &self.namespace, &self.queue, task_id).await
+        self.cancel_on(&mut connection, task_id).await
+    }
+
+    /// Requests the cancellation of a task in the transaction of the caller.
+    ///
+    /// The cancellation and the business write of the caller are only durable
+    /// when the caller commits the transaction. The transaction must belong to
+    /// the schema instance of this queue, otherwise the call is refused.
+    pub async fn request_cancel_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        task_id: TaskId,
+    ) -> Result<Task> {
+        self.verify_instance(transaction).await?;
+        self.cancel_on(transaction, task_id).await
     }
 
     /// Schedules a failed task again with a larger budget.
@@ -330,27 +366,28 @@ impl Queue {
     /// The attempt history of the task and its request stay untouched. A task
     /// that is not failed is not retried.
     pub async fn retry_failed(&self, task_id: TaskId, additional_attempts: u32) -> Result<Task> {
-        if additional_attempts == 0 {
-            return Err(Error::Validation {
-                field: "additional_attempts",
-                reason: "must be at least 1".to_owned(),
-            });
-        }
-        if additional_attempts > store::MAX_ADDITIONAL_ATTEMPTS {
-            return Err(Error::Validation {
-                field: "additional_attempts",
-                reason: format!("must not exceed {}", store::MAX_ADDITIONAL_ATTEMPTS),
-            });
-        }
+        let additional_attempts = validate_additional_attempts(additional_attempts)?;
         let mut connection = self.pool.acquire().await?;
-        store::retry_failed_task(
-            &mut connection,
-            &self.namespace,
-            &self.queue,
-            task_id,
-            additional_attempts,
-        )
-        .await
+        self.retry_failed_on(&mut connection, task_id, additional_attempts)
+            .await
+    }
+
+    /// Schedules a failed task again with a larger budget in the transaction
+    /// of the caller.
+    ///
+    /// The retry and the business write of the caller are only durable when
+    /// the caller commits the transaction. The transaction must belong to the
+    /// schema instance of this queue, otherwise the call is refused.
+    pub async fn retry_failed_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        task_id: TaskId,
+        additional_attempts: u32,
+    ) -> Result<Task> {
+        let additional_attempts = validate_additional_attempts(additional_attempts)?;
+        self.verify_instance(transaction).await?;
+        self.retry_failed_on(transaction, task_id, additional_attempts)
+            .await
     }
 
     /// Seals the attempts whose lease expired and schedules their tasks again.
@@ -361,7 +398,91 @@ impl Queue {
     pub async fn recover_expired(&self, limit: u32) -> Result<Vec<Task>> {
         let limit = validate_limit(limit, MAX_RECOVERY_LIMIT, "limit")?;
         let mut connection = self.pool.acquire().await?;
-        store::recover_expired_tasks(&mut connection, &self.namespace, &self.queue, limit).await
+        self.recover_expired_on(&mut connection, limit).await
+    }
+
+    /// Seals the attempts whose lease expired and schedules their tasks again
+    /// in the transaction of the caller.
+    ///
+    /// The recovery and the business write of the caller are only durable when
+    /// the caller commits the transaction. The transaction must belong to the
+    /// schema instance of this queue, otherwise the call is refused.
+    pub async fn recover_expired_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        limit: u32,
+    ) -> Result<Vec<Task>> {
+        let limit = validate_limit(limit, MAX_RECOVERY_LIMIT, "limit")?;
+        self.verify_instance(transaction).await?;
+        self.recover_expired_on(transaction, limit).await
+    }
+
+    async fn claim_on(
+        &self,
+        connection: &mut PgConnection,
+        worker_id: &str,
+    ) -> Result<Option<Claim>> {
+        store::claim_task(
+            connection,
+            &self.namespace,
+            &self.queue,
+            worker_id,
+            self.lease_ttl,
+        )
+        .await
+    }
+
+    async fn renew_on(
+        &self,
+        connection: &mut PgConnection,
+        attempt: &Attempt,
+    ) -> Result<DateTime<Utc>> {
+        store::renew_attempt(
+            connection,
+            &self.namespace,
+            &self.queue,
+            attempt,
+            self.lease_ttl,
+        )
+        .await
+    }
+
+    async fn report_progress_on(
+        &self,
+        connection: &mut PgConnection,
+        attempt: &Attempt,
+        report: &ProgressUpdate,
+    ) -> Result<()> {
+        store::lock_attempt(connection, &self.namespace, &self.queue, attempt).await?;
+        progress::report_progress(connection, &self.namespace, &self.queue, attempt, report).await
+    }
+
+    async fn cancel_on(&self, connection: &mut PgConnection, task_id: TaskId) -> Result<Task> {
+        store::cancel_task(connection, &self.namespace, &self.queue, task_id).await
+    }
+
+    async fn retry_failed_on(
+        &self,
+        connection: &mut PgConnection,
+        task_id: TaskId,
+        additional_attempts: u32,
+    ) -> Result<Task> {
+        store::retry_failed_task(
+            connection,
+            &self.namespace,
+            &self.queue,
+            task_id,
+            additional_attempts,
+        )
+        .await
+    }
+
+    async fn recover_expired_on(
+        &self,
+        connection: &mut PgConnection,
+        limit: u32,
+    ) -> Result<Vec<Task>> {
+        store::recover_expired_tasks(connection, &self.namespace, &self.queue, limit).await
     }
 
     async fn fail_in_transaction(
@@ -412,6 +533,22 @@ fn validate_worker_id(worker_id: &str) -> Result<&str> {
         });
     }
     Ok(worker_id)
+}
+
+fn validate_additional_attempts(additional_attempts: u32) -> Result<u32> {
+    if additional_attempts == 0 {
+        return Err(Error::Validation {
+            field: "additional_attempts",
+            reason: "must be at least 1".to_owned(),
+        });
+    }
+    if additional_attempts > store::MAX_ADDITIONAL_ATTEMPTS {
+        return Err(Error::Validation {
+            field: "additional_attempts",
+            reason: format!("must not exceed {}", store::MAX_ADDITIONAL_ATTEMPTS),
+        });
+    }
+    Ok(additional_attempts)
 }
 
 #[cfg(test)]

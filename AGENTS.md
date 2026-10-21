@@ -46,6 +46,43 @@ DATABASE_URL='postgresql://dev@localhost:57664/cloudiful_tasks_dev?host=<repo>/t
   cargo sqlx prepare -- --all-targets
 ```
 
+The development database also holds the test owned `app_domain` schema, so the
+query macros of the test statements can be described. The fixture is created by
+`sql/tests/transaction_app_domain_setup.sql`.
+
+## Transaction variants
+
+Every mutating queue operation has a variant that takes
+`&mut sqlx::Transaction<'_, sqlx::Postgres>`: `enqueue_in`, `claim_in`,
+`renew_in`, `report_progress_in`, `complete_in`, `fail_in`,
+`request_cancel_in`, `retry_failed_in` and `recover_expired_in`.
+
+- A variant verifies the schema instance of the queue before it writes and
+  refuses a transaction of another database or of another schema instance.
+- A variant never begins, commits or rolls back a transaction. The caller owns
+  the commit and the rollback, so a refused operation must roll the transaction
+  back.
+- A variant shares its implementation with its self-committing counterpart
+  through a private `*_on(&mut PgConnection, ...)` helper in `src/queue.rs`, so
+  the two cannot diverge in result, error or bounds.
+- The result of a variant is valid before the commit of the caller but not
+  durable until it.
+
+## Tests
+
+The live tests of `tests/postgres.rs` are ignored by default and run against
+the fixture database with `--include-ignored --test-threads=1`. The borrowed
+variants are covered with a domain sentinel: `tests/common/mod.rs` owns a
+separate `app_domain` schema that the library never touches, so a business
+write and the queue change commit or roll back together. A live test of a
+borrowed variant must prove the atomicity of both directions and the refusal
+of a wrong schema instance.
+
+The statements of the sentinel live in `sql/tests/transaction_*.sql` and are
+loaded with `query_file!` and `query_file_scalar!`, so they are checked like
+the statements of the library. Only the DDL that creates the schema is loaded
+through `raw_sql`.
+
 ## Rules
 
 - Every statement of the library lives in `sql/*.sql` and is loaded with

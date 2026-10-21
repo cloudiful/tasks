@@ -19,8 +19,8 @@ use sqlx::postgres::PgListener;
 use tokio::sync::Barrier;
 
 use common::{
-    attempt_count, connect, connect_to_sibling_database, open_queue, open_queue_with_short_lease,
-    reset, task_count,
+    app_domain_count, attempt_count, connect, connect_to_sibling_database, open_queue,
+    open_queue_with_short_lease, prepare_app_domain, reset, task_count, write_app_domain,
 };
 
 const NAMESPACE: &str = "ns";
@@ -830,4 +830,547 @@ async fn a_manual_retry_grants_only_the_requested_attempts() {
     );
     let attempts = queue.attempts(id, 10).await.unwrap();
     assert_eq!(attempts.len(), 1, "the attempt history must stay untouched");
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_claim_in_a_transaction_is_atomic_with_the_domain_write() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+
+    // The rollback discards the claim and the domain write together.
+    let mut transaction = pool.begin().await.unwrap();
+    let claim = queue
+        .claim_in(&mut transaction, "worker")
+        .await
+        .unwrap()
+        .expect("the task must be claimed");
+    write_app_domain(&mut transaction, "claimed").await;
+    transaction.rollback().await.unwrap();
+
+    assert_eq!(claim.task().id(), task.task().id());
+    assert_eq!(app_domain_count(&pool).await, 0);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Queued);
+    assert_eq!(
+        attempt_count(&pool, task.task().id().as_uuid()).await,
+        0,
+        "a rolled back claim must leave no attempt"
+    );
+
+    // The commit makes the claim and the domain write durable together.
+    let mut transaction = pool.begin().await.unwrap();
+    let claim = queue
+        .claim_in(&mut transaction, "worker")
+        .await
+        .unwrap()
+        .expect("the task must be claimed");
+    write_app_domain(&mut transaction, "claimed").await;
+    transaction.commit().await.unwrap();
+
+    assert_eq!(claim.task().id(), task.task().id());
+    assert_eq!(app_domain_count(&pool).await, 1);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Running);
+    assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_cancellation_in_a_transaction_is_atomic_with_the_domain_write() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+
+    // The rollback discards the cancellation and the domain write together.
+    let mut transaction = pool.begin().await.unwrap();
+    let cancelled = queue
+        .request_cancel_in(&mut transaction, task.task().id())
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status(), TaskStatus::Cancelled);
+    write_app_domain(&mut transaction, "cancelled").await;
+    transaction.rollback().await.unwrap();
+
+    assert_eq!(app_domain_count(&pool).await, 0);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Queued);
+    assert!(stored.cancel_requested_at().is_none());
+
+    // The commit makes the cancellation and the domain write durable together.
+    let mut transaction = pool.begin().await.unwrap();
+    let cancelled = queue
+        .request_cancel_in(&mut transaction, task.task().id())
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status(), TaskStatus::Cancelled);
+    write_app_domain(&mut transaction, "cancelled").await;
+    transaction.commit().await.unwrap();
+
+    assert_eq!(app_domain_count(&pool).await, 1);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Cancelled);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_retry_in_a_transaction_is_atomic_with_the_domain_write() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+    let claim = queue.claim("worker").await.unwrap().unwrap();
+    let failed = queue
+        .fail(
+            claim.attempt(),
+            &Failure::permanent(Some(json!({"reason": "boom"}))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), TaskStatus::Failed);
+    let budget = failed.max_attempts();
+
+    // The rollback discards the retry and the domain write together.
+    let mut transaction = pool.begin().await.unwrap();
+    let retried = queue
+        .retry_failed_in(&mut transaction, task.task().id(), 1)
+        .await
+        .unwrap();
+    assert_eq!(retried.status(), TaskStatus::Queued);
+    write_app_domain(&mut transaction, "retried").await;
+    transaction.rollback().await.unwrap();
+
+    assert_eq!(app_domain_count(&pool).await, 0);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Failed);
+    assert_eq!(stored.max_attempts(), budget);
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    assert_eq!(attempts.len(), 1, "the attempt history must stay untouched");
+
+    // The commit makes the retry and the domain write durable together.
+    let mut transaction = pool.begin().await.unwrap();
+    let retried = queue
+        .retry_failed_in(&mut transaction, task.task().id(), 1)
+        .await
+        .unwrap();
+    assert_eq!(retried.status(), TaskStatus::Queued);
+    write_app_domain(&mut transaction, "retried").await;
+    transaction.commit().await.unwrap();
+
+    assert_eq!(app_domain_count(&pool).await, 1);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Queued);
+    assert_eq!(stored.max_attempts(), budget + 1);
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    assert_eq!(attempts.len(), 1, "the attempt history must stay untouched");
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_recovery_in_a_transaction_is_atomic_with_the_domain_write() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue_with_short_lease(&pool, NAMESPACE, QUEUE).await;
+    let policy = RetryPolicy::new(2, Duration::from_millis(10), Duration::from_millis(50)).unwrap();
+    let task = queue
+        .enqueue(request().with_retry_policy(policy))
+        .await
+        .unwrap();
+    let claim = queue.claim("worker").await.unwrap().unwrap();
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // The rollback discards the recovery and the domain write together.
+    let mut transaction = pool.begin().await.unwrap();
+    let recovered = queue
+        .recover_expired_in(&mut transaction, 10)
+        .await
+        .unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].status(), TaskStatus::Queued);
+    write_app_domain(&mut transaction, "recovered").await;
+    transaction.rollback().await.unwrap();
+
+    assert_eq!(app_domain_count(&pool).await, 0);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Running);
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    assert_eq!(attempts[0].status(), AttemptStatus::Running);
+    assert!(
+        attempts[0].lease_expires_at().is_some(),
+        "the lease of the attempt must stay untouched"
+    );
+
+    // The commit makes the recovery and the domain write durable together.
+    let mut transaction = pool.begin().await.unwrap();
+    let recovered = queue
+        .recover_expired_in(&mut transaction, 10)
+        .await
+        .unwrap();
+    assert_eq!(recovered.len(), 1);
+    write_app_domain(&mut transaction, "recovered").await;
+    transaction.commit().await.unwrap();
+
+    assert_eq!(app_domain_count(&pool).await, 1);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Queued);
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    assert_eq!(attempts[0].status(), AttemptStatus::Interrupted);
+    assert!(attempts[0].lease_expires_at().is_none());
+
+    // The late worker of the sealed attempt still loses its lease.
+    let error = queue
+        .complete(claim.attempt(), None)
+        .await
+        .expect_err("a late worker must not finish the task");
+    assert!(
+        matches!(error, Error::LeaseLost { .. }),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_progress_report_in_a_transaction_is_atomic_with_the_domain_write() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+    let claim = queue.claim("worker").await.unwrap().unwrap();
+    let report = ProgressUpdate::new("import")
+        .with_completed(3)
+        .with_total(10);
+
+    // The rollback discards the report and the domain write together.
+    let mut transaction = pool.begin().await.unwrap();
+    queue
+        .report_progress_in(&mut transaction, claim.attempt(), &report)
+        .await
+        .unwrap();
+    write_app_domain(&mut transaction, "reported").await;
+    transaction.rollback().await.unwrap();
+
+    assert_eq!(app_domain_count(&pool).await, 0);
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    assert!(attempts[0].progress().is_none());
+
+    // The commit makes the report and the domain write durable together.
+    let mut transaction = pool.begin().await.unwrap();
+    queue
+        .report_progress_in(&mut transaction, claim.attempt(), &report)
+        .await
+        .unwrap();
+    write_app_domain(&mut transaction, "reported").await;
+    transaction.commit().await.unwrap();
+
+    assert_eq!(app_domain_count(&pool).await, 1);
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    let stored = attempts[0].progress().expect("the progress must be stored");
+    assert_eq!(stored.stage(), "import");
+    assert_eq!(stored.completed(), Some(3));
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_renewal_in_a_transaction_is_atomic_with_the_domain_write() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+    let claim = queue.claim("worker").await.unwrap().unwrap();
+    let lease = claim.attempt().lease_expires_at().unwrap();
+
+    // The rollback discards the renewal and the domain write together.
+    let mut transaction = pool.begin().await.unwrap();
+    queue
+        .renew_in(&mut transaction, claim.attempt())
+        .await
+        .unwrap();
+    write_app_domain(&mut transaction, "renewed").await;
+    transaction.rollback().await.unwrap();
+
+    assert_eq!(app_domain_count(&pool).await, 0);
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    assert_eq!(attempts[0].lease_expires_at(), Some(lease));
+
+    // The commit makes the renewal and the domain write durable together.
+    let mut transaction = pool.begin().await.unwrap();
+    let expiry = queue
+        .renew_in(&mut transaction, claim.attempt())
+        .await
+        .unwrap();
+    write_app_domain(&mut transaction, "renewed").await;
+    transaction.commit().await.unwrap();
+
+    assert_eq!(app_domain_count(&pool).await, 1);
+    assert!(expiry >= lease);
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    assert!(attempts[0].lease_expires_at().unwrap() >= expiry);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_borrowed_operation_of_another_schema_instance_is_refused() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+
+    // The schema is migrated again, the queue of the caller holds the
+    // instance of the schema before the migration.
+    reset(&pool).await;
+    let task = queue.enqueue(request()).await.unwrap();
+    let claim = queue.claim("worker").await.unwrap().unwrap();
+
+    let mut transaction = pool.begin().await.unwrap();
+    write_app_domain(&mut transaction, "refused").await;
+    let error = queue
+        .claim_in(&mut transaction, "worker")
+        .await
+        .expect_err("a transaction of another schema instance must be refused");
+    assert!(
+        matches!(error, Error::InstanceMismatch { .. }),
+        "unexpected error: {error}"
+    );
+    let error = queue
+        .request_cancel_in(&mut transaction, task.task().id())
+        .await
+        .expect_err("a transaction of another schema instance must be refused");
+    assert!(
+        matches!(error, Error::InstanceMismatch { .. }),
+        "unexpected error: {error}"
+    );
+    let error = queue
+        .retry_failed_in(&mut transaction, task.task().id(), 1)
+        .await
+        .expect_err("a transaction of another schema instance must be refused");
+    assert!(
+        matches!(error, Error::InstanceMismatch { .. }),
+        "unexpected error: {error}"
+    );
+    let error = queue
+        .recover_expired_in(&mut transaction, 10)
+        .await
+        .expect_err("a transaction of another schema instance must be refused");
+    assert!(
+        matches!(error, Error::InstanceMismatch { .. }),
+        "unexpected error: {error}"
+    );
+    let error = queue
+        .renew_in(&mut transaction, claim.attempt())
+        .await
+        .expect_err("a transaction of another schema instance must be refused");
+    assert!(
+        matches!(error, Error::InstanceMismatch { .. }),
+        "unexpected error: {error}"
+    );
+    let error = queue
+        .report_progress_in(
+            &mut transaction,
+            claim.attempt(),
+            &ProgressUpdate::new("import"),
+        )
+        .await
+        .expect_err("a transaction of another schema instance must be refused");
+    assert!(
+        matches!(error, Error::InstanceMismatch { .. }),
+        "unexpected error: {error}"
+    );
+    transaction.commit().await.unwrap();
+
+    assert_eq!(
+        app_domain_count(&pool).await,
+        1,
+        "the refused operations must not write the domain state"
+    );
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Running);
+    assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_borrowed_operation_of_another_database_is_refused() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+    let claim = queue.claim("worker").await.unwrap().unwrap();
+    let sibling = connect_to_sibling_database().await;
+
+    let mut transaction = sibling.begin().await.unwrap();
+    let error = queue
+        .claim_in(&mut transaction, "worker")
+        .await
+        .expect_err("a transaction of another database must be refused");
+    assert!(
+        matches!(
+            error,
+            Error::InstanceMismatch { .. } | Error::SchemaMissing { .. }
+        ),
+        "unexpected error: {error}"
+    );
+    let error = queue
+        .request_cancel_in(&mut transaction, task.task().id())
+        .await
+        .expect_err("a transaction of another database must be refused");
+    assert!(
+        matches!(
+            error,
+            Error::InstanceMismatch { .. } | Error::SchemaMissing { .. }
+        ),
+        "unexpected error: {error}"
+    );
+    let error = queue
+        .retry_failed_in(&mut transaction, task.task().id(), 1)
+        .await
+        .expect_err("a transaction of another database must be refused");
+    assert!(
+        matches!(
+            error,
+            Error::InstanceMismatch { .. } | Error::SchemaMissing { .. }
+        ),
+        "unexpected error: {error}"
+    );
+    let error = queue
+        .recover_expired_in(&mut transaction, 10)
+        .await
+        .expect_err("a transaction of another database must be refused");
+    assert!(
+        matches!(
+            error,
+            Error::InstanceMismatch { .. } | Error::SchemaMissing { .. }
+        ),
+        "unexpected error: {error}"
+    );
+    let error = queue
+        .renew_in(&mut transaction, claim.attempt())
+        .await
+        .expect_err("a transaction of another database must be refused");
+    assert!(
+        matches!(
+            error,
+            Error::InstanceMismatch { .. } | Error::SchemaMissing { .. }
+        ),
+        "unexpected error: {error}"
+    );
+    let error = queue
+        .report_progress_in(
+            &mut transaction,
+            claim.attempt(),
+            &ProgressUpdate::new("import"),
+        )
+        .await
+        .expect_err("a transaction of another database must be refused");
+    assert!(
+        matches!(
+            error,
+            Error::InstanceMismatch { .. } | Error::SchemaMissing { .. }
+        ),
+        "unexpected error: {error}"
+    );
+    transaction.rollback().await.ok();
+
+    assert_eq!(task_count(&pool, NAMESPACE, QUEUE).await, 1);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Running);
+    assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn an_expired_lease_is_refused_by_the_borrowed_operations() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue_with_short_lease(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+    let claim = queue.claim("worker").await.unwrap().unwrap();
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut transaction = pool.begin().await.unwrap();
+    write_app_domain(&mut transaction, "reported").await;
+    let error = queue
+        .renew_in(&mut transaction, claim.attempt())
+        .await
+        .expect_err("an expired lease must be refused");
+    assert!(
+        matches!(error, Error::LeaseLost { .. }),
+        "unexpected error: {error}"
+    );
+    let error = queue
+        .report_progress_in(
+            &mut transaction,
+            claim.attempt(),
+            &ProgressUpdate::new("import"),
+        )
+        .await
+        .expect_err("an expired lease must be refused");
+    assert!(
+        matches!(error, Error::LeaseLost { .. }),
+        "unexpected error: {error}"
+    );
+    transaction.rollback().await.ok();
+
+    assert_eq!(app_domain_count(&pool).await, 0);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Running);
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    assert!(attempts[0].progress().is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_lock_wait_that_crosses_the_expiry_refuses_the_borrowed_renewal() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue_with_short_lease(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+    let claim = queue.claim("worker").await.unwrap().unwrap();
+
+    // Another transaction holds the lock of the attempt.
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query_file!(
+        "sql/tests/transaction_lock_attempt.sql",
+        claim.attempt().id().as_uuid()
+    )
+    .fetch_one(&mut *blocker)
+    .await
+    .expect("the attempt must be lockable");
+
+    // The borrowed renewal waits for the lock and outlives the lease.
+    let waiting_queue = queue.clone();
+    let attempt = claim.attempt().clone();
+    let mut waiting = pool.begin().await.unwrap();
+    let waiter = tokio::spawn(async move {
+        write_app_domain(&mut waiting, "renewed").await;
+        let result = waiting_queue.renew_in(&mut waiting, &attempt).await;
+        (waiting, result)
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    blocker.rollback().await.unwrap();
+
+    let (waiting, result) = waiter.await.unwrap();
+    let error = result.expect_err("a lease that expired during the wait must not be renewed");
+    assert!(
+        matches!(error, Error::LeaseLost { .. }),
+        "unexpected error: {error}"
+    );
+    waiting.rollback().await.ok();
+
+    assert_eq!(app_domain_count(&pool).await, 0);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Running);
 }

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use cloudiful_tasks::{Queue, WorkerConfig};
 use sqlx::postgres::PgConnectOptions;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
 /// Environment variable that holds the URL of the test database.
 pub const TEST_DATABASE_URL_ENV: &str = "CLOUDIFUL_TASKS_TEST_DATABASE_URL";
@@ -40,6 +40,12 @@ const PUBLIC_SENTINEL_SQL: &str = include_str!("../../sql/tests/migration_public
 const SEED_SENTINEL_SQL: &str = include_str!("../../sql/tests/migration_seed_sentinel.sql");
 const ADVISORY_LOCKS_SQL: &str = include_str!("../../sql/tests/migration_advisory_locks.sql");
 const INSERT_TASK_SQL: &str = include_str!("../../sql/tests/worker_insert_task.sql");
+
+/// The statements that create the domain state of the application.
+///
+/// The schema is dropped first, so every test starts from an empty domain
+/// state.
+const APP_DOMAIN_SETUP_SQL: &str = include_str!("../../sql/tests/transaction_app_domain_setup.sql");
 
 #[derive(sqlx::FromRow)]
 struct IdentityRow {
@@ -325,6 +331,39 @@ pub async fn attempt_count(pool: &PgPool, task_id: uuid::Uuid) -> i64 {
         .fetch_one(pool)
         .await
         .expect("the attempts must be countable")
+        .unwrap_or_default()
+}
+
+/// Creates the domain state of the application and empties it.
+///
+/// The domain state belongs to the application, not to the library. The
+/// library never writes to it, the tests write to it inside the transaction
+/// of the caller to prove that a domain write and a queue change share one
+/// commit.
+pub async fn prepare_app_domain(pool: &PgPool) {
+    sqlx::raw_sql(APP_DOMAIN_SETUP_SQL)
+        .execute(pool)
+        .await
+        .expect("the domain state of the application must be creatable");
+}
+
+/// Writes a row of the domain state of the application.
+///
+/// The write runs in the transaction of the caller, so it becomes durable
+/// together with the queue change of that transaction.
+pub async fn write_app_domain(transaction: &mut Transaction<'_, Postgres>, note: &str) {
+    sqlx::query_file!("sql/tests/transaction_app_domain_insert.sql", note)
+        .execute(&mut **transaction)
+        .await
+        .expect("the domain state of the application must be writable");
+}
+
+/// The number of rows of the domain state of the application.
+pub async fn app_domain_count(pool: &PgPool) -> i64 {
+    sqlx::query_file_scalar!("sql/tests/transaction_app_domain_count.sql")
+        .fetch_one(pool)
+        .await
+        .expect("the domain state of the application must be countable")
         .unwrap_or_default()
 }
 

@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS sentinel_count\nFROM app_domain.sentinel\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sentinel_count",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "b816b1719c54266e90009b8adaade9da1f57bcb609289c4daa946807a3759d47"
+}
