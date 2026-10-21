@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT c.relname AS relation_name\nFROM pg_catalog.pg_class AS c\nINNER JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace\nWHERE n.nspname = $1\n  AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')\nORDER BY c.relname\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "relation_name",
+        "type_info": "Name",
+        "origin": {
+          "Table": {
+            "table": "pg_class",
+            "name": "relname"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Name"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "631d276cc133bb601ad9e37548af3064bfc5864502f713481c9a56f46783e622"
+}

@@ -1,0 +1,39 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO cloudiful_tasks.tasks (\n    id,\n    namespace,\n    queue,\n    kind,\n    payload,\n    status,\n    priority,\n    available_at,\n    idempotency_key,\n    request_spec,\n    attempt_count,\n    max_attempts,\n    retry_initial_delay_ns,\n    retry_max_delay_ns\n)\nVALUES (\n    $1,\n    $2,\n    $3,\n    $4,\n    $5,\n    'queued',\n    $6,\n    COALESCE($7::timestamptz, clock_timestamp()),\n    $8,\n    $9,\n    0,\n    $10,\n    $11,\n    $12\n)\nON CONFLICT (namespace, queue, idempotency_key) WHERE idempotency_key IS NOT NULL\nDO NOTHING\nRETURNING id\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Int4",
+        "Timestamptz",
+        "Text",
+        "Jsonb",
+        "Int4",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "815e2479cd83215b78da015f32dbd47361717b6fa269259822363c4ed879c7e3"
+}

@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- Locks the task and the attempt of a lease guarded operation.\n--\n-- The task is locked before the attempt, so that all operations of a task\n-- take its locks in the same order. The locks are held while the lease of\n-- the attempt is checked, so that the check uses the clock of the database\n-- after a lock wait.\nWITH task_guard AS (\n    SELECT id, status\n    FROM cloudiful_tasks.tasks\n    WHERE id = $3 AND namespace = $1 AND queue = $2\n    FOR UPDATE\n),\nattempt_guard AS (\n    SELECT a.id\n    FROM cloudiful_tasks.attempts AS a\n    INNER JOIN task_guard ON task_guard.id = a.task_id\n    WHERE a.id = $4\n      AND a.fencing_token = $5\n      AND a.status = 'running'\n    FOR UPDATE OF a\n)\nSELECT\n    (SELECT count(*) FROM task_guard) AS task_found,\n    (SELECT count(*) FROM attempt_guard) AS attempt_found\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "task_found",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "attempt_found",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "a33bc39b4c01ba742d4753294576cb27a6fdfc6a1d43953d066a84737d3b6cd1"
+}

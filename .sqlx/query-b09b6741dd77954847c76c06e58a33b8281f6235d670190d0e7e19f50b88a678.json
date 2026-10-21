@@ -1,0 +1,258 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH expired AS (\n    SELECT\n        t.id AS task_id,\n        a.id AS attempt_id,\n        a.attempt_number,\n        a.fencing_token\n    FROM cloudiful_tasks.tasks AS t\n    INNER JOIN cloudiful_tasks.attempts AS a\n        ON a.task_id = t.id\n        AND a.status = 'running'\n        AND a.lease_expires_at <= clock_timestamp()\n    WHERE t.namespace = $1 AND t.queue = $2\n    ORDER BY a.lease_expires_at, a.id\n    FOR UPDATE OF t, a SKIP LOCKED\n    LIMIT $3\n),\nsealed AS (\n    UPDATE cloudiful_tasks.attempts AS a\n    SET status = 'interrupted',\n        finished_at = clock_timestamp(),\n        lease_expires_at = NULL,\n        error = jsonb_build_object('reason', 'lease_expired')\n    FROM expired\n    WHERE a.id = expired.attempt_id\n      AND a.status = 'running'\n      AND a.fencing_token = expired.fencing_token\n    RETURNING a.task_id, expired.attempt_number\n)\nUPDATE cloudiful_tasks.tasks AS t\nSET status = CASE\n        WHEN t.status = 'cancel_requested' THEN 'cancelled'\n        WHEN t.attempt_count < t.max_attempts THEN 'queued'\n        ELSE 'failed'\n    END,\n    available_at = CASE\n        WHEN t.status = 'cancel_requested' THEN t.available_at\n        WHEN t.attempt_count < t.max_attempts THEN clock_timestamp() + make_interval(\n            secs => LEAST(\n                t.retry_initial_delay_ns::numeric\n                    * power(2::numeric, LEAST(GREATEST(sealed.attempt_number - 1, 0), 31)),\n                t.retry_max_delay_ns::numeric\n            ) / 1000000000.0\n        )\n        ELSE t.available_at\n    END,\n    finished_at = CASE\n        WHEN t.status = 'cancel_requested' OR t.attempt_count >= t.max_attempts THEN clock_timestamp()\n        ELSE t.finished_at\n    END,\n    terminal_reason = CASE\n        WHEN t.status = 'cancel_requested' THEN 'cancelled'\n        WHEN t.attempt_count >= t.max_attempts THEN 'attempts_exhausted'\n        ELSE t.terminal_reason\n    END,\n    updated_at = clock_timestamp()\nFROM sealed\nWHERE t.id = sealed.task_id\n  AND t.status IN ('running', 'cancel_requested')\nRETURNING t.*\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "namespace",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "namespace"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "queue",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "queue"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "payload",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "payload"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "result",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "result"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "priority",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "priority"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "available_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "available_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "idempotency_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "idempotency_key"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "request_spec",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "request_spec"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "attempt_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "attempt_count"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "max_attempts",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "max_attempts"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "retry_initial_delay_ns",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "retry_initial_delay_ns"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "retry_max_delay_ns",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "retry_max_delay_ns"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "cancel_requested_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "cancel_requested_at"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "finished_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "finished_at"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "terminal_reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "terminal_reason"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "b09b6741dd77954847c76c06e58a33b8281f6235d670190d0e7e19f50b88a678"
+}

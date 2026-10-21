@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE cloudiful_tasks.attempts AS a\nSET lease_expires_at = clock_timestamp() + ($6::bigint * interval '1 millisecond')\nFROM cloudiful_tasks.tasks AS t\nWHERE t.id = $3\n  AND t.namespace = $1\n  AND t.queue = $2\n  AND a.task_id = t.id\n  AND a.id = $4\n  AND a.fencing_token = $5\n  AND a.status = 'running'\n  AND a.lease_expires_at > clock_timestamp()\nRETURNING a.lease_expires_at\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "lease_expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "lease_expires_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "5c270953cec0f84d1b036a7cd598efc277066bbc63df51ee38814856b8f6ebaf"
+}

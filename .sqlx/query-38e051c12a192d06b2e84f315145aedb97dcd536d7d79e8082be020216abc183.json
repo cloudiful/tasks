@@ -1,0 +1,165 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH candidate AS (\n    SELECT id, attempt_count\n    FROM cloudiful_tasks.tasks\n    WHERE namespace = $1\n      AND queue = $2\n      AND status = 'queued'\n      AND available_at <= clock_timestamp()\n    ORDER BY priority DESC, available_at, created_at, id\n    FOR UPDATE SKIP LOCKED\n    LIMIT 1\n),\nclaimed AS (\n    UPDATE cloudiful_tasks.tasks AS t\n    SET status = 'running',\n        attempt_count = t.attempt_count + 1,\n        updated_at = clock_timestamp()\n    FROM candidate AS c\n    WHERE t.id = c.id\n    RETURNING t.id\n),\nsealed_attempt AS (\n    INSERT INTO cloudiful_tasks.attempts (\n        id,\n        task_id,\n        attempt_number,\n        worker_id,\n        fencing_token,\n        status,\n        lease_expires_at,\n        started_at\n    )\n    SELECT $4, c.id, c.attempt_count + 1, $3, $5, 'running',\n           clock_timestamp() + ($6::bigint * interval '1 millisecond'), clock_timestamp()\n    FROM candidate AS c\n    RETURNING *\n)\nSELECT\n    attempt.id,\n    attempt.task_id,\n    attempt.attempt_number,\n    attempt.worker_id,\n    attempt.fencing_token,\n    attempt.status,\n    attempt.lease_expires_at,\n    attempt.started_at,\n    attempt.finished_at,\n    attempt.error,\n    attempt.progress,\n    attempt.progress_updated_at\nFROM sealed_attempt AS attempt\nINNER JOIN claimed ON claimed.id = attempt.task_id\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "task_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "task_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "attempt_number",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "attempt_number"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "worker_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "worker_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "fencing_token",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "fencing_token"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "lease_expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "lease_expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "started_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "started_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "finished_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "finished_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "error",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "error"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "progress",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "progress"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "progress_updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "progress_updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "38e051c12a192d06b2e84f315145aedb97dcd536d7d79e8082be020216abc183"
+}

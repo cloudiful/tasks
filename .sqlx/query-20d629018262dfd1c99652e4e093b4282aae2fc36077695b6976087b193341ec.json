@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT pg_advisory_unlock($1::bigint)::text AS unlocked\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "unlocked",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "20d629018262dfd1c99652e4e093b4282aae2fc36077695b6976087b193341ec"
+}

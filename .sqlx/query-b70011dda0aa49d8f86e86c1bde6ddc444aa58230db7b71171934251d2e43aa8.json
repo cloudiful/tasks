@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT version AS migration_version\nFROM cloudiful_tasks._sqlx_migrations\nWHERE success\nORDER BY version\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "migration_version",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks._sqlx_migrations",
+            "name": "version"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b70011dda0aa49d8f86e86c1bde6ddc444aa58230db7b71171934251d2e43aa8"
+}

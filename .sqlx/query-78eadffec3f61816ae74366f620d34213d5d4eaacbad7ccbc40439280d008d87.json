@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT current_database() AS database_name\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "database_name",
+        "type_info": "Name",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "78eadffec3f61816ae74366f620d34213d5d4eaacbad7ccbc40439280d008d87"
+}

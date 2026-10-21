@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT library, protocol_version, instance_uuid, installed_at\nFROM cloudiful_tasks.schema_ownership\nWHERE singleton\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "library",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.schema_ownership",
+            "name": "library"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "protocol_version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.schema_ownership",
+            "name": "protocol_version"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "instance_uuid",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.schema_ownership",
+            "name": "instance_uuid"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "installed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.schema_ownership",
+            "name": "installed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "fadbada5daa61cbe8e22dd2e4ad2ff2f3975a4139852bb6ee4ee29cfc6f7672f"
+}

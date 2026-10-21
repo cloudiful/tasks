@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE cloudiful_tasks.attempts AS a\nSET progress = $6::jsonb,\n    progress_updated_at = clock_timestamp()\nFROM cloudiful_tasks.tasks AS t\nWHERE t.id = $3\n  AND t.namespace = $1\n  AND t.queue = $2\n  AND a.task_id = t.id\n  AND a.id = $4\n  AND a.fencing_token = $5\n  AND a.status = 'running'\n  AND a.lease_expires_at > clock_timestamp()\nRETURNING a.id\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "046e9543eaaa62bb6b8580bcbcbfd8cbb0cab8afbce130eb465f07872cf773a1"
+}

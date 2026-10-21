@@ -1,0 +1,48 @@
+[package]
+name = "cloudiful-tasks"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Durable PostgreSQL-backed task execution library"
+repository = "https://github.com/cloudiful/tasks"
+readme = "README.md"
+publish = false
+include = [
+    "src/**/*.rs",
+    "sql/**/*.sql",
+    "migrations/**/*.sql",
+    "tests/**/*.rs",
+    "examples/**/*.rs",
+    ".sqlx/*.json",
+    "sqlx.toml",
+    "Cargo.lock",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE",
+    "AGENTS.md",
+]
+
+[lib]
+name = "cloudiful_tasks"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = [
+    "postgres",
+    "runtime-tokio",
+    "macros",
+    "migrate",
+    "uuid",
+    "chrono",
+    "json",
+    "tls-rustls",
+    "sqlx-toml",
+] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "signal"] }
+tokio-util = "0.7"
+uuid = { version = "1", features = ["serde", "v4"] }

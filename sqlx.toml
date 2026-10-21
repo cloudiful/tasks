@@ -1,0 +1,3 @@
+[migrate]
+create-schemas = ["cloudiful_tasks"]
+table-name = "cloudiful_tasks._sqlx_migrations"

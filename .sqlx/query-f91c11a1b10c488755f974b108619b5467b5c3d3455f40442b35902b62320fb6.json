@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT pg_notify('cloudiful_tasks_ready', '')::text AS notified\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "notified",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "f91c11a1b10c488755f974b108619b5467b5c3d3455f40442b35902b62320fb6"
+}
