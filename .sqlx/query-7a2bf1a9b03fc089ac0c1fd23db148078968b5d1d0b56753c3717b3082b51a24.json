@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- Counts every running attempt of the queue, including an expired attempt\n-- until recovery seals it.\nSELECT count(*) AS running_attempts\nFROM cloudiful_tasks.attempts AS a\nINNER JOIN cloudiful_tasks.tasks AS t ON t.id = a.task_id\nWHERE t.namespace = $1\n  AND t.queue = $2\n  AND a.status = 'running'\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "running_attempts",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "7a2bf1a9b03fc089ac0c1fd23db148078968b5d1d0b56753c3717b3082b51a24"
+}

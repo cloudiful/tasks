@@ -19,7 +19,7 @@ pub const SCHEMA_NAME: &str = "cloudiful_tasks";
 pub const LIBRARY_ID: &str = "cloudiful-tasks";
 
 /// Schema protocol version implemented by this build.
-pub const PROTOCOL_VERSION: i32 = 1;
+pub const PROTOCOL_VERSION: i32 = 2;
 
 /// Table holding the ownership marker of the schema.
 const OWNERSHIP_TABLE: &str = "schema_ownership";
@@ -103,7 +103,8 @@ impl MigrationOutcome {
 ///
 /// The call refuses a schema that exists without the ownership marker of this
 /// library, and a schema that was written by a newer, incompatible version of
-/// the library.
+/// the library. An owned schema of an older supported protocol version is
+/// upgraded to the current version.
 ///
 /// # Errors
 ///
@@ -200,7 +201,7 @@ async fn ensure_ownership(connection: &mut PgConnection) -> Result<()> {
         .ok_or(Error::ForeignSchema {
             schema: SCHEMA_NAME.to_owned(),
         })?;
-    validate_marker(&marker)
+    validate_owner(&marker)
 }
 
 async fn read_schema_info(connection: &mut PgConnection) -> Result<SchemaInfo> {
@@ -219,7 +220,12 @@ async fn read_schema_info(connection: &mut PgConnection) -> Result<SchemaInfo> {
     })
 }
 
-fn validate_marker(marker: &OwnershipRow) -> Result<()> {
+/// Refuses a schema that another library owns or a schema of a newer protocol.
+///
+/// Callers that migrate accept an owned older protocol version, because the
+/// migrations upgrade it to the current version. Callers that read accept only
+/// the exact supported version.
+fn validate_owner(marker: &OwnershipRow) -> Result<()> {
     if marker.library != LIBRARY_ID {
         return Err(Error::ForeignSchema {
             schema: SCHEMA_NAME.to_owned(),
@@ -231,6 +237,11 @@ fn validate_marker(marker: &OwnershipRow) -> Result<()> {
             supported: PROTOCOL_VERSION,
         });
     }
+    Ok(())
+}
+
+fn validate_marker(marker: &OwnershipRow) -> Result<()> {
+    validate_owner(marker)?;
     if marker.protocol_version < PROTOCOL_VERSION {
         return Err(Error::OutdatedSchemaVersion {
             found: marker.protocol_version,

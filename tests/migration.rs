@@ -35,14 +35,15 @@ async fn migrate_creates_only_the_owned_schema() {
 
     let outcome = migrate(&pool).await.expect("the migration must succeed");
     assert!(outcome.applied());
-    assert_eq!(outcome.protocol_version(), 1);
-    assert_eq!(outcome.applied_versions().len(), 1);
+    assert_eq!(outcome.protocol_version(), 2);
+    assert_eq!(outcome.applied_versions().len(), 2);
     assert!(!outcome.instance_uuid().is_nil());
 
     let owned = relation_names(&pool, "cloudiful_tasks").await;
     assert!(owned.contains(&"schema_ownership".to_owned()));
     assert!(owned.contains(&"tasks".to_owned()));
     assert!(owned.contains(&"attempts".to_owned()));
+    assert!(owned.contains(&"queue_policies".to_owned()));
     assert!(owned.contains(&"_sqlx_migrations".to_owned()));
 
     let public = relation_names(&pool, "public").await;
@@ -62,7 +63,7 @@ async fn migrate_creates_only_the_owned_schema() {
         .await
         .expect("the schema must be compatible");
     assert_eq!(info.instance_uuid(), outcome.instance_uuid());
-    assert_eq!(info.protocol_version(), 1);
+    assert_eq!(info.protocol_version(), 2);
 
     assert_eq!(
         advisory_lock_count(&pool).await,
@@ -89,7 +90,7 @@ async fn concurrent_migrations_are_idempotent() {
             .fetch_all(&pool)
             .await
             .expect("the migration ledger must be readable");
-    assert_eq!(versions.len(), 1);
+    assert_eq!(versions.len(), 2);
     assert_eq!(versions[0].migration_version, first.applied_versions()[0]);
 }
 
@@ -234,7 +235,7 @@ async fn a_newer_protocol_version_is_refused() {
             error,
             Error::UnsupportedSchemaVersion {
                 found: 999,
-                supported: 1
+                supported: 2
             }
         ),
         "unexpected error: {error}"
@@ -248,7 +249,7 @@ async fn a_newer_protocol_version_is_refused() {
             error,
             Error::UnsupportedSchemaVersion {
                 found: 999,
-                supported: 1
+                supported: 2
             }
         ),
         "unexpected error: {error}"
@@ -333,5 +334,67 @@ async fn the_migration_runs_on_an_empty_database() {
 
     let outcome = migrate(&pool).await.expect("the migration must succeed");
     assert!(outcome.applied());
-    assert_eq!(outcome.applied_versions().len(), 1);
+    assert_eq!(outcome.applied_versions().len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn an_owned_version_one_schema_is_upgraded() {
+    let pool = connect().await;
+    cleanup(&pool).await;
+    let first = migrate(&pool)
+        .await
+        .expect("the first migration must succeed");
+    let latest = *first
+        .applied_versions()
+        .last()
+        .expect("the migration ledger must not be empty");
+
+    sqlx::query("DROP TABLE cloudiful_tasks.queue_policies")
+        .execute(&pool)
+        .await
+        .expect("the policy table fixture must be removable");
+    sqlx::query("DELETE FROM cloudiful_tasks._sqlx_migrations WHERE version = $1")
+        .bind(latest)
+        .execute(&pool)
+        .await
+        .expect("the latest ledger row must be removable");
+    sqlx::query("UPDATE cloudiful_tasks.schema_ownership SET protocol_version = 1 WHERE singleton")
+        .execute(&pool)
+        .await
+        .expect("the ownership marker must be writable");
+
+    let error = check_schema(&pool)
+        .await
+        .expect_err("an older protocol version must not be read");
+    assert!(
+        matches!(
+            error,
+            Error::OutdatedSchemaVersion {
+                found: 1,
+                supported: 2
+            }
+        ),
+        "unexpected error: {error}"
+    );
+
+    let upgraded = migrate(&pool)
+        .await
+        .expect("an owned older schema must be upgraded");
+    assert!(upgraded.applied());
+    assert_eq!(upgraded.protocol_version(), 2);
+    assert_eq!(upgraded.applied_versions(), first.applied_versions());
+    assert!(
+        relation_names(&pool, "cloudiful_tasks")
+            .await
+            .contains(&"queue_policies".to_owned()),
+        "the upgrade must create the policy table"
+    );
+    assert_eq!(
+        check_schema(&pool)
+            .await
+            .expect("the upgraded schema must be readable")
+            .protocol_version(),
+        2
+    );
 }

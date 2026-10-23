@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM cloudiful_tasks.queue_policies\nWHERE namespace = $1 AND queue = $2\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "21bc26dac6c95869c2423a221252558769ae6acda9f5fde1ce2fa121b7981b03"
+}

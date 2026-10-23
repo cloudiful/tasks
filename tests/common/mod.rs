@@ -8,7 +8,6 @@
 // them.
 #![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -16,8 +15,11 @@ use cloudiful_tasks::{Queue, WorkerConfig};
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
-/// Environment variable that holds the URL of the test database.
+/// Environment variable that holds the URL of the dedicated test database.
 pub const TEST_DATABASE_URL_ENV: &str = "CLOUDIFUL_TASKS_TEST_DATABASE_URL";
+
+/// Environment variable that holds the URL of the dedicated sibling database.
+pub const SIBLING_DATABASE_URL_ENV: &str = "CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL";
 
 /// Database the live tests are allowed to touch.
 pub const EXPECTED_DATABASE: &str = "cloudiful_tasks_test";
@@ -25,11 +27,23 @@ pub const EXPECTED_DATABASE: &str = "cloudiful_tasks_test";
 /// Sibling database of the fixture that holds a schema of the library too.
 pub const SIBLING_DATABASE: &str = "cloudiful_tasks_dev";
 
-/// Role the live tests are allowed to use.
-pub const EXPECTED_USER: &str = "dev";
+/// Fixed configured endpoint of the shared non-production test server.
+pub const EXPECTED_HOST: &str = "unraid.cloud1ful.com";
 
-/// Port the test database listens on.
-pub const EXPECTED_PORT: u16 = 57664;
+/// Fixed configured port of the shared non-production test server.
+pub const EXPECTED_PORT: u16 = 5432;
+
+/// Port reported by the test server backend.
+///
+/// The forwarded endpoint is not assumed to equal this server side value.
+pub const EXPECTED_SERVER_PORT: &str = "5432";
+
+/// Exact database comment of the dedicated test fixture.
+pub const TEST_DATABASE_MARKER: &str = "cloudiful-tasks test fixture v1; non-production; dedicated";
+
+/// Exact database comment of the dedicated sibling fixture.
+pub const SIBLING_DATABASE_MARKER: &str =
+    "cloudiful-tasks development fixture v1; non-production; dedicated";
 
 const CLEANUP_SQL: &str = include_str!("../../sql/tests/migration_cleanup.sql");
 const FOREIGN_SCHEMA_SQL: &str = include_str!("../../sql/tests/migration_foreign_schema.sql");
@@ -53,7 +67,7 @@ struct IdentityRow {
     user_name: Option<String>,
     server_address: Option<String>,
     server_port: Option<String>,
-    socket_directories: Option<String>,
+    database_comment: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -61,62 +75,107 @@ struct RelationRow {
     relation_name: String,
 }
 
-/// The URL of the test database.
-///
-/// The test fails when the variable is missing: a live test never reports
-/// success without a database.
-pub fn test_database_url() -> String {
-    std::env::var(TEST_DATABASE_URL_ENV).unwrap_or_else(|_| {
-        panic!("{TEST_DATABASE_URL_ENV} must point at the {EXPECTED_DATABASE} database")
-    })
+fn fixture_options(env: &str, expected_database: &str) -> PgConnectOptions {
+    let value = std::env::var(env).ok();
+    fixture_options_from(value.as_deref(), expected_database)
+        .unwrap_or_else(|reason| panic!("{env} {reason}"))
 }
 
-/// The connection options of the test database.
+fn fixture_options_from(
+    value: Option<&str>,
+    expected_database: &str,
+) -> std::result::Result<PgConnectOptions, String> {
+    let url = value.ok_or_else(|| "must be set".to_owned())?;
+    let options =
+        PgConnectOptions::from_str(url).map_err(|_| "must be a valid postgres url".to_owned())?;
+    validate_fixture_options(&options, expected_database)?;
+    Ok(options)
+}
+
+fn validate_fixture_options(
+    options: &PgConnectOptions,
+    expected_database: &str,
+) -> std::result::Result<(), String> {
+    if options.get_database() != Some(expected_database) {
+        return Err(format!(
+            "must name the dedicated {expected_database} database"
+        ));
+    }
+    if options.get_host() != EXPECTED_HOST {
+        return Err(format!("must use the dedicated endpoint {EXPECTED_HOST}"));
+    }
+    if options.get_port() != EXPECTED_PORT {
+        return Err(format!(
+            "must use the dedicated endpoint port {EXPECTED_PORT}"
+        ));
+    }
+    if options.get_username().is_empty() {
+        return Err("must name a role".to_owned());
+    }
+    if options.get_socket().is_some() {
+        return Err("must not use a Unix socket override".to_owned());
+    }
+    if options.get_options().is_some() {
+        return Err("must not use connection option overrides".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_identity(
+    row: &IdentityRow,
+    options: &PgConnectOptions,
+    expected_database: &str,
+    expected_marker: &str,
+) -> std::result::Result<(), String> {
+    if row.database_name.as_deref() != Some(expected_database) {
+        return Err(format!(
+            "must report the dedicated {expected_database} database, not {:?}",
+            row.database_name
+        ));
+    }
+    if row.user_name.as_deref() != Some(options.get_username()) {
+        return Err(format!(
+            "must report the configured role {}, not {:?}",
+            options.get_username(),
+            row.user_name
+        ));
+    }
+    if row.database_comment.as_deref() != Some(expected_marker) {
+        return Err(format!(
+            "must carry the exact dedicated database marker, found {:?}",
+            row.database_comment
+        ));
+    }
+    match row.server_address.as_deref() {
+        None => return Err("must be reached over TCP".to_owned()),
+        Some("127.0.0.1" | "::1") => {
+            return Err("must not be reached over a loopback address".to_owned());
+        }
+        Some(_) => {}
+    }
+    if row.server_port.as_deref() != Some(EXPECTED_SERVER_PORT) {
+        return Err(format!(
+            "must report server port {EXPECTED_SERVER_PORT}, not {:?}",
+            row.server_port
+        ));
+    }
+    Ok(())
+}
+
+/// The connection options of the dedicated test database.
 pub fn test_database_options() -> PgConnectOptions {
-    let url = test_database_url();
-    let options = PgConnectOptions::from_str(&url).unwrap_or_else(|error| {
-        panic!("the test database url must be a valid postgres url: {error}")
-    });
-    assert_eq!(
-        options.get_database(),
-        Some(EXPECTED_DATABASE),
-        "the test database url must name the {EXPECTED_DATABASE} database"
-    );
-    options
+    fixture_options(TEST_DATABASE_URL_ENV, EXPECTED_DATABASE)
 }
 
 /// Connects to the test database and verifies that it is the expected fixture.
 pub async fn connect() -> PgPool {
-    let url = test_database_url();
-    let options = PgConnectOptions::from_str(&url).unwrap_or_else(|error| {
-        panic!("the test database url must be a valid postgres url: {error}")
-    });
-
-    assert_eq!(
-        options.get_database(),
-        Some(EXPECTED_DATABASE),
-        "the test database url must name the {EXPECTED_DATABASE} database"
-    );
-    assert_eq!(
-        options.get_username(),
-        EXPECTED_USER,
-        "the test database url must use the {EXPECTED_USER} role"
-    );
-    assert_eq!(
-        options.get_port(),
-        EXPECTED_PORT,
-        "the test database url must use port {EXPECTED_PORT}"
-    );
-
-    let socket = configured_socket_path(&url);
-    assert_task_socket(&socket);
-
+    let options = test_database_options();
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
-        .connect_with(options)
+        .connect_with(options.clone())
         .await
-        .expect("the test database must be reachable");
-    verify_identity(&pool, &socket).await;
+        .expect("the dedicated test database must be reachable");
+    verify_identity(&pool, &options, EXPECTED_DATABASE, TEST_DATABASE_MARKER).await;
     pool
 }
 
@@ -261,20 +320,14 @@ pub async fn open_queue_with_config(
 /// transaction of another database is refused. The tests only read from it and
 /// roll their transactions back.
 pub async fn connect_to_sibling_database() -> PgPool {
-    let url = test_database_url().replace(EXPECTED_DATABASE, SIBLING_DATABASE);
-    let options = PgConnectOptions::from_str(&url).unwrap_or_else(|error| {
-        panic!("the sibling database url must be a valid postgres url: {error}")
-    });
-    assert_eq!(
-        options.get_database(),
-        Some(SIBLING_DATABASE),
-        "the sibling database url must name the {SIBLING_DATABASE} database"
-    );
-    sqlx::postgres::PgPoolOptions::new()
+    let options = fixture_options(SIBLING_DATABASE_URL_ENV, SIBLING_DATABASE);
+    let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
-        .connect_with(options)
+        .connect_with(options.clone())
         .await
-        .expect("the sibling database must be reachable")
+        .expect("the dedicated sibling database must be reachable");
+    verify_identity(&pool, &options, SIBLING_DATABASE, SIBLING_DATABASE_MARKER).await;
+    pool
 }
 
 /// Inserts a task without the wake up notification of the queue.
@@ -367,64 +420,137 @@ pub async fn app_domain_count(pool: &PgPool) -> i64 {
         .unwrap_or_default()
 }
 
-fn configured_socket_path(url: &str) -> PathBuf {
-    let query = url.split_once('?').map(|(_, query)| query).unwrap_or("");
-    for pair in query.split('&') {
-        if let Some(value) = pair.strip_prefix("host=") {
-            return PathBuf::from(value);
-        }
-    }
-    panic!("the test database url must point at the unix socket of the tasks checkout");
-}
-
-fn assert_task_socket(socket: &Path) {
-    assert!(
-        socket.is_absolute(),
-        "the test database socket must be an absolute path: {socket:?}"
-    );
-    assert!(
-        socket.ends_with("target/pg"),
-        "the test database socket must live in the target directory of the tasks checkout: {socket:?}"
-    );
-    let root = socket
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or_else(|| panic!("the socket path must live in <root>/target/pg: {socket:?}"));
-    let manifest = root.join("Cargo.toml");
-    assert!(
-        manifest.is_file(),
-        "the socket path must belong to a checkout of the library: {root:?}"
-    );
-    let manifest =
-        std::fs::read_to_string(&manifest).expect("the checkout manifest must be readable");
-    assert!(
-        manifest.contains("name = \"cloudiful-tasks\""),
-        "the socket path must belong to a checkout of the library: {root:?}"
-    );
-}
-
-async fn verify_identity(pool: &PgPool, socket: &Path) {
+async fn verify_identity(
+    pool: &PgPool,
+    options: &PgConnectOptions,
+    expected_database: &str,
+    expected_marker: &str,
+) {
     let row = sqlx::query_file_as!(IdentityRow, "sql/tests/migration_test_identity.sql")
         .fetch_one(pool)
         .await
-        .expect("the test database must report its identity");
+        .expect("the dedicated database must report its identity");
+    if let Err(reason) = validate_identity(&row, options, expected_database, expected_marker) {
+        panic!("the {expected_database} fixture is invalid: {reason}");
+    }
+}
 
-    assert_eq!(row.database_name.as_deref(), Some(EXPECTED_DATABASE));
-    assert_eq!(row.user_name.as_deref(), Some(EXPECTED_USER));
-    assert!(
-        row.server_address.is_none(),
-        "the test database must not listen on a network address"
-    );
-    assert_eq!(row.server_port.as_deref(), Some("57664"));
+#[cfg(test)]
+mod fixture_guard_tests {
+    use super::*;
 
-    let expected = std::fs::canonicalize(socket).unwrap_or_else(|_| socket.to_path_buf());
-    assert!(
-        row.socket_directories
-            .as_deref()
-            .unwrap_or_default()
-            .split(':')
-            .any(|directory| Path::new(directory) == expected),
-        "the test database must listen on the socket of the tasks checkout: {:?}",
-        row.socket_directories
-    );
+    fn options(url: &str) -> PgConnectOptions {
+        PgConnectOptions::from_str(url).expect("the test fixture url must parse")
+    }
+
+    fn dedicated_options() -> PgConnectOptions {
+        options("postgres://postgres@unraid.cloud1ful.com:5432/cloudiful_tasks_test")
+    }
+
+    fn identity() -> IdentityRow {
+        IdentityRow {
+            database_name: Some(EXPECTED_DATABASE.to_owned()),
+            user_name: Some("postgres".to_owned()),
+            server_address: Some("172.19.0.30".to_owned()),
+            server_port: Some(EXPECTED_SERVER_PORT.to_owned()),
+            database_comment: Some(TEST_DATABASE_MARKER.to_owned()),
+        }
+    }
+
+    #[test]
+    fn missing_malformed_and_mismatched_urls_fail_closed() {
+        assert!(fixture_options_from(None, EXPECTED_DATABASE).is_err());
+        assert!(fixture_options_from(Some("not a url"), EXPECTED_DATABASE).is_err());
+        assert!(
+            fixture_options_from(
+                Some("postgres://postgres@unraid.cloud1ful.com:5432/postgres"),
+                EXPECTED_DATABASE
+            )
+            .is_err()
+        );
+        assert!(
+            fixture_options_from(
+                Some("postgres://postgres@localhost:5432/cloudiful_tasks_test"),
+                EXPECTED_DATABASE
+            )
+            .is_err()
+        );
+        assert!(
+            fixture_options_from(
+                Some("postgres://postgres@unraid.cloud1ful.com:5433/cloudiful_tasks_test"),
+                EXPECTED_DATABASE
+            )
+            .is_err()
+        );
+        assert!(
+            fixture_options_from(
+                Some("postgres://postgres@unraid.cloud1ful.com:5432/cloudiful_tasks_test"),
+                EXPECTED_DATABASE
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn connection_option_overrides_are_refused() {
+        assert!(
+            validate_fixture_options(
+                &options(
+                    "postgres://postgres@unraid.cloud1ful.com:5432/cloudiful_tasks_test?host=/tmp"
+                ),
+                EXPECTED_DATABASE
+            )
+            .is_err()
+        );
+        assert!(
+            validate_fixture_options(
+                &options("postgres://postgres@unraid.cloud1ful.com:5432/cloudiful_tasks_test?options=-csearch_path%3Dpublic"),
+                EXPECTED_DATABASE
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn identity_requires_the_dedicated_marker_and_endpoint() {
+        let options = dedicated_options();
+        let row = identity();
+        assert!(validate_identity(&row, &options, EXPECTED_DATABASE, TEST_DATABASE_MARKER).is_ok());
+
+        let mut wrong = identity();
+        wrong.database_name = Some("postgres".to_owned());
+        assert!(
+            validate_identity(&wrong, &options, EXPECTED_DATABASE, TEST_DATABASE_MARKER).is_err()
+        );
+
+        let mut wrong = identity();
+        wrong.database_comment = Some("another fixture".to_owned());
+        assert!(
+            validate_identity(&wrong, &options, EXPECTED_DATABASE, TEST_DATABASE_MARKER).is_err()
+        );
+
+        let mut wrong = identity();
+        wrong.user_name = Some("someone-else".to_owned());
+        assert!(
+            validate_identity(&wrong, &options, EXPECTED_DATABASE, TEST_DATABASE_MARKER).is_err()
+        );
+
+        let mut wrong = identity();
+        wrong.server_address = None;
+        assert!(
+            validate_identity(&wrong, &options, EXPECTED_DATABASE, TEST_DATABASE_MARKER).is_err()
+        );
+
+        let mut wrong = identity();
+        wrong.server_address = Some("127.0.0.1".to_owned());
+        assert!(
+            validate_identity(&wrong, &options, EXPECTED_DATABASE, TEST_DATABASE_MARKER).is_err()
+        );
+
+        let mut wrong = identity();
+        wrong.server_port = Some("5434".to_owned());
+        assert!(
+            validate_identity(&wrong, &options, EXPECTED_DATABASE, TEST_DATABASE_MARKER).is_err()
+        );
+    }
 }

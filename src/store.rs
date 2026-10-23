@@ -16,6 +16,7 @@ use crate::model::{
     Attempt, AttemptId, AttemptStatus, Failure, FencingToken, ListCursor, Namespace,
     ProgressUpdate, QueueName, Task, TaskId, TaskKind, TaskStatus,
 };
+use crate::queue::QueuePolicy;
 
 #[derive(sqlx::FromRow)]
 pub(crate) struct TaskRow {
@@ -47,6 +48,11 @@ pub(crate) struct TaskRow {
 struct LockRow {
     task_found: Option<i64>,
     attempt_found: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct QueuePolicyRow {
+    max_concurrent_attempts: i32,
 }
 
 #[derive(sqlx::FromRow)]
@@ -91,6 +97,136 @@ pub(crate) async fn verify_instance(connection: &mut PgConnection, expected: Uui
         });
     }
     Ok(())
+}
+
+/// Takes the queue scoped transaction advisory lock.
+///
+/// Claims and policy replacement use the same lock, so a policy change and a
+/// count-and-claim cannot interleave. The lock is held until the end of the
+/// transaction of the caller.
+pub(crate) async fn lock_queue(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+) -> Result<()> {
+    sqlx::query_file!(
+        "sql/store_lock_queue.sql",
+        namespace.as_str(),
+        queue.as_str(),
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    Ok(())
+}
+
+/// Reads the durable execution policy of the queue.
+pub(crate) async fn queue_policy(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+) -> Result<QueuePolicy> {
+    let row = sqlx::query_file_as!(
+        QueuePolicyRow,
+        "sql/store_queue_policy_get.sql",
+        namespace.as_str(),
+        queue.as_str(),
+    )
+    .fetch_optional(&mut *connection)
+    .await?;
+    match row {
+        Some(row) => {
+            let limit = u32::try_from(row.max_concurrent_attempts)
+                .ok()
+                .filter(|limit| *limit > 0)
+                .ok_or(Error::Validation {
+                    field: "max_concurrent_attempts",
+                    reason: "the stored policy is not a positive supported integer".to_owned(),
+                })?;
+            Ok(QueuePolicy {
+                max_concurrent_attempts: Some(limit),
+            })
+        }
+        None => Ok(QueuePolicy::unlimited()),
+    }
+}
+
+/// Stores the positive concurrency limit of the queue.
+pub(crate) async fn set_queue_policy(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+    max_concurrent_attempts: i32,
+) -> Result<()> {
+    sqlx::query_file!(
+        "sql/store_queue_policy_set.sql",
+        namespace.as_str(),
+        queue.as_str(),
+        max_concurrent_attempts,
+    )
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
+}
+
+/// Removes the stored policy of the queue and restores the unlimited default.
+pub(crate) async fn clear_queue_policy(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+) -> Result<()> {
+    sqlx::query_file!(
+        "sql/store_queue_policy_delete.sql",
+        namespace.as_str(),
+        queue.as_str(),
+    )
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
+}
+
+async fn running_attempt_count(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+) -> Result<i64> {
+    Ok(sqlx::query_file_scalar!(
+        "sql/store_queue_policy_count.sql",
+        namespace.as_str(),
+        queue.as_str(),
+    )
+    .fetch_one(&mut *connection)
+    .await?
+    .unwrap_or_default())
+}
+
+async fn transaction_isolation(connection: &mut PgConnection) -> Result<String> {
+    sqlx::query_file_scalar!("sql/store_queue_policy_isolation.sql")
+        .fetch_one(&mut *connection)
+        .await?
+        .ok_or(Error::Validation {
+            field: "transaction_isolation",
+            reason: "the database did not report its isolation level".to_owned(),
+        })
+}
+
+/// Whether the captured attempt already holds a terminal seal.
+pub(crate) async fn attempt_is_sealed(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+    attempt: &Attempt,
+) -> Result<bool> {
+    Ok(sqlx::query_file_scalar!(
+        "sql/store_attempt_sealed.sql",
+        namespace.as_str(),
+        queue.as_str(),
+        attempt.task_id().as_uuid(),
+        attempt.id().as_uuid(),
+        attempt.fencing_token().as_uuid(),
+    )
+    .fetch_one(&mut *connection)
+    .await?
+    .unwrap_or(false))
 }
 
 /// The largest number of additional attempts a manual retry can grant.
@@ -281,6 +417,29 @@ pub(crate) async fn claim_task(
     lease_ttl: Duration,
     target: Option<TaskId>,
 ) -> Result<Option<crate::model::Claim>> {
+    // The lock statement runs on its own so that a READ COMMITTED transaction
+    // takes a fresh snapshot after it acquired the lock. A limit that was
+    // stored while the claim waited is therefore visible to the count below.
+    lock_queue(connection, namespace, queue).await?;
+    // Every claim requires READ COMMITTED, whether or not the queue has a
+    // policy now. An older snapshot could otherwise miss a policy committed
+    // while the claim waited, or act on a stale policy and running count.
+    if transaction_isolation(connection).await? != "read committed" {
+        return Err(Error::Validation {
+            field: "transaction_isolation",
+            reason: "all task claims require READ COMMITTED".to_owned(),
+        });
+    }
+    if let Some(limit) = queue_policy(connection, namespace, queue)
+        .await?
+        .max_concurrent_attempts
+    {
+        let running = running_attempt_count(connection, namespace, queue).await?;
+        if running >= i64::from(limit) {
+            return Ok(None);
+        }
+    }
+
     let row = sqlx::query_file_as!(
         AttemptRow,
         "sql/store_claim.sql",

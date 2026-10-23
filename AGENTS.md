@@ -14,41 +14,47 @@ cargo test --locked --offline --doc
 SQLX_OFFLINE=true cargo check --locked --offline --all-targets
 ```
 
-The live tests are ignored by default. They need the fixture database and run
-serially:
+The live tests are ignored by default. They use the dedicated non-production
+databases on the shared test server and run serially:
+
+The live tests read two explicit environment values:
+`CLOUDIFUL_TASKS_TEST_DATABASE_URL` for `cloudiful_tasks_test` and
+`CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL` for `cloudiful_tasks_dev`.
 
 ```sh
-CLOUDIFUL_TASKS_TEST_DATABASE_URL='postgresql://dev@localhost:57664/cloudiful_tasks_test?host=<repo>/target/pg' \
-  cargo test --locked --offline --test migration -- --include-ignored --test-threads=1
-CLOUDIFUL_TASKS_TEST_DATABASE_URL='postgresql://dev@localhost:57664/cloudiful_tasks_test?host=<repo>/target/pg' \
-  cargo test --locked --offline --test postgres -- --include-ignored --test-threads=1
-CLOUDIFUL_TASKS_TEST_DATABASE_URL='postgresql://dev@localhost:57664/cloudiful_tasks_test?host=<repo>/target/pg' \
-  cargo test --locked --offline --test worker -- --include-ignored --test-threads=1
+cargo test --locked --offline --test migration -- --include-ignored --test-threads=1
+cargo test --locked --offline --test postgres -- --include-ignored --test-threads=1
+cargo test --locked --offline --test worker -- --include-ignored --test-threads=1
 ```
 
-`<repo>` is the root of this checkout; the socket directory is `<repo>/target/pg`.
-A live test fails when the variable is missing or when the database does not
-report the expected identity (`cloudiful_tasks_test`, role `dev`, port `57664`,
-no network listener, socket of this checkout). Never point the variable at a
-production or shared database.
+The test URL names `cloudiful_tasks_test`; the explicit sibling URL names
+`cloudiful_tasks_dev`. Both must use the fixed `unraid.cloud1ful.com:5432`
+endpoint. A live test fails when an environment value is missing or malformed,
+when the effective `PgConnectOptions` carries a socket or connection option
+override, or when the database does not report the configured role, a TCP
+server address, server port `5432` and the exact dedicated database comment
+(`cloudiful-tasks test fixture v1; non-production; dedicated` for the test
+database, `cloudiful-tasks development fixture v1; non-production; dedicated`
+for the sibling). The guard runs before any reset or destructive statement.
 
 ## Databases
 
 | Database | Purpose |
 | --- | --- |
-| `cloudiful_tasks_dev` | Query metadata for `cargo sqlx prepare`, and the compile time check of the query macros |
+| `cloudiful_tasks_dev` | Query metadata for `cargo sqlx prepare`, the compile time check of the query macros, and the sibling identity test |
 | `cloudiful_tasks_test` | Live tests: migration, ownership and coexistence checks |
 
 Only the development database is used to regenerate the query metadata:
 
 ```sh
-DATABASE_URL='postgresql://dev@localhost:57664/cloudiful_tasks_dev?host=<repo>/target/pg' \
+DATABASE_URL="$CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL" \
   cargo sqlx prepare -- --all-targets
 ```
 
 The development database also holds the test owned `app_domain` schema, so the
 query macros of the test statements can be described. The fixture is created by
-`sql/tests/transaction_app_domain_setup.sql`.
+`sql/tests/transaction_app_domain_setup.sql`. Never reset a shared project
+database and never derive one fixture URL from the other.
 
 ## Transaction variants
 
@@ -67,6 +73,24 @@ Every mutating queue operation has a variant that takes
   the two cannot diverge in result, error or bounds.
 - The result of a variant is valid before the commit of the caller but not
   durable until it.
+
+## Queue policies and external terminals
+
+`QueuePolicy { max_concurrent_attempts: Option<u32> }` is stored in
+`cloudiful_tasks.queue_policies` and read on every `Queue::policy` call. A
+missing row is unlimited. Every claim path takes the queue scoped transaction
+advisory lock and then requires `READ COMMITTED` before it reads the policy,
+counts the running attempts of the queue and claims in separate statements; a
+non-default isolation is refused even while the queue is unlimited, so an old
+snapshot cannot bypass a limit stored after the transaction began. Recovery
+keeps an expired attempt counted until it seals it.
+
+`Outcome::ExternallyCompleted` means the handler already committed the terminal
+of the captured attempt. The worker verifies the namespace, queue, task,
+attempt, fencing token and a sealed `succeeded`, `failed` or `cancelled` status
+with `sql/store_attempt_sealed.sql`. Only a verified seal skips the worker
+terminal; an unsealed signal uses the normal failure write and a lost lease
+never touches a newer attempt.
 
 ## Addressed claims
 

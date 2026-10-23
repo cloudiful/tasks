@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT max_concurrent_attempts\nFROM cloudiful_tasks.queue_policies\nWHERE namespace = $1 AND queue = $2\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "max_concurrent_attempts",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.queue_policies",
+            "name": "max_concurrent_attempts"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "8ff1b6513912549a1378e476c47ff514ac3758764888ccd2f6654b9ae24899bf"
+}

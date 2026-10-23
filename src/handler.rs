@@ -21,6 +21,13 @@ pub enum Outcome {
     Completed(Option<Value>),
     /// The task failed.
     Failed(Failure),
+    /// The handler already committed the terminal state of its attempt.
+    ///
+    /// The worker verifies that the exact captured attempt was sealed as
+    /// succeeded, failed or cancelled before it skips its own terminal write.
+    /// An unsealed attempt is handled as a failure, and a lost lease is never
+    /// written to a newer attempt.
+    ExternallyCompleted,
 }
 
 impl Outcome {

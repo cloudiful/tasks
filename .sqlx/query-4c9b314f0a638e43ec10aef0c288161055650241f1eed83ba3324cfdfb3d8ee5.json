@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- Takes the transaction advisory lock of one queue.\n--\n-- Claims and policy replacement use this lock, so a policy change and a\n-- count-and-claim of the same queue cannot interleave. The two key form keeps\n-- the lock separate from the one key migration lock space.\nSELECT pg_advisory_xact_lock(\n    hashtext('cloudiful_tasks.queue'),\n    hashtext($1 || E'\\x1f' || $2)\n)\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pg_advisory_xact_lock",
+        "type_info": "Void",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "4c9b314f0a638e43ec10aef0c288161055650241f1eed83ba3324cfdfb3d8ee5"
+}
