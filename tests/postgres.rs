@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use cloudiful_tasks::{
-    AttemptStatus, EnqueueRequest, Error, Failure, ProgressUpdate, RetryPolicy, TaskId, TaskKind,
-    TaskStatus,
+    AttemptStatus, EnqueueRequest, Error, Failure, ProgressUpdate, QueuePolicy, RetryPolicy,
+    TaskId, TaskKind, TaskStatus,
 };
 use serde_json::json;
 use sqlx::postgres::PgListener;
@@ -28,6 +28,35 @@ const QUEUE: &str = "q";
 
 fn request() -> EnqueueRequest {
     EnqueueRequest::new(TaskKind::new("demo").unwrap(), json!({"a": 1}))
+}
+
+async fn running_attempts(pool: &sqlx::PgPool, namespace: &str, queue: &str) -> i64 {
+    sqlx::query_file_scalar!("sql/store_queue_policy_count.sql", namespace, queue)
+        .fetch_one(pool)
+        .await
+        .expect("the running attempts must be countable")
+        .unwrap_or_default()
+}
+
+async fn isolation_transaction<'a>(
+    pool: &'a sqlx::PgPool,
+    level: &str,
+) -> sqlx::Transaction<'a, sqlx::Postgres> {
+    let mut transaction = pool.begin().await.unwrap();
+    let statement = match level {
+        "REPEATABLE READ" => "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        "SERIALIZABLE" => "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        other => panic!("unsupported isolation level {other}"),
+    };
+    sqlx::query(statement)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("SELECT 1")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction
 }
 
 #[tokio::test]
@@ -1678,4 +1707,392 @@ async fn an_addressed_claim_in_a_transaction_of_another_schema_instance_is_refus
     let stored = queue.get(task.task().id()).await.unwrap().unwrap();
     assert_eq!(stored.status(), TaskStatus::Queued);
     assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_queue_policy_limits_every_claim_path_across_instances() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let second = open_queue(&pool, NAMESPACE, QUEUE).await;
+    queue
+        .set_policy(QueuePolicy {
+            max_concurrent_attempts: Some(1),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        second.policy().await.unwrap().max_concurrent_attempts,
+        Some(1)
+    );
+
+    let first = queue.enqueue(request()).await.unwrap();
+    let second_task = queue.enqueue(request()).await.unwrap();
+    let claim = second
+        .claim("worker-1")
+        .await
+        .unwrap()
+        .expect("the first claim must be admitted");
+    assert_eq!(claim.task().id(), first.task().id());
+
+    assert!(
+        queue.claim("worker-2").await.unwrap().is_none(),
+        "the second claim of the queue must be refused"
+    );
+    assert!(
+        second
+            .claim_by_id(second_task.task().id(), "worker-3")
+            .await
+            .unwrap()
+            .is_none(),
+        "an addressed claim must obey the queue policy"
+    );
+
+    let mut transaction = pool.begin().await.unwrap();
+    assert!(
+        second
+            .claim_in(&mut transaction, "worker-4")
+            .await
+            .unwrap()
+            .is_none(),
+        "a borrowed claim must obey the queue policy"
+    );
+    transaction.rollback().await.unwrap();
+
+    let mut transaction = pool.begin().await.unwrap();
+    assert!(
+        second
+            .claim_by_id_in(&mut transaction, second_task.task().id(), "worker-5")
+            .await
+            .unwrap()
+            .is_none(),
+        "a borrowed addressed claim must obey the queue policy"
+    );
+    transaction.rollback().await.unwrap();
+
+    let other_queue = open_queue(&pool, NAMESPACE, "other").await;
+    other_queue.enqueue(request()).await.unwrap();
+    assert!(
+        other_queue.claim("worker-6").await.unwrap().is_some(),
+        "another queue of the namespace must stay unlimited"
+    );
+
+    queue.complete(claim.attempt(), None).await.unwrap();
+    let next = second
+        .claim("worker-7")
+        .await
+        .unwrap()
+        .expect("the sealed attempt must free the capacity");
+    assert_eq!(next.task().id(), second_task.task().id());
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn failure_cancellation_and_recovery_free_policy_capacity() {
+    let pool = connect().await;
+    reset(&pool).await;
+
+    let failure_queue = open_queue(&pool, NAMESPACE, "failure").await;
+    failure_queue
+        .set_policy(QueuePolicy {
+            max_concurrent_attempts: Some(1),
+        })
+        .await
+        .unwrap();
+    failure_queue.enqueue(request()).await.unwrap();
+    let failed_claim = failure_queue.claim("worker-1").await.unwrap().unwrap();
+    failure_queue
+        .fail(&failed_claim.attempt().clone(), &Failure::permanent(None))
+        .await
+        .unwrap();
+    failure_queue.enqueue(request()).await.unwrap();
+    assert!(
+        failure_queue.claim("worker-2").await.unwrap().is_some(),
+        "a sealed failure must free the capacity"
+    );
+
+    let cancel_queue = open_queue(&pool, NAMESPACE, "cancel").await;
+    cancel_queue
+        .set_policy(QueuePolicy {
+            max_concurrent_attempts: Some(1),
+        })
+        .await
+        .unwrap();
+    let cancelled_task = cancel_queue.enqueue(request()).await.unwrap();
+    let cancelled_claim = cancel_queue.claim("worker-3").await.unwrap().unwrap();
+    cancel_queue
+        .request_cancel(cancelled_task.task().id())
+        .await
+        .unwrap();
+    let cancelled = cancel_queue
+        .complete(cancelled_claim.attempt(), None)
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status(), TaskStatus::Cancelled);
+    cancel_queue.enqueue(request()).await.unwrap();
+    assert!(
+        cancel_queue.claim("worker-4").await.unwrap().is_some(),
+        "a sealed cancellation must free the capacity"
+    );
+
+    let recovery_queue = open_queue_with_short_lease(&pool, NAMESPACE, "recovery").await;
+    recovery_queue
+        .set_policy(QueuePolicy {
+            max_concurrent_attempts: Some(1),
+        })
+        .await
+        .unwrap();
+    recovery_queue.enqueue(request()).await.unwrap();
+    recovery_queue.claim("worker-5").await.unwrap().unwrap();
+    assert!(
+        recovery_queue.claim("worker-6").await.unwrap().is_none(),
+        "the expired but unsealed attempt must still count"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    recovery_queue.recover_expired(10).await.unwrap();
+    recovery_queue.enqueue(request()).await.unwrap();
+    assert!(
+        recovery_queue.claim("worker-7").await.unwrap().is_some(),
+        "recovery must free the capacity"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_queue_policy_is_durable_and_unlimited_by_default() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    assert_eq!(queue.policy().await.unwrap(), QueuePolicy::unlimited());
+
+    let first = queue.enqueue(request()).await.unwrap();
+    let second = queue.enqueue(request()).await.unwrap();
+    assert!(queue.claim("worker-1").await.unwrap().is_some());
+    assert!(
+        queue.claim("worker-2").await.unwrap().is_some(),
+        "an absent policy must leave the queue unlimited"
+    );
+    assert_eq!(task_count(&pool, NAMESPACE, QUEUE).await, 2);
+    assert_ne!(first.task().id(), second.task().id());
+
+    let error = queue
+        .set_policy(QueuePolicy {
+            max_concurrent_attempts: Some(0),
+        })
+        .await
+        .expect_err("a zero limit must be rejected");
+    assert!(matches!(error, Error::Validation { .. }));
+
+    let error = queue
+        .set_policy(QueuePolicy {
+            max_concurrent_attempts: Some(u32::MAX),
+        })
+        .await
+        .expect_err("an out of range limit must be rejected");
+    assert!(matches!(error, Error::Validation { .. }));
+
+    queue
+        .set_policy(QueuePolicy {
+            max_concurrent_attempts: Some(2),
+        })
+        .await
+        .unwrap();
+    drop(queue);
+    let reopened = open_queue(&pool, NAMESPACE, QUEUE).await;
+    assert_eq!(
+        reopened.policy().await.unwrap(),
+        QueuePolicy {
+            max_concurrent_attempts: Some(2),
+        }
+    );
+
+    reopened.set_policy(QueuePolicy::unlimited()).await.unwrap();
+    assert_eq!(reopened.policy().await.unwrap(), QueuePolicy::unlimited());
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_policy_protected_claim_requires_read_committed() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    queue
+        .set_policy(QueuePolicy {
+            max_concurrent_attempts: Some(1),
+        })
+        .await
+        .unwrap();
+    let task = queue.enqueue(request()).await.unwrap();
+
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    let error = queue
+        .claim_in(&mut transaction, "worker")
+        .await
+        .expect_err("a repeatable read claim must be refused");
+    assert!(
+        matches!(
+            error,
+            Error::Validation {
+                field: "transaction_isolation",
+                ..
+            }
+        ),
+        "unexpected error: {error}"
+    );
+    transaction.rollback().await.unwrap();
+
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Queued);
+    assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn an_unlimited_claim_requires_read_committed() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    assert_eq!(queue.policy().await.unwrap(), QueuePolicy::unlimited());
+    let task = queue.enqueue(request()).await.unwrap();
+
+    for level in ["REPEATABLE READ", "SERIALIZABLE"] {
+        let mut transaction = isolation_transaction(&pool, level).await;
+        let error = queue
+            .claim_in(&mut transaction, "worker")
+            .await
+            .expect_err("an unlimited claim under a non default isolation must be refused");
+        assert_claim_requires_read_committed(&error);
+        transaction.rollback().await.unwrap();
+
+        let mut transaction = isolation_transaction(&pool, level).await;
+        let error = queue
+            .claim_by_id_in(&mut transaction, task.task().id(), "worker")
+            .await
+            .expect_err(
+                "an addressed unlimited claim under a non default isolation must be refused",
+            );
+        assert_claim_requires_read_committed(&error);
+        transaction.rollback().await.unwrap();
+    }
+
+    assert_eq!(running_attempts(&pool, NAMESPACE, QUEUE).await, 0);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Queued);
+    assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 0);
+}
+
+fn assert_claim_requires_read_committed(error: &Error) {
+    match error {
+        Error::Validation { field, reason } => {
+            assert_eq!(*field, "transaction_isolation");
+            assert_eq!(reason.as_str(), "all task claims require READ COMMITTED");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn an_old_snapshot_cannot_bypass_a_policy_installed_while_it_waits() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    assert_eq!(queue.policy().await.unwrap(), QueuePolicy::unlimited());
+    let first = queue.enqueue(request()).await.unwrap();
+    let second = queue.enqueue(request()).await.unwrap();
+
+    let mut borrowed = isolation_transaction(&pool, "REPEATABLE READ").await;
+    let mut addressed = isolation_transaction(&pool, "REPEATABLE READ").await;
+
+    let running = queue
+        .claim("worker-1")
+        .await
+        .unwrap()
+        .expect("the first claim must be admitted");
+    assert_eq!(running.task().id(), first.task().id());
+
+    queue
+        .set_policy(QueuePolicy {
+            max_concurrent_attempts: Some(1),
+        })
+        .await
+        .unwrap();
+
+    let error = queue
+        .claim_in(&mut borrowed, "worker-2")
+        .await
+        .expect_err("an old snapshot must not bypass the new policy");
+    assert_claim_requires_read_committed(&error);
+    borrowed.rollback().await.unwrap();
+    let error = queue
+        .claim_by_id_in(&mut addressed, second.task().id(), "worker-3")
+        .await
+        .expect_err("an old addressed snapshot must not bypass the new policy");
+    assert_claim_requires_read_committed(&error);
+
+    assert_eq!(
+        running_attempts(&pool, NAMESPACE, QUEUE).await,
+        1,
+        "the refused claims must leave the running count unchanged"
+    );
+    addressed.rollback().await.unwrap();
+
+    let stored = queue.get(second.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Queued);
+    assert_eq!(attempt_count(&pool, second.task().id().as_uuid()).await, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_waiting_policy_claim_uses_a_fresh_snapshot_after_the_queue_lock() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    queue
+        .set_policy(QueuePolicy {
+            max_concurrent_attempts: Some(1),
+        })
+        .await
+        .unwrap();
+    let first = queue.enqueue(request()).await.unwrap();
+    let second = queue.enqueue(request()).await.unwrap();
+    let claim = queue.claim("worker-1").await.unwrap().unwrap();
+
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtext('cloudiful_tasks.queue'), \
+         hashtext($1 || E'\\x1f' || $2))",
+    )
+    .bind(NAMESPACE)
+    .bind(QUEUE)
+    .fetch_one(&mut *holder)
+    .await
+    .unwrap();
+
+    let waiting_queue = queue.clone();
+    let waiting = tokio::spawn(async move { waiting_queue.claim("worker-2").await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !waiting.is_finished(),
+        "the claim must wait for the queue lock"
+    );
+
+    queue
+        .complete(claim.attempt(), Some(json!({"ok": true})))
+        .await
+        .unwrap();
+    holder.commit().await.unwrap();
+
+    let next = waiting
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("the waiting claim must see the capacity of the sealed attempt");
+    assert_eq!(next.task().id(), second.task().id());
+    assert_eq!(first.task().id(), claim.task().id());
 }

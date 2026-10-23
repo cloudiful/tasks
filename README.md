@@ -28,9 +28,10 @@ The `v0.1` release implements:
 - the durable queue store: enqueue with idempotency, claim with a lease,
   renewal, progress, completion, failure, cancellation, manual retry and
   recovery of expired leases,
+- durable queue policies with an optional global limit on running attempts,
 - the worker runtime: bounded concurrency, lease heartbeat, cooperative
-  cancellation, recovery of expired leases, wake up notifications and a
-  graceful shutdown.
+  cancellation, recovery of expired leases, wake up notifications, a
+  handler-owned terminal outcome and a graceful shutdown.
 
 ## Install
 
@@ -78,6 +79,7 @@ Both calls refuse a database that is not ready:
 | The schema does not exist | `check_schema` reports `SchemaMissing`, `migrate` creates it |
 | The schema exists without the ownership marker of the library | `ForeignSchema` |
 | The schema was written by a newer library version | `UnsupportedSchemaVersion` |
+| An owned schema uses an older supported protocol version | `migrate` upgrades it; `check_schema` reports `OutdatedSchemaVersion` |
 | An applied migration no longer matches the migration source | `ChecksumMismatch` |
 
 A schema that the library does not own is never adopted and never overwritten.
@@ -129,6 +131,31 @@ if let Some(claim) = queue.claim_by_id(task_id, "worker-1").await? {
 The claim needs the same lease and the same fencing token as every other
 claim, and the caller keeps the decision which task is eligible.
 
+### Queue policies
+
+A policy is stored per namespace and queue, so every instance that opens the
+same queue enforces the same limit:
+
+```rust
+use cloudiful_tasks::QueuePolicy;
+
+queue
+    .set_policy(QueuePolicy {
+        max_concurrent_attempts: Some(1),
+    })
+    .await?;
+
+let policy = queue.policy().await?;
+```
+
+| Topic | Behaviour |
+| --- | --- |
+| Default | A queue without a stored policy is unlimited, which preserves the behavior of every existing queue. |
+| Limit | `Some(n)` accepts a positive supported integer and rejects zero or an out-of-range value. A lower limit applies to future claims and never cancels running attempts. |
+| Capacity | Every claim path counts the running attempts of the queue under the same queue-scoped transaction advisory lock that replaces the policy. An expired running attempt still counts until recovery seals it, and a successful completion, failure, cancellation or recovery frees the capacity by sealing the attempt. |
+| Isolation | Every claim path requires `READ COMMITTED`, whether or not the queue has a stored policy; another isolation level is refused before the policy is read. The lock statement and the count run separately, so a waiting claim counts after it acquired the lock and cannot rely on a snapshot taken before a limit was stored. |
+| Reset | Setting `None` removes the policy and restores the unlimited behavior. |
+
 ### The worker
 
 A worker claims the tasks of its queue and runs the handlers of their kinds.
@@ -176,6 +203,7 @@ The semantics of the worker:
 | Recovery | The worker seals the attempts whose lease expired and schedules their tasks again. |
 | Wake up | The notification of the queue is a hint. The worker also polls, so a lost notification only delays the next task. |
 | A panic | The task fails permanently, the worker keeps running. The payload of the task is never printed. |
+| External terminal | `Outcome::ExternallyCompleted` tells the worker that the handler already committed the terminal of its attempt with `Queue::complete`, `Queue::fail` or `Queue::complete_in`/`fail_in`. The worker verifies the captured attempt id, task, fencing token and a sealed succeeded, failed or cancelled status, then skips its own terminal write. An unsealed signal fails the still owned attempt; a lost lease never touches a newer attempt. |
 | Shutdown | The worker stops claiming, asks its handlers to stop, waits for the grace period and aborts the rest. The aborted handlers are dropped, also when they ignore the cancellation token of their attempt. Their leases stay recoverable, no task is finished with a result the worker did not produce. |
 
 ### The transaction API
@@ -232,11 +260,20 @@ committed, so the crate builds without a database:
 SQLX_OFFLINE=true cargo check --locked --offline --all-targets
 ```
 
-Regenerate the metadata only against the development database of the checkout:
+Regenerate the metadata only against the dedicated development database of the
+shared non-production test server:
 
 ```sh
-DATABASE_URL=postgresql://dev@localhost:5432/cloudiful_tasks_dev cargo sqlx prepare -- --all-targets
+DATABASE_URL="$CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL" \
+  cargo sqlx prepare -- --all-targets
 ```
+
+The live suites read their explicit fixture URLs from
+`CLOUDIFUL_TASKS_TEST_DATABASE_URL` (`cloudiful_tasks_test`) and
+`CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL` (`cloudiful_tasks_dev`). The guard
+checks the effective connection options, the actual database identity and the
+exact dedicated database comment before any fixture reset; a shared project
+database is never accepted.
 
 ## License
 

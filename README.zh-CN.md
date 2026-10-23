@@ -24,8 +24,9 @@ schema 中。本库不会自行执行任务：worker 运行时由应用显式启
 - 显式的 schema 初始化：包含归属标记、版本化的 schema 协议和迁移校验和验证，
 - 持久化队列存储：带幂等键的入队、带租约的领取、续租、进度、完成、失败、取消、
   手动重试以及过期租约的恢复，
-- worker 运行时：有界并发、租约心跳、协作式取消、过期租约恢复、唤醒通知以及
-  优雅停机。
+- 持久化队列策略：可选地限制队列中同时运行的尝试数量，
+- worker 运行时：有界并发、租约心跳、协作式取消、过期租约恢复、唤醒通知、
+  处理函数拥有的终态结果以及优雅停机。
 
 ## 安装
 
@@ -72,6 +73,7 @@ println!("schema 实例 {}，协议版本 {}", schema.instance_uuid(), schema.pr
 | schema 不存在 | `check_schema` 返回 `SchemaMissing`，`migrate` 创建它 |
 | schema 存在但没有本库的归属标记 | `ForeignSchema` |
 | schema 由更新版本的库写入 | `UnsupportedSchemaVersion` |
+| 本库拥有的 schema 使用较旧的受支持协议版本 | `migrate` 会升级它；`check_schema` 返回 `OutdatedSchemaVersion` |
 | 已应用的迁移与迁移源不再一致 | `ChecksumMismatch` |
 
 不属于本库的 schema 不会被接管，也不会被覆盖。
@@ -122,6 +124,30 @@ if let Some(claim) = queue.claim_by_id(task_id, "worker-1").await? {
 该领取与其他领取一样需要租约和 fencing token，哪个任务可以执行仍由调用方
 决定。
 
+### 队列策略
+
+策略按命名空间和队列持久化，因此打开同一队列的所有实例执行同一限制：
+
+```rust
+use cloudiful_tasks::QueuePolicy;
+
+queue
+    .set_policy(QueuePolicy {
+        max_concurrent_attempts: Some(1),
+    })
+    .await?;
+
+let policy = queue.policy().await?;
+```
+
+| 主题 | 行为 |
+| --- | --- |
+| 默认 | 没有存储策略的队列不受限制，所有已有队列的行为保持不变。 |
+| 限制 | `Some(n)` 只接受受支持的正整数，拒绝零或越界值。调低限制只影响之后的领取，不会取消运行中的任务。 |
+| 容量 | 所有领取路径在与策略替换相同的队列级事务咨询锁下统计运行中的尝试。已过期但尚未被恢复封存的尝试仍然计数；完成、失败、取消或恢复通过封存尝试释放容量。 |
+| 隔离级别 | 所有领取路径都要求 `READ COMMITTED`，无论队列是否存有策略；其他隔离级别会在读取策略前被拒绝。加锁语句与计数分开执行，因此等待中的领取在取得锁之后才计数，不能依赖在限制写入之前取得的快照。 |
+| 重置 | 设置 `None` 会删除策略并恢复不受限制的行为。 |
+
 ### worker
 
 worker 领取其队列中的任务并运行相应类型的处理函数。在调用 `run` 之前不会
@@ -169,6 +195,7 @@ worker 的语义：
 | 恢复 | worker 封存租约过期的尝试并重新排队其任务。 |
 | 唤醒 | 队列的通知只是一个提示。worker 同时也会轮询，因此丢失的通知只会延迟下一个任务。 |
 | panic | 任务永久失败，worker 继续运行。任务的 payload 绝不会被打印。 |
+| 外部终态 | `Outcome::ExternallyCompleted` 表示处理函数已经通过 `Queue::complete`、`Queue::fail` 或 `Queue::complete_in`/`fail_in` 提交了该尝试的终态。worker 校验捕获的尝试 id、任务、fencing token 以及 succeeded、failed 或 cancelled 封存状态，然后跳过自己的终态写入。未封存的信号会让仍持有租约的尝试失败；租约丢失时绝不会写入更新的尝试。 |
 | 停机 | worker 停止领取、通知处理函数停止、等待宽限期并中止其余任务。被中止的处理函数会被丢弃，即使它们忽略其尝试的取消令牌。它们的租约仍可被恢复，任务不会以 worker 未产生的结果结束。 |
 
 ### 事务 API
@@ -220,11 +247,17 @@ cargo run --example transactional
 SQLX_OFFLINE=true cargo check --locked --offline --all-targets
 ```
 
-仅针对当前检出目录的开发数据库重新生成元数据：
+仅针对共享非生产测试服务器上的专用开发数据库重新生成元数据：
 
 ```sh
-DATABASE_URL=postgresql://dev@localhost:5432/cloudiful_tasks_dev cargo sqlx prepare -- --all-targets
+DATABASE_URL="$CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL" \
+  cargo sqlx prepare -- --all-targets
 ```
+
+实时测试从显式的 `CLOUDIFUL_TASKS_TEST_DATABASE_URL`（`cloudiful_tasks_test`）
+和 `CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL`（`cloudiful_tasks_dev`）读取
+测试库 URL。守卫会在任何夹具重置之前校验实际连接选项、数据库实际身份和精确的
+专用数据库注释；共享项目数据库永远不会被接受。
 
 ## 许可证
 

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO cloudiful_tasks.queue_policies (\n    namespace,\n    queue,\n    max_concurrent_attempts,\n    updated_at\n)\nVALUES ($1, $2, $3, clock_timestamp())\nON CONFLICT (namespace, queue) DO UPDATE\nSET max_concurrent_attempts = EXCLUDED.max_concurrent_attempts,\n    updated_at = clock_timestamp()\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "684f9f0497a0dae1a0d97b6b14cb52436515d09b74f3fb5735ff483dd2000d9d"
+}

@@ -18,9 +18,10 @@
 //! run to completion, so handlers must be idempotent and callers must fence
 //! their own side effects with the attempt fencing token.
 //!
-//! The current release implements the data model, the configuration contract,
-//! the explicit schema bootstrap and the durable queue store. The worker
-//! runtime is not implemented yet.
+//! The library implements the data model, the configuration contract, the
+//! explicit schema bootstrap, the durable queue store, durable queue policies
+//! and the worker runtime. A handler may commit its own terminal state and
+//! report it with [`Outcome::ExternallyCompleted`].
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -49,7 +50,7 @@ pub use crate::model::{
     FencingToken, ListCursor, Namespace, ProgressUpdate, QueueName, RetryPolicy, Task, TaskId,
     TaskKind, TaskStatus,
 };
-pub use crate::queue::{MAX_ATTEMPT_LIMIT, MAX_LIST_LIMIT, MAX_RECOVERY_LIMIT, Queue};
+pub use crate::queue::{MAX_ATTEMPT_LIMIT, MAX_LIST_LIMIT, MAX_RECOVERY_LIMIT, Queue, QueuePolicy};
 pub use crate::wake::{WAKE_CHANNEL, WakeListener, Wakeup};
 pub use crate::worker::{Worker, WorkerBuilder};
 pub use tokio_util::sync::CancellationToken;

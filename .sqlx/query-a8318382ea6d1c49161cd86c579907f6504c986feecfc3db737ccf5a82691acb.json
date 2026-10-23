@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- Whether the captured attempt already holds a terminal seal.\n--\n-- The task, the attempt and the fencing token identify the attempt, so a\n-- terminal of a newer attempt never matches.\nSELECT EXISTS (\n    SELECT 1\n    FROM cloudiful_tasks.attempts AS a\n    INNER JOIN cloudiful_tasks.tasks AS t ON t.id = a.task_id\n    WHERE t.namespace = $1\n      AND t.queue = $2\n      AND a.task_id = $3\n      AND a.id = $4\n      AND a.fencing_token = $5\n      AND a.status IN ('succeeded', 'failed', 'cancelled')\n) AS sealed\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sealed",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "a8318382ea6d1c49161cd86c579907f6504c986feecfc3db737ccf5a82691acb"
+}

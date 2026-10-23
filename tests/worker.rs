@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cloudiful_tasks::{
-    CancellationToken, EnqueueRequest, Error, Failure, HandlerError, Outcome, ProgressUpdate,
-    Queue, TaskContext, TaskHandler, TaskKind, TaskStatus, Worker, WorkerConfig,
+    AttemptStatus, CancellationToken, EnqueueRequest, Error, Failure, HandlerError, Outcome,
+    ProgressUpdate, Queue, TaskContext, TaskHandler, TaskKind, TaskStatus, Worker, WorkerConfig,
 };
 use serde_json::json;
 use tokio::sync::Notify;
@@ -276,6 +276,245 @@ impl TaskHandler for Reporting {
             .map_err(|error| HandlerError::new(error.to_string()))?;
         tokio::time::sleep(self.work).await;
         Ok(Outcome::completed(None))
+    }
+}
+
+/// A handler that commits its own terminal state and reports it.
+struct ExternalCompletion {
+    queue: Queue,
+    recorder: Recorder,
+    result: serde_json::Value,
+}
+
+#[async_trait]
+impl TaskHandler for ExternalCompletion {
+    async fn handle(&self, context: TaskContext) -> Result<Outcome, HandlerError> {
+        self.recorder.handled(context.task_id().as_uuid());
+        self.queue
+            .complete(context.attempt(), Some(self.result.clone()))
+            .await
+            .map_err(|error| HandlerError::new(error.to_string()))?;
+        Ok(Outcome::ExternallyCompleted)
+    }
+}
+
+/// A handler that commits its own failure and reports it.
+struct ExternalFailure {
+    queue: Queue,
+    recorder: Recorder,
+}
+
+#[async_trait]
+impl TaskHandler for ExternalFailure {
+    async fn handle(&self, context: TaskContext) -> Result<Outcome, HandlerError> {
+        self.recorder.handled(context.task_id().as_uuid());
+        self.queue
+            .fail(
+                context.attempt(),
+                &Failure::permanent(Some(json!({"reason": "external failure"}))),
+            )
+            .await
+            .map_err(|error| HandlerError::new(error.to_string()))?;
+        Ok(Outcome::ExternallyCompleted)
+    }
+}
+
+/// A handler that loses a cancellation race before it reports its terminal.
+struct ExternalCancellation {
+    queue: Queue,
+    recorder: Recorder,
+}
+
+#[async_trait]
+impl TaskHandler for ExternalCancellation {
+    async fn handle(&self, context: TaskContext) -> Result<Outcome, HandlerError> {
+        self.recorder.handled(context.task_id().as_uuid());
+        self.queue
+            .request_cancel(context.task_id())
+            .await
+            .map_err(|error| HandlerError::new(error.to_string()))?;
+        self.queue
+            .complete(context.attempt(), Some(json!({"discarded": true})))
+            .await
+            .map_err(|error| HandlerError::new(error.to_string()))?;
+        Ok(Outcome::ExternallyCompleted)
+    }
+}
+
+/// A handler that reports an external terminal while a newer attempt is sealed.
+struct NewerTerminal {
+    pool: sqlx::PgPool,
+    recorder: Recorder,
+}
+
+#[async_trait]
+impl TaskHandler for NewerTerminal {
+    async fn handle(&self, context: TaskContext) -> Result<Outcome, HandlerError> {
+        self.recorder.handled(context.task_id().as_uuid());
+        sqlx::query(
+            "INSERT INTO cloudiful_tasks.attempts (
+                 id, task_id, attempt_number, worker_id, fencing_token,
+                 status, lease_expires_at, started_at, finished_at
+             )
+             VALUES (
+                 gen_random_uuid(), $1, 2, 'newer-worker', gen_random_uuid(),
+                 'succeeded', NULL, now(), now()
+             )",
+        )
+        .bind(context.task_id().as_uuid())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| HandlerError::new(error.to_string()))?;
+        Ok(Outcome::ExternallyCompleted)
+    }
+}
+
+/// A handler that reports an external terminal without committing one.
+struct UnsealedExternalCompletion {
+    recorder: Recorder,
+}
+
+#[async_trait]
+impl TaskHandler for UnsealedExternalCompletion {
+    async fn handle(&self, context: TaskContext) -> Result<Outcome, HandlerError> {
+        self.recorder.handled(context.task_id().as_uuid());
+        Ok(Outcome::ExternallyCompleted)
+    }
+}
+
+struct SealedContinuation {
+    queue: Queue,
+    recorder: Recorder,
+    release: Arc<Notify>,
+    token: Arc<Mutex<Option<CancellationToken>>>,
+    mode: u8,
+}
+
+#[async_trait]
+impl TaskHandler for SealedContinuation {
+    async fn handle(&self, context: TaskContext) -> Result<Outcome, HandlerError> {
+        let _drop = DropSignal {
+            recorder: self.recorder.clone(),
+            task_id: context.task_id().as_uuid(),
+        };
+        *self.token.lock().unwrap() = Some(context.cancellation_token());
+        let result = match self.mode {
+            0 => self
+                .queue
+                .complete(context.attempt(), Some(json!({"sealed": true})))
+                .await
+                .map(|_| ()),
+            1 => self
+                .queue
+                .fail(context.attempt(), &Failure::permanent(None))
+                .await
+                .map(|_| ()),
+            _ => {
+                let mut tx = self
+                    .queue
+                    .pool()
+                    .begin()
+                    .await
+                    .map_err(|e| HandlerError::new(e.to_string()))?;
+                self.queue
+                    .request_cancel_in(&mut tx, context.task_id())
+                    .await
+                    .map_err(|e| HandlerError::new(e.to_string()))?;
+                self.queue
+                    .complete_in(&mut tx, context.attempt(), None)
+                    .await
+                    .map_err(|e| HandlerError::new(e.to_string()))?;
+                tx.commit().await.map_err(Error::from)
+            }
+        };
+        result.map_err(|e| HandlerError::new(e.to_string()))?;
+        self.recorder.handled(context.task_id().as_uuid());
+        self.release.notified().await;
+        Ok(Outcome::ExternallyCompleted)
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_sealed_handler_continues_across_renewals_but_shutdown_still_aborts_it() {
+    let pool = connect().await;
+    for mode in 0..3 {
+        for force_shutdown in [false, true] {
+            reset(&pool).await;
+            let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+            let task = queue
+                .enqueue(EnqueueRequest::new(TaskKind::new(KIND).unwrap(), json!({})))
+                .await
+                .unwrap();
+            let recorder = Recorder::default();
+            let release = Arc::new(Notify::new());
+            let token = Arc::new(Mutex::new(None));
+            let worker = Worker::builder(
+                queue.clone(),
+                WorkerConfig {
+                    heartbeat_interval: Duration::from_millis(40),
+                    shutdown_grace: Duration::from_millis(100),
+                    ..worker_config()
+                },
+            )
+            .handler(
+                TaskKind::new(KIND).unwrap(),
+                SealedContinuation {
+                    queue: queue.clone(),
+                    recorder: recorder.clone(),
+                    release: release.clone(),
+                    token: token.clone(),
+                    mode,
+                },
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            let shutdown = CancellationToken::new();
+            let worker_token = shutdown.clone();
+            let worker = tokio::spawn(async move { worker.run(worker_token).await });
+            recorder.wait_for_handled(1).await;
+            let cancel = token.lock().unwrap().clone().unwrap();
+            let mut ticks = tokio::time::interval(Duration::from_millis(80));
+            for _ in 0..6 {
+                ticks.tick().await;
+                assert!(
+                    !cancel.is_cancelled(),
+                    "a verified seal must not cancel its handler"
+                );
+                assert!(
+                    !recorder.was_dropped(task.task().id().as_uuid()),
+                    "a sealed handler must continue through renewal ticks"
+                );
+            }
+            if !force_shutdown {
+                release.notify_one();
+                recorder.wait_for_dropped().await;
+            }
+            shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(2), worker)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(recorder.was_dropped(task.task().id().as_uuid()));
+            if force_shutdown {
+                assert!(
+                    cancel.is_cancelled(),
+                    "shutdown still includes sealed handlers"
+                );
+            }
+            let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+            assert_eq!(
+                stored.status(),
+                match mode {
+                    0 => TaskStatus::Succeeded,
+                    1 => TaskStatus::Failed,
+                    _ => TaskStatus::Cancelled,
+                }
+            );
+            assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 1);
+        }
     }
 }
 
@@ -1353,4 +1592,207 @@ async fn the_shutdown_signals_the_running_handlers_while_the_pool_is_busy() {
         "the shutdown must not wait for the busy pool"
     );
     finished.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn an_external_terminal_skips_the_worker_terminal() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+    let recorder = Recorder::default();
+
+    let worker = Worker::builder(queue.clone(), worker_config())
+        .handler(
+            kind(),
+            ExternalCompletion {
+                queue: queue.clone(),
+                recorder: recorder.clone(),
+                result: json!({"external": true}),
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let (shutdown, handle) = start(worker);
+
+    recorder.wait_for_handled(1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    shutdown.cancel();
+    handle.await.unwrap().unwrap();
+
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Succeeded);
+    assert_eq!(
+        stored
+            .result()
+            .and_then(|result| result.get("external").cloned()),
+        Some(json!(true))
+    );
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status(), AttemptStatus::Succeeded);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn an_external_failure_skips_the_worker_terminal() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+    let recorder = Recorder::default();
+
+    let worker = Worker::builder(queue.clone(), worker_config())
+        .handler(
+            kind(),
+            ExternalFailure {
+                queue: queue.clone(),
+                recorder: recorder.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let (shutdown, handle) = start(worker);
+
+    recorder.wait_for_handled(1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    shutdown.cancel();
+    handle.await.unwrap().unwrap();
+
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Failed);
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status(), AttemptStatus::Failed);
+    assert_eq!(
+        attempts[0]
+            .error()
+            .and_then(|error| error.get("reason"))
+            .cloned(),
+        Some(json!("external failure"))
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn an_external_completion_accepts_the_cancellation_winner() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+    let recorder = Recorder::default();
+
+    let worker = Worker::builder(queue.clone(), worker_config())
+        .handler(
+            kind(),
+            ExternalCancellation {
+                queue: queue.clone(),
+                recorder: recorder.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let (shutdown, handle) = start(worker);
+
+    recorder.wait_for_handled(1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    shutdown.cancel();
+    handle.await.unwrap().unwrap();
+
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Cancelled);
+    assert!(stored.result().is_none());
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status(), AttemptStatus::Cancelled);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_newer_attempt_terminal_does_not_authorize_the_external_completion() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+    let recorder = Recorder::default();
+
+    let worker = Worker::builder(queue.clone(), worker_config())
+        .handler(
+            kind(),
+            NewerTerminal {
+                pool: pool.clone(),
+                recorder: recorder.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let (shutdown, handle) = start(worker);
+
+    recorder.wait_for_handled(1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    shutdown.cancel();
+    handle.await.unwrap().unwrap();
+
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(
+        stored.status(),
+        TaskStatus::Failed,
+        "the newer terminal must not authorize the captured attempt"
+    );
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    let first = attempts
+        .iter()
+        .find(|attempt| attempt.attempt_number() == 1)
+        .expect("the captured attempt must exist");
+    let newer = attempts
+        .iter()
+        .find(|attempt| attempt.attempt_number() == 2)
+        .expect("the newer attempt must exist");
+    assert_eq!(first.status(), AttemptStatus::Failed);
+    assert_eq!(newer.status(), AttemptStatus::Succeeded);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn an_unsealed_external_terminal_fails_the_attempt() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+    let recorder = Recorder::default();
+
+    let worker = Worker::builder(queue.clone(), worker_config())
+        .handler(
+            kind(),
+            UnsealedExternalCompletion {
+                recorder: recorder.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let (shutdown, handle) = start(worker);
+
+    recorder.wait_for_handled(1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    shutdown.cancel();
+    handle.await.unwrap().unwrap();
+
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Failed);
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status(), AttemptStatus::Failed);
+    assert_eq!(
+        attempts[0]
+            .error()
+            .and_then(|error| error.get("reason"))
+            .cloned(),
+        Some(json!("external completion was not sealed"))
+    );
 }

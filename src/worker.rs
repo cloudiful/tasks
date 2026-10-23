@@ -64,6 +64,7 @@ struct ActiveAttempt {
     deadline: Instant,
     failures: u32,
     renewing: bool,
+    terminal: bool,
 }
 
 /// The registry of the running attempts of a worker.
@@ -98,6 +99,7 @@ impl Registry {
                 deadline,
                 failures: 0,
                 renewing: false,
+                terminal: false,
             },
         );
     }
@@ -127,7 +129,7 @@ impl Registry {
             .expect("the registry of the worker is not poisoned");
         let matches = active
             .get(task_id)
-            .is_some_and(|entry| identity.matches(&entry.attempt));
+            .is_some_and(|entry| identity.matches(&entry.attempt) && !entry.terminal);
         if !matches {
             return;
         }
@@ -147,6 +149,7 @@ impl Registry {
             .expect("the registry of the worker is not poisoned");
         if let Some(entry) = active.get(task_id)
             && identity.matches(&entry.attempt)
+            && !entry.terminal
         {
             entry.cancel.cancel();
         }
@@ -170,6 +173,7 @@ impl Registry {
             .expect("the registry of the worker is not poisoned");
         active
             .values()
+            .filter(|entry| !entry.terminal)
             .map(|entry| {
                 (
                     entry.attempt.task_id(),
@@ -189,11 +193,26 @@ impl Registry {
             .lock()
             .expect("the registry of the worker is not poisoned");
         match active.get_mut(task_id) {
-            Some(entry) if identity.matches(&entry.attempt) && !entry.renewing => {
+            Some(entry)
+                if identity.matches(&entry.attempt) && !entry.renewing && !entry.terminal =>
+            {
                 entry.renewing = true;
                 true
             }
             _ => false,
+        }
+    }
+
+    fn mark_terminal(&self, task_id: &TaskId, identity: AttemptIdentity) {
+        let mut active = self
+            .active
+            .lock()
+            .expect("the registry of the worker is not poisoned");
+        if let Some(entry) = active.get_mut(task_id)
+            && identity.matches(&entry.attempt)
+        {
+            entry.terminal = true;
+            entry.renewing = false;
         }
     }
 
@@ -549,7 +568,11 @@ async fn supervise(
     // The authority of the attempt must still be there. When the worker gave
     // it up, the attempt lost its lease and no write is allowed, also when the
     // lease of the database is still live.
-    if context.registry.take(&task_id, identity).is_none() {
+    let Some(active) = context.registry.take(&task_id, identity) else {
+        return;
+    };
+    if active.terminal {
+        context.wakeup.wake();
         return;
     }
 
@@ -562,6 +585,27 @@ async fn supervise(
     let result = match outcome {
         Outcome::Completed(result) => context.queue.complete(&attempt, result).await.map(|_| ()),
         Outcome::Failed(failure) => context.queue.fail(&attempt, &failure).await.map(|_| ()),
+        Outcome::ExternallyCompleted => {
+            match context.queue.attempt_is_sealed(&attempt).await {
+                // The handler committed the terminal of this exact attempt.
+                // The worker must not write a second terminal.
+                Ok(true) => Ok(()),
+                // The signal is not backed by a seal of this attempt. The
+                // normal failure write either seals the still owned attempt or
+                // reports the lost lease without touching a newer attempt.
+                Ok(false) => context
+                    .queue
+                    .fail(
+                        &attempt,
+                        &Failure::permanent(Some(failure_payload(
+                            "external completion was not sealed",
+                        ))),
+                    )
+                    .await
+                    .map(|_| ()),
+                Err(error) => Err(error),
+            }
+        }
     };
     let _ = result;
 
@@ -613,11 +657,6 @@ async fn heartbeat_loop(context: Arc<RunContext>) {
         while renewals.try_join_next().is_some() {}
         for (task_id, attempt, deadline) in context.registry.active_attempts() {
             let identity = AttemptIdentity::of(&attempt);
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                context.registry.revoke(&task_id, identity);
-                continue;
-            }
             if !context.registry.start_renewal(&task_id, identity) {
                 continue;
             }
@@ -645,7 +684,7 @@ async fn renew_attempt(
     let margin = authority_margin(context.config.lease_ttl);
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        context.registry.revoke(&task_id, identity);
+        revoke_unless_sealed(&context, task_id, &attempt, margin).await;
         return;
     }
     let budget = remaining.saturating_sub(margin);
@@ -659,21 +698,53 @@ async fn renew_attempt(
         Ok(Err(error)) => {
             let lost = matches!(error, Error::LeaseLost { .. });
             if lost {
-                context.registry.revoke(&task_id, identity);
+                match sealed_within(&context, &attempt, margin).await {
+                    Some(true) => context.registry.mark_terminal(&task_id, identity),
+                    Some(false) => context.registry.revoke(&task_id, identity),
+                    None => {
+                        let failures = context.registry.count_failure(&task_id, identity);
+                        if failures > context.config.heartbeat_failure_budget
+                            || Instant::now() >= deadline
+                        {
+                            context.registry.revoke(&task_id, identity);
+                        }
+                    }
+                }
             } else {
                 let failures = context.registry.count_failure(&task_id, identity);
                 if failures > context.config.heartbeat_failure_budget {
-                    context.registry.revoke(&task_id, identity);
+                    revoke_unless_sealed(&context, task_id, &attempt, margin).await;
                 }
             }
         }
         Err(_elapsed) => {
-            // The renewal did not finish in time, the authority of the attempt
-            // is given up.
-            context.registry.revoke(&task_id, identity);
+            revoke_unless_sealed(&context, task_id, &attempt, margin).await;
         }
     }
     context.registry.finish_renewal(&task_id, identity);
+}
+
+async fn sealed_within(context: &RunContext, attempt: &Attempt, budget: Duration) -> Option<bool> {
+    tokio::time::timeout(budget, context.queue.attempt_is_sealed(attempt))
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+}
+
+async fn revoke_unless_sealed(
+    context: &RunContext,
+    task_id: TaskId,
+    attempt: &Attempt,
+    budget: Duration,
+) {
+    let identity = AttemptIdentity::of(attempt);
+    // The final probe uses only the reserved authority margin. An unavailable
+    // database never grants an unbounded continuation to an unverified attempt.
+    if sealed_within(context, attempt, budget).await == Some(true) {
+        context.registry.mark_terminal(&task_id, identity);
+    } else {
+        context.registry.revoke(&task_id, identity);
+    }
 }
 
 /// Asks the running attempts to stop when their task was cancelled.
@@ -788,6 +859,7 @@ mod tests {
 
         // The callbacks of the first attempt change nothing of the second one.
         let deadline = Instant::now() + Duration::from_secs(30);
+        registry.mark_terminal(&task_id, first_identity);
         registry.revoke(&task_id, first_identity);
         registry.extend_deadline(&task_id, first_identity, deadline);
         registry.finish_renewal(&task_id, first_identity);
@@ -814,7 +886,15 @@ mod tests {
             .pop()
             .expect("the second attempt must hold its authority");
         assert_eq!(entry_deadline, deadline);
-        assert!(registry.take(&task_id, second_identity).is_some());
+        registry.mark_terminal(&task_id, second_identity);
+        assert!(registry.active_attempts().is_empty());
+        assert!(!registry.start_renewal(&task_id, second_identity));
+        registry.cancel(&task_id, second_identity);
+        registry.revoke(&task_id, second_identity);
+        assert!(!token.is_cancelled());
+        registry.cancel_all();
+        assert!(token.is_cancelled());
+        assert!(registry.take(&task_id, second_identity).unwrap().terminal);
     }
 
     #[test]

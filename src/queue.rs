@@ -35,6 +35,46 @@ pub const MAX_RECOVERY_LIMIT: u32 = 1000;
 /// The largest length of a worker identifier.
 pub const MAX_WORKER_ID_LENGTH: usize = 128;
 
+/// The durable execution policy of one namespace and queue.
+///
+/// The policy applies to every instance that opens the same queue. A missing
+/// policy row is the same as [`QueuePolicy::unlimited`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueuePolicy {
+    /// The largest number of attempts that may run at the same time.
+    ///
+    /// `None` keeps the queue unlimited. `Some(limit)` must be positive and
+    /// fit the integer column of the queue policy table.
+    pub max_concurrent_attempts: Option<u32>,
+}
+
+impl QueuePolicy {
+    /// A policy without a global concurrency limit.
+    pub const fn unlimited() -> Self {
+        Self {
+            max_concurrent_attempts: None,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let Some(limit) = self.max_concurrent_attempts {
+            if limit == 0 {
+                return Err(Error::Validation {
+                    field: "max_concurrent_attempts",
+                    reason: "must be at least 1".to_owned(),
+                });
+            }
+            if limit > i32::MAX as u32 {
+                return Err(Error::Validation {
+                    field: "max_concurrent_attempts",
+                    reason: format!("must not exceed {}", i32::MAX),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A queue of one namespace and one queue name.
 #[derive(Debug, Clone)]
 pub struct Queue {
@@ -88,6 +128,37 @@ impl Queue {
     /// The lease time to live of the claims of this queue.
     pub fn lease_ttl(&self) -> Duration {
         self.lease_ttl
+    }
+
+    /// Reads the durable execution policy of the queue.
+    ///
+    /// The policy is read from the database on every call. A queue without a
+    /// stored policy is unlimited.
+    pub async fn policy(&self) -> Result<QueuePolicy> {
+        let mut connection = self.pool.acquire().await?;
+        store::queue_policy(&mut connection, &self.namespace, &self.queue).await
+    }
+
+    /// Replaces the durable execution policy of the queue.
+    ///
+    /// The replacement and every claim of the queue are serialized by the
+    /// queue scoped transaction lock. A lower limit applies to future claims
+    /// and never cancels running attempts. `None` removes the policy row and
+    /// restores the unlimited behavior.
+    pub async fn set_policy(&self, policy: QueuePolicy) -> Result<()> {
+        policy.validate()?;
+        let mut transaction = self.pool.begin().await?;
+        let outcome = self.set_policy_on(&mut transaction, policy).await;
+        match outcome {
+            Ok(()) => {
+                transaction.commit().await?;
+                Ok(())
+            }
+            Err(error) => {
+                transaction.rollback().await.ok();
+                Err(error)
+            }
+        }
     }
 
     /// Enqueues a task.
@@ -159,8 +230,18 @@ impl Queue {
     /// the fencing token of the new attempt.
     pub async fn claim(&self, worker_id: &str) -> Result<Option<Claim>> {
         let worker_id = validate_worker_id(worker_id)?;
-        let mut connection = self.pool.acquire().await?;
-        self.claim_on(&mut connection, worker_id, None).await
+        let mut transaction = self.pool.begin().await?;
+        let outcome = self.claim_on(&mut transaction, worker_id, None).await;
+        match outcome {
+            Ok(claim) => {
+                transaction.commit().await?;
+                Ok(claim)
+            }
+            Err(error) => {
+                transaction.rollback().await.ok();
+                Err(error)
+            }
+        }
     }
 
     /// Claims the next ready task of the queue in the transaction of the
@@ -168,7 +249,9 @@ impl Queue {
     ///
     /// The claim and the business write of the caller are only durable when
     /// the caller commits the transaction. The transaction must belong to the
-    /// schema instance of this queue, otherwise the call is refused.
+    /// schema instance of this queue, otherwise the call is refused. The
+    /// transaction must run at `READ COMMITTED`; every claim requires it, so
+    /// another isolation level is refused before the policy is read.
     pub async fn claim_in(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
@@ -190,9 +273,20 @@ impl Queue {
     /// decision which task is eligible stays with the caller.
     pub async fn claim_by_id(&self, task_id: TaskId, worker_id: &str) -> Result<Option<Claim>> {
         let worker_id = validate_worker_id(worker_id)?;
-        let mut connection = self.pool.acquire().await?;
-        self.claim_on(&mut connection, worker_id, Some(task_id))
-            .await
+        let mut transaction = self.pool.begin().await?;
+        let outcome = self
+            .claim_on(&mut transaction, worker_id, Some(task_id))
+            .await;
+        match outcome {
+            Ok(claim) => {
+                transaction.commit().await?;
+                Ok(claim)
+            }
+            Err(error) => {
+                transaction.rollback().await.ok();
+                Err(error)
+            }
+        }
     }
 
     /// Claims one task of the queue by its identifier in the transaction of
@@ -200,7 +294,9 @@ impl Queue {
     ///
     /// The claim and the business write of the caller are only durable when
     /// the caller commits the transaction. The transaction must belong to the
-    /// schema instance of this queue, otherwise the call is refused.
+    /// schema instance of this queue, otherwise the call is refused. The
+    /// transaction must run at `READ COMMITTED`; every claim requires it, so
+    /// another isolation level is refused before the policy is read.
     pub async fn claim_by_id_in(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
@@ -448,6 +544,33 @@ impl Queue {
         let limit = validate_limit(limit, MAX_RECOVERY_LIMIT, "limit")?;
         self.verify_instance(transaction).await?;
         self.recover_expired_on(transaction, limit).await
+    }
+
+    async fn set_policy_on(
+        &self,
+        connection: &mut PgConnection,
+        policy: QueuePolicy,
+    ) -> Result<()> {
+        store::lock_queue(connection, &self.namespace, &self.queue).await?;
+        match policy.max_concurrent_attempts {
+            Some(limit) => {
+                let limit = i32::try_from(limit).map_err(|_| Error::Validation {
+                    field: "max_concurrent_attempts",
+                    reason: format!("must not exceed {}", i32::MAX),
+                })?;
+                store::set_queue_policy(connection, &self.namespace, &self.queue, limit).await
+            }
+            None => store::clear_queue_policy(connection, &self.namespace, &self.queue).await,
+        }
+    }
+
+    /// Whether the captured attempt already holds a terminal seal.
+    ///
+    /// The check is scoped to the namespace, the queue, the task, the attempt
+    /// and its fencing token, so a terminal of another attempt never matches.
+    pub(crate) async fn attempt_is_sealed(&self, attempt: &Attempt) -> Result<bool> {
+        let mut connection = self.pool.acquire().await?;
+        store::attempt_is_sealed(&mut connection, &self.namespace, &self.queue, attempt).await
     }
 
     async fn claim_on(
