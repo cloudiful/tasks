@@ -14,12 +14,12 @@ cargo test --locked --offline --doc
 SQLX_OFFLINE=true cargo check --locked --offline --all-targets
 ```
 
-The live tests are ignored by default. They use the dedicated non-production
-databases on the shared test server and run serially:
+The live tests are ignored by default. They use the issue-owned non-production
+database pair on the shared test server and run serially:
 
 The live tests read two explicit environment values:
-`CLOUDIFUL_TASKS_TEST_DATABASE_URL` for `cloudiful_tasks_test` and
-`CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL` for `cloudiful_tasks_dev`.
+`CLOUDIFUL_TASKS_TEST_DATABASE_URL` for the issue primary database and
+`CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL` for its sibling.
 
 ```sh
 cargo test --locked --offline --test migration -- --include-ignored --test-threads=1
@@ -27,41 +27,47 @@ cargo test --locked --offline --test postgres -- --include-ignored --test-thread
 cargo test --locked --offline --test worker -- --include-ignored --test-threads=1
 ```
 
-The test URL names `cloudiful_tasks_test`; the explicit sibling URL names
-`cloudiful_tasks_dev`. Both must use the fixed `unraid.cloud1ful.com:5432`
-endpoint. A live test fails when an environment value is missing or malformed,
-when the effective `PgConnectOptions` carries a socket or connection option
-override, or when the database does not report the configured role, a TCP
-server address, server port `5432` and the exact dedicated database comment
-(`cloudiful-tasks test fixture v1; non-production; dedicated` for the test
-database, `cloudiful-tasks development fixture v1; non-production; dedicated`
-for the sibling). The guard runs before any reset or destructive statement.
+The guard parses both values together before any fixture access. The primary
+must be `cloudiful_tasks_issue_<id>` and the sibling
+`cloudiful_tasks_issue_<id>_sibling`, where `<id>` is a canonical positive
+`u32` without leading zeros and both names stay within 63 bytes. Both values
+must use the fixed `unraid.cloud1ful.com:5432` endpoint, a non-empty role and
+no socket or connection option override. Shared names, a mismatched issue pair
+and legacy names are refused. Before any write the database must report the
+configured role, its exact issue database name, a non-loopback TCP server
+address, server port `5432` and the exact marker
+`cloudiful-tasks issue <id> test fixture v1; non-production; issue-owned` (or
+`cloudiful-tasks issue <id> sibling fixture v1; non-production; issue-owned`).
+The guard runs before any reset or destructive statement.
 
 ## Databases
 
 | Database | Purpose |
 | --- | --- |
-| `cloudiful_tasks_dev` | Query metadata for `cargo sqlx prepare`, the compile time check of the query macros, and the sibling identity test |
-| `cloudiful_tasks_test` | Live tests: migration, ownership and coexistence checks |
+| `cloudiful_tasks_issue_<id>` | Live tests: migration, ownership and coexistence checks |
+| `cloudiful_tasks_issue_<id>_sibling` | Query metadata for `cargo sqlx prepare`, the compile time check of the query macros, and the cross-database identity test |
 
-Only the development database is used to regenerate the query metadata:
+Only the issue sibling database is used to regenerate the query metadata:
 
 ```sh
 DATABASE_URL="$CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL" \
   cargo sqlx prepare -- --all-targets
 ```
 
-The development database also holds the test owned `app_domain` schema, so the
+The issue sibling database also holds the test owned `app_domain` schema, so the
 query macros of the test statements can be described. The fixture is created by
-`sql/tests/transaction_app_domain_setup.sql`. Never reset a shared project
-database and never derive one fixture URL from the other.
+`sql/tests/transaction_app_domain_setup.sql`. Only the issue pair is created,
+migrated, seeded and dropped by this issue's primary, and both databases are
+dropped at issue completion after the exact markers are rechecked. Shared,
+other-issue and production databases are never reset.
 
 ## Transaction variants
 
 Every mutating queue operation has a variant that takes
 `&mut sqlx::Transaction<'_, sqlx::Postgres>`: `enqueue_in`, `claim_in`,
-`renew_in`, `report_progress_in`, `complete_in`, `fail_in`,
-`request_cancel_in`, `retry_failed_in` and `recover_expired_in`.
+`claim_from_candidates_in`, `set_resource_policy_in`, `renew_in`,
+`report_progress_in`, `complete_in`, `fail_in`, `request_cancel_in`,
+`retry_failed_in` and `recover_expired_in`.
 
 - A variant verifies the schema instance of the queue before it writes and
   refuses a transaction of another database or of another schema instance.
@@ -91,6 +97,34 @@ attempt, fencing token and a sealed `succeeded`, `failed` or `cancelled` status
 with `sql/store_attempt_sealed.sql`. Only a verified seal skips the worker
 terminal; an unsealed signal uses the normal failure write and a lost lease
 never touches a newer attempt.
+
+## Fair admission and shared resources
+
+`EnqueueRequest::with_class` and `with_resources` store the immutable admission
+metadata of a task; the default request stays unclassified and resource free.
+Resource keys are validated like every other name, are unique and bounded to 16
+and are stored sorted. `canonical_request_spec` keeps the exact stored shape of
+a default request and appends non-default class and resource keys, so a stored
+protocol 2 request still replays.
+
+`Queue::claim_from_candidates` accepts at most `MAX_CLAIM_CANDIDATES` unique
+identifiers. It reads the shared resource occupancy, orders the eligible
+candidates by class rotation and priority and claims the first candidate that
+is still grantable. The queue scoped advisory lock, the `READ COMMITTED` check,
+the global policy, the resource occupancy and the claim share one transaction.
+The fair cursor in `cloudiful_tasks.queue_class_cursors` moves only when the
+claim grants a task; the empty class represents a task without a class. The
+ordinary claim keeps its native order but skips resource blocked tasks, and an
+addressed claim still never falls back.
+
+`Queue::set_resource_policy` stores `cloudiful_tasks.queue_resource_policies`
+under the same queue lock and isolation check as a claim. A limit of
+`Some(n)` must be positive and fit the integer column, `None` deletes exactly
+that resource row. The running occupancy of a resource joins the running
+attempts to the immutable `tasks.resources`, so every attempt counts once per
+declared key and an expired but unsealed attempt still counts. Every claim path
+requires all declared keys to have capacity; a class limit is a resource key
+declared only by that class.
 
 ## Addressed claims
 

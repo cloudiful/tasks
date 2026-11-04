@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT t.class, t.resources, t.attempt_count, a.fencing_token\nFROM cloudiful_tasks.tasks AS t\nINNER JOIN cloudiful_tasks.attempts AS a ON a.task_id = t.id\nWHERE t.id = $1\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "class",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "class"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "resources",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "resources"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "attempt_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "attempt_count"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "fencing_token",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "fencing_token"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "52263e8dd692e848196ffa5babf88e6559a11cddd8e708deb66cd896453dc37c"
+}

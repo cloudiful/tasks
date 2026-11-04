@@ -23,6 +23,9 @@ pub const MAX_STAGE_LENGTH: usize = 128;
 /// Maximum length of a progress unit.
 pub const MAX_UNIT_LENGTH: usize = 32;
 
+/// Largest number of shared resource keys one task may declare.
+pub const MAX_RESOURCE_KEYS: usize = 16;
+
 /// Upper bound for a retry delay.
 pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -51,6 +54,11 @@ fn validate_name(field: &'static str, value: &str) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Validates a shared resource key with the same rules as every other name.
+pub(crate) fn validate_resource_name(value: &str) -> Result<()> {
+    validate_name("resource", value)
 }
 
 fn validate_idempotency_key(key: &str) -> Result<()> {
@@ -372,6 +380,8 @@ pub struct EnqueueRequest {
     priority: i32,
     available_at: Option<DateTime<Utc>>,
     retry: RetryPolicy,
+    class: Option<String>,
+    resources: Vec<String>,
 }
 
 impl EnqueueRequest {
@@ -384,6 +394,8 @@ impl EnqueueRequest {
             priority: 0,
             available_at: None,
             retry: RetryPolicy::none(),
+            class: None,
+            resources: Vec::new(),
         }
     }
 
@@ -417,6 +429,46 @@ impl EnqueueRequest {
         self
     }
 
+    /// Sets the admission class of the task.
+    ///
+    /// The class is immutable metadata. Fair candidate admission rotates
+    /// between the classes of the candidate set, and a resource policy that
+    /// uses the class name bounds the attempts of that class.
+    pub fn with_class(mut self, class: impl Into<String>) -> Result<Self> {
+        let class = class.into();
+        validate_name("class", &class)?;
+        self.class = Some(class);
+        Ok(self)
+    }
+
+    /// Sets the shared resource keys of the task.
+    ///
+    /// Every key is validated and the keys are sorted into their canonical
+    /// order. A key may occur once; a resource policy of the queue bounds the
+    /// running attempts that declare it.
+    pub fn with_resources(mut self, resources: impl IntoIterator<Item = String>) -> Result<Self> {
+        let mut values = Vec::new();
+        for resource in resources {
+            validate_name("resources", &resource)?;
+            values.push(resource);
+        }
+        if values.len() > MAX_RESOURCE_KEYS {
+            return Err(Error::Validation {
+                field: "resources",
+                reason: format!("must contain at most {MAX_RESOURCE_KEYS} resource keys"),
+            });
+        }
+        values.sort();
+        if values.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Error::Validation {
+                field: "resources",
+                reason: "must not contain duplicate resource keys".to_owned(),
+            });
+        }
+        self.resources = values;
+        Ok(self)
+    }
+
     /// The kind of the task.
     pub fn kind(&self) -> &TaskKind {
         &self.kind
@@ -445,6 +497,16 @@ impl EnqueueRequest {
     /// The retry policy of the task.
     pub fn retry_policy(&self) -> &RetryPolicy {
         &self.retry
+    }
+
+    /// The admission class of the request, if it has one.
+    pub fn class(&self) -> Option<&str> {
+        self.class.as_deref()
+    }
+
+    /// The shared resource keys of the request in canonical sorted order.
+    pub fn resources(&self) -> &[String] {
+        &self.resources
     }
 }
 
@@ -658,6 +720,8 @@ pub struct Task {
     pub(crate) cancel_requested_at: Option<DateTime<Utc>>,
     pub(crate) finished_at: Option<DateTime<Utc>>,
     pub(crate) terminal_reason: Option<String>,
+    pub(crate) class: Option<String>,
+    pub(crate) resources: Vec<String>,
 }
 
 impl Task {
@@ -756,6 +820,16 @@ impl Task {
         self.terminal_reason.as_deref()
     }
 
+    /// The admission class of the task, if it has one.
+    pub fn class(&self) -> Option<&str> {
+        self.class.as_deref()
+    }
+
+    /// The shared resource keys of the task in canonical sorted order.
+    pub fn resources(&self) -> &[String] {
+        &self.resources
+    }
+
     /// Whether the task reached a terminal state.
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
@@ -790,6 +864,8 @@ impl fmt::Debug for Task {
             .field("cancel_requested_at", &self.cancel_requested_at)
             .field("finished_at", &self.finished_at)
             .field("terminal_reason", &self.terminal_reason)
+            .field("class", &self.class)
+            .field("resources", &self.resources)
             .finish()
     }
 }
@@ -1109,6 +1185,91 @@ mod tests {
     }
 
     #[test]
+    fn a_request_carries_a_class_and_canonical_resources() {
+        let request = EnqueueRequest::new(TaskKind::new("demo").unwrap(), Value::Null)
+            .with_class("batch")
+            .unwrap()
+            .with_resources(["gpu".to_owned(), "io".to_owned()])
+            .unwrap();
+
+        assert_eq!(request.class(), Some("batch"));
+        assert_eq!(
+            request.resources().to_vec(),
+            vec!["gpu".to_owned(), "io".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_default_request_has_no_class_and_no_resources() {
+        let request = EnqueueRequest::new(TaskKind::new("demo").unwrap(), Value::Null);
+
+        assert_eq!(request.class(), None);
+        assert!(request.resources().is_empty());
+    }
+
+    #[test]
+    fn a_class_is_validated_like_every_other_name() {
+        let request = EnqueueRequest::new(TaskKind::new("demo").unwrap(), Value::Null);
+
+        assert!(request.clone().with_class("").is_err());
+        assert!(request.clone().with_class("bad class").is_err());
+        assert!(
+            request
+                .clone()
+                .with_class("a".repeat(MAX_NAME_LENGTH + 1))
+                .is_err()
+        );
+        assert!(request.with_class("a".repeat(MAX_NAME_LENGTH)).is_ok());
+    }
+
+    #[test]
+    fn resource_keys_are_bounded_unique_and_validated() {
+        let request = EnqueueRequest::new(TaskKind::new("demo").unwrap(), Value::Null);
+        let keys = |count: usize| {
+            (0..count)
+                .map(|index| format!("resource-{index}"))
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            request
+                .clone()
+                .with_resources(keys(MAX_RESOURCE_KEYS))
+                .is_ok()
+        );
+        assert!(
+            request
+                .clone()
+                .with_resources(keys(MAX_RESOURCE_KEYS + 1))
+                .is_err()
+        );
+        assert!(
+            request
+                .clone()
+                .with_resources(vec!["io".to_owned(), "io".to_owned()])
+                .is_err()
+        );
+        assert!(request.clone().with_resources(vec!["".to_owned()]).is_err());
+        assert!(
+            request
+                .clone()
+                .with_resources(vec!["a b".to_owned()])
+                .is_err()
+        );
+        assert!(
+            request
+                .clone()
+                .with_resources(vec!["a".repeat(MAX_NAME_LENGTH + 1)])
+                .is_err()
+        );
+        assert!(
+            request
+                .with_resources(vec!["a".repeat(MAX_NAME_LENGTH)])
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn idempotency_key_is_validated() {
         let request = EnqueueRequest::new(TaskKind::new("demo").unwrap(), Value::Null);
         assert!(request.clone().with_idempotency_key("").is_err());
@@ -1201,6 +1362,8 @@ mod tests {
             cancel_requested_at: None,
             finished_at: None,
             terminal_reason: None,
+            class: Some("batch".to_owned()),
+            resources: vec!["io".to_owned()],
         };
         let attempt = Attempt {
             id: AttemptId::new(),

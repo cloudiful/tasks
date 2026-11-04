@@ -9,10 +9,10 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use cloudiful_tasks::{
-    AttemptStatus, EnqueueRequest, Error, Failure, ProgressUpdate, QueuePolicy, RetryPolicy,
-    TaskId, TaskKind, TaskStatus,
+    AttemptStatus, EnqueueRequest, Error, Failure, MAX_CLAIM_CANDIDATES, ProgressUpdate,
+    QueuePolicy, RetryPolicy, Task, TaskId, TaskKind, TaskStatus,
 };
 use serde_json::json;
 use sqlx::postgres::PgListener;
@@ -2095,4 +2095,1002 @@ async fn a_waiting_policy_claim_uses_a_fresh_snapshot_after_the_queue_lock() {
         .expect("the waiting claim must see the capacity of the sealed attempt");
     assert_eq!(next.task().id(), second.task().id());
     assert_eq!(first.task().id(), claim.task().id());
+}
+
+fn classified(class: &str) -> EnqueueRequest {
+    request().with_class(class).unwrap()
+}
+
+fn classified_with_resources(class: &str, resources: &[&str]) -> EnqueueRequest {
+    request()
+        .with_class(class)
+        .unwrap()
+        .with_resources(resources.iter().map(|resource| (*resource).to_owned()))
+        .unwrap()
+}
+
+fn ordered_request(order: i32, priority: i32, available_at: DateTime<Utc>) -> EnqueueRequest {
+    EnqueueRequest::new(TaskKind::new("demo").unwrap(), json!({"order": order}))
+        .with_priority(priority)
+        .with_available_at(available_at)
+}
+
+fn ordered_class_request(order: i32, class: &str) -> EnqueueRequest {
+    EnqueueRequest::new(TaskKind::new("demo").unwrap(), json!({"order": order}))
+        .with_class(class)
+        .unwrap()
+}
+
+fn order_of(task: &Task) -> i32 {
+    task.payload()
+        .get("order")
+        .and_then(|value| value.as_i64())
+        .and_then(|value| i32::try_from(value).ok())
+        .expect("the test payload must carry its order")
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn native_and_fair_claims_share_the_default_class_order() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let native = open_queue(&pool, NAMESPACE, "native-order").await;
+    let fair = open_queue(&pool, NAMESPACE, "fair-order").await;
+    let now = Utc::now();
+    let requests = [
+        ordered_request(1, 5, now - ChronoDuration::minutes(10)),
+        ordered_request(2, 5, now - ChronoDuration::minutes(5)),
+        ordered_request(3, 5, now - ChronoDuration::minutes(5)),
+        ordered_request(4, 9, now - ChronoDuration::minutes(20)),
+        ordered_request(5, 1, now - ChronoDuration::minutes(30)),
+    ];
+
+    let mut fair_ids = Vec::with_capacity(requests.len());
+    for (index, request) in requests.iter().enumerate() {
+        native.enqueue(request.clone()).await.unwrap();
+        fair_ids.push(fair.enqueue(request.clone()).await.unwrap().task().id());
+        if index == 1 {
+            // Keep the FIFO tie of the next two tasks after the earlier one in
+            // both mirrored queues.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    let mut native_order = Vec::new();
+    while let Some(claim) = native.claim("worker-native").await.unwrap() {
+        native_order.push(order_of(claim.task()));
+    }
+    let mut fair_order = Vec::new();
+    while let Some(claim) = fair
+        .claim_from_candidates(&fair_ids, "worker-fair")
+        .await
+        .unwrap()
+    {
+        fair_order.push(order_of(claim.task()));
+    }
+
+    assert_eq!(
+        native_order,
+        vec![4, 1, 2, 3, 5],
+        "the native order follows priority, availability, creation and id"
+    );
+    assert_eq!(
+        fair_order, native_order,
+        "the default class must use the native priority and FIFO order"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn fair_candidate_admission_wraps_across_two_class_turns() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let first = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let second = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let a1 = first.enqueue(ordered_class_request(1, "a")).await.unwrap();
+    let b1 = first.enqueue(ordered_class_request(2, "b")).await.unwrap();
+    let a2 = first.enqueue(ordered_class_request(3, "a")).await.unwrap();
+    let b2 = first.enqueue(ordered_class_request(4, "b")).await.unwrap();
+    let candidates = [
+        a1.task().id(),
+        a2.task().id(),
+        b1.task().id(),
+        b2.task().id(),
+    ];
+
+    let first_claim = first
+        .claim_from_candidates(&candidates, "worker-1")
+        .await
+        .unwrap()
+        .expect("the first class turn must be granted");
+    assert_eq!(order_of(first_claim.task()), 1);
+    assert_eq!(first.class_cursor().await.unwrap().as_deref(), Some("a"));
+
+    let second_claim = second
+        .claim_from_candidates(&candidates, "worker-2")
+        .await
+        .unwrap()
+        .expect("the second class turn must be granted");
+    assert_eq!(order_of(second_claim.task()), 2);
+    assert_eq!(second.class_cursor().await.unwrap().as_deref(), Some("b"));
+
+    let third_claim = first
+        .claim_from_candidates(&candidates, "worker-3")
+        .await
+        .unwrap()
+        .expect("the rotation must wrap back to the first class");
+    assert_eq!(order_of(third_claim.task()), 3);
+    assert_eq!(first.class_cursor().await.unwrap().as_deref(), Some("a"));
+
+    let fourth_claim = second
+        .claim_from_candidates(&candidates, "worker-4")
+        .await
+        .unwrap()
+        .expect("the second class must be granted again");
+    assert_eq!(order_of(fourth_claim.task()), 4);
+    assert_eq!(second.class_cursor().await.unwrap().as_deref(), Some("b"));
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn fair_candidate_admission_rotates_classes_and_skips_blocked_classes() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let second = open_queue(&pool, NAMESPACE, QUEUE).await;
+    queue.set_resource_policy("gpu", Some(1)).await.unwrap();
+
+    let first = queue
+        .enqueue(classified_with_resources("a", &["gpu"]))
+        .await
+        .unwrap();
+    let second_task = queue.enqueue(classified("b")).await.unwrap();
+    let third_task = queue.enqueue(classified("b")).await.unwrap();
+    let blocked = queue
+        .enqueue(classified_with_resources("c", &["gpu"]))
+        .await
+        .unwrap();
+    let wrapped = queue.enqueue(classified("d")).await.unwrap();
+
+    let claim = second
+        .claim_from_candidates(
+            &[
+                first.task().id(),
+                second_task.task().id(),
+                blocked.task().id(),
+            ],
+            "worker-1",
+        )
+        .await
+        .unwrap()
+        .expect("the first fair claim must be granted");
+    assert_eq!(claim.task().id(), first.task().id());
+    assert_eq!(second.class_cursor().await.unwrap().as_deref(), Some("a"));
+
+    let claim = queue
+        .claim_from_candidates(&[second_task.task().id(), wrapped.task().id()], "worker-2")
+        .await
+        .unwrap()
+        .expect("the next class must be granted");
+    assert_eq!(claim.task().id(), second_task.task().id());
+    assert_eq!(queue.class_cursor().await.unwrap().as_deref(), Some("b"));
+
+    let claim = second
+        .claim_from_candidates(&[blocked.task().id(), wrapped.task().id()], "worker-3")
+        .await
+        .unwrap()
+        .expect("a blocked class must not hide the next class");
+    assert_eq!(claim.task().id(), wrapped.task().id());
+    assert_eq!(second.class_cursor().await.unwrap().as_deref(), Some("d"));
+
+    assert!(
+        queue
+            .claim_from_candidates(&[blocked.task().id()], "worker-4")
+            .await
+            .unwrap()
+            .is_none(),
+        "a resource blocked candidate must not be granted"
+    );
+    assert_eq!(
+        second.class_cursor().await.unwrap().as_deref(),
+        Some("d"),
+        "a refused fair claim must not move the cursor"
+    );
+    assert_eq!(attempt_count(&pool, blocked.task().id().as_uuid()).await, 0);
+    assert_eq!(
+        attempt_count(&pool, third_task.task().id().as_uuid()).await,
+        0
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn fair_candidate_sets_are_validated_and_ignore_ineligible_identifiers() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+
+    let empty: [TaskId; 0] = [];
+    let error = queue
+        .claim_from_candidates(&empty, "worker")
+        .await
+        .expect_err("an empty candidate set must be refused");
+    assert!(matches!(
+        error,
+        Error::Validation {
+            field: "candidate_ids",
+            ..
+        }
+    ));
+
+    let oversized = (0..=MAX_CLAIM_CANDIDATES)
+        .map(|_| TaskId::new())
+        .collect::<Vec<_>>();
+    let error = queue
+        .claim_from_candidates(&oversized, "worker")
+        .await
+        .expect_err("an oversized candidate set must be refused");
+    assert!(matches!(
+        error,
+        Error::Validation {
+            field: "candidate_ids",
+            ..
+        }
+    ));
+
+    let duplicate = TaskId::new();
+    let error = queue
+        .claim_from_candidates(&[duplicate, duplicate], "worker")
+        .await
+        .expect_err("a duplicate candidate set must be refused");
+    assert!(matches!(
+        error,
+        Error::Validation {
+            field: "candidate_ids",
+            ..
+        }
+    ));
+
+    let ready = queue.enqueue(request()).await.unwrap();
+    let other_namespace = open_queue(&pool, "other-ns", QUEUE).await;
+    let foreign = other_namespace.enqueue(request()).await.unwrap();
+    let other_queue = open_queue(&pool, NAMESPACE, "other-q").await;
+    let elsewhere = other_queue.enqueue(request()).await.unwrap();
+    let terminal = queue.enqueue(request()).await.unwrap();
+    queue.request_cancel(terminal.task().id()).await.unwrap();
+    let later = queue
+        .enqueue(request().with_available_at(Utc::now() + ChronoDuration::hours(1)))
+        .await
+        .unwrap();
+
+    let claim = queue
+        .claim_from_candidates(
+            &[
+                TaskId::new(),
+                foreign.task().id(),
+                elsewhere.task().id(),
+                terminal.task().id(),
+                later.task().id(),
+                ready.task().id(),
+            ],
+            "worker",
+        )
+        .await
+        .unwrap()
+        .expect("the eligible identifier must be granted");
+    assert_eq!(claim.task().id(), ready.task().id());
+    for task in [&foreign, &elsewhere, &terminal, &later] {
+        assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 0);
+    }
+    assert!(
+        queue
+            .claim_from_candidates(&[foreign.task().id()], "worker")
+            .await
+            .unwrap()
+            .is_none(),
+        "a fair claim must never fall back outside the set"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn addressed_and_ordinary_claims_respect_resource_limits() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    queue.set_resource_policy("io", Some(1)).await.unwrap();
+
+    let first = queue
+        .enqueue(classified_with_resources("a", &["io"]))
+        .await
+        .unwrap();
+    let shared = queue.enqueue(classified("b")).await.unwrap();
+    let blocked = queue
+        .enqueue(classified_with_resources("c", &["io"]))
+        .await
+        .unwrap();
+
+    let claim = queue
+        .claim_by_id(first.task().id(), "worker-1")
+        .await
+        .unwrap()
+        .expect("the resource must be free");
+    assert_eq!(claim.task().id(), first.task().id());
+    assert!(
+        queue
+            .claim_by_id(blocked.task().id(), "worker-2")
+            .await
+            .unwrap()
+            .is_none(),
+        "an addressed claim must respect a full resource"
+    );
+    assert_eq!(queue.class_cursor().await.unwrap(), None);
+    assert!(
+        queue
+            .claim_by_id(shared.task().id(), "worker-3")
+            .await
+            .unwrap()
+            .is_some(),
+        "a task without the resource must stay admissible"
+    );
+    assert_eq!(queue.class_cursor().await.unwrap(), None);
+
+    let high = queue
+        .enqueue(
+            request()
+                .with_priority(100)
+                .with_resources(["io".to_owned()])
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let low = queue.enqueue(request().with_priority(-100)).await.unwrap();
+    let ordinary = queue
+        .claim("worker-4")
+        .await
+        .unwrap()
+        .expect("the ordinary claim must skip the blocked head");
+    assert_eq!(ordinary.task().id(), low.task().id());
+    assert_eq!(attempt_count(&pool, high.task().id().as_uuid()).await, 0);
+
+    queue.complete(claim.attempt(), None).await.unwrap();
+    let freed = queue
+        .claim_by_id(blocked.task().id(), "worker-5")
+        .await
+        .unwrap()
+        .expect("the sealed attempt must release the resource");
+    assert_eq!(freed.task().id(), blocked.task().id());
+    assert_eq!(
+        queue.class_cursor().await.unwrap(),
+        None,
+        "addressed and ordinary claims must not move the fair cursor"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn shared_resource_limits_apply_to_every_key_across_classes() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    queue.set_resource_policy("gpu", Some(1)).await.unwrap();
+    queue.set_resource_policy("disk", Some(1)).await.unwrap();
+
+    let gpu_a = queue
+        .enqueue(classified_with_resources("a", &["gpu"]))
+        .await
+        .unwrap();
+    let gpu_b = queue
+        .enqueue(classified_with_resources("b", &["gpu"]))
+        .await
+        .unwrap();
+    let both = queue
+        .enqueue(classified_with_resources("c", &["disk", "gpu"]))
+        .await
+        .unwrap();
+    let disk_only = queue
+        .enqueue(classified_with_resources("d", &["disk"]))
+        .await
+        .unwrap();
+
+    let claim = queue.claim("worker-1").await.unwrap().unwrap();
+    assert_eq!(claim.task().id(), gpu_a.task().id());
+    let disk_claim = queue
+        .claim_by_id(disk_only.task().id(), "worker-2")
+        .await
+        .unwrap()
+        .expect("the free resource must stay admissible");
+    assert_eq!(disk_claim.task().id(), disk_only.task().id());
+    assert!(
+        queue.claim("worker-3").await.unwrap().is_none(),
+        "the same resource must be shared across classes"
+    );
+    assert!(
+        queue
+            .claim_from_candidates(&[both.task().id(), gpu_b.task().id()], "worker-4")
+            .await
+            .unwrap()
+            .is_none(),
+        "a fair claim must apply every resource limit"
+    );
+
+    queue.complete(claim.attempt(), None).await.unwrap();
+    let next = queue
+        .claim_from_candidates(&[both.task().id(), gpu_b.task().id()], "worker-5")
+        .await
+        .unwrap()
+        .expect("the released resource must admit the next candidate");
+    assert_eq!(next.task().id(), gpu_b.task().id());
+    queue.complete(next.attempt(), None).await.unwrap();
+    assert!(
+        queue
+            .claim_from_candidates(&[both.task().id()], "worker-6")
+            .await
+            .unwrap()
+            .is_none(),
+        "a task must wait for every declared key"
+    );
+
+    queue.complete(disk_claim.attempt(), None).await.unwrap();
+    let both_claim = queue
+        .claim_from_candidates(&[both.task().id()], "worker-7")
+        .await
+        .unwrap()
+        .expect("all declared keys must be free");
+    assert_eq!(both_claim.task().id(), both.task().id());
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn concurrent_resource_claims_never_exceed_the_limit() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    queue.set_resource_policy("gpu", Some(1)).await.unwrap();
+
+    for index in 0..5 {
+        queue
+            .enqueue(classified_with_resources(
+                &format!("class-{index}"),
+                &["gpu"],
+            ))
+            .await
+            .unwrap();
+    }
+
+    let (one, two, three, four, five) = tokio::join!(
+        queue.claim("worker-1"),
+        queue.claim("worker-2"),
+        queue.claim("worker-3"),
+        queue.claim("worker-4"),
+        queue.claim("worker-5"),
+    );
+    let granted = [one, two, three, four, five]
+        .into_iter()
+        .filter(|claim| claim.as_ref().is_ok_and(Option::is_some))
+        .count();
+    assert_eq!(granted, 1, "the shared resource must be granted once");
+    assert_eq!(running_attempts(&pool, NAMESPACE, QUEUE).await, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn expired_and_cancelled_attempts_hold_and_release_resource_capacity() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue_with_short_lease(&pool, NAMESPACE, QUEUE).await;
+    queue.set_resource_policy("gpu", Some(1)).await.unwrap();
+    queue
+        .enqueue(classified_with_resources("a", &["gpu"]))
+        .await
+        .unwrap();
+    queue
+        .enqueue(classified_with_resources("b", &["gpu"]))
+        .await
+        .unwrap();
+
+    queue.claim("worker-1").await.unwrap().unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        queue.claim("worker-2").await.unwrap().is_none(),
+        "an expired but unsealed attempt must still hold the resource"
+    );
+    queue.recover_expired(10).await.unwrap();
+    assert!(
+        queue.claim("worker-3").await.unwrap().is_some(),
+        "recovery must release the resource"
+    );
+
+    let cancel_queue = open_queue(&pool, NAMESPACE, "cancel").await;
+    cancel_queue
+        .set_resource_policy("gpu", Some(1))
+        .await
+        .unwrap();
+    let cancelled = cancel_queue
+        .enqueue(classified_with_resources("a", &["gpu"]))
+        .await
+        .unwrap();
+    cancel_queue
+        .enqueue(classified_with_resources("b", &["gpu"]))
+        .await
+        .unwrap();
+    let cancelled_claim = cancel_queue.claim("worker-4").await.unwrap().unwrap();
+    assert_eq!(cancelled_claim.task().id(), cancelled.task().id());
+    assert!(cancel_queue.claim("worker-5").await.unwrap().is_none());
+    cancel_queue
+        .request_cancel(cancelled.task().id())
+        .await
+        .unwrap();
+    let terminal = cancel_queue
+        .complete(cancelled_claim.attempt(), None)
+        .await
+        .unwrap();
+    assert_eq!(terminal.status(), TaskStatus::Cancelled);
+    assert!(
+        cancel_queue.claim("worker-6").await.unwrap().is_some(),
+        "a sealed cancellation must release the resource"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_resource_policy_round_trips_and_a_lower_limit_keeps_grants() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    assert!(queue.resource_policy().await.unwrap().is_empty());
+
+    queue.set_resource_policy("gpu", Some(2)).await.unwrap();
+    queue.set_resource_policy("disk", Some(1)).await.unwrap();
+    assert_eq!(
+        queue.resource_policy().await.unwrap(),
+        vec![("disk".to_owned(), 1), ("gpu".to_owned(), 2)]
+    );
+
+    let first = queue
+        .enqueue(classified_with_resources("a", &["gpu"]))
+        .await
+        .unwrap();
+    let second = queue
+        .enqueue(classified_with_resources("b", &["gpu"]))
+        .await
+        .unwrap();
+    let third = queue
+        .enqueue(classified_with_resources("c", &["gpu"]))
+        .await
+        .unwrap();
+    let first_claim = queue.claim("worker-1").await.unwrap().unwrap();
+    let second_claim = queue.claim("worker-2").await.unwrap().unwrap();
+    assert_eq!(first_claim.task().id(), first.task().id());
+    assert_eq!(second_claim.task().id(), second.task().id());
+
+    queue.set_resource_policy("gpu", Some(1)).await.unwrap();
+    assert!(
+        queue.claim("worker-3").await.unwrap().is_none(),
+        "a lower limit must block new grants"
+    );
+    let stored = queue.get(first.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Running);
+    let second_stored = queue.get(second.task().id()).await.unwrap().unwrap();
+    assert_eq!(second_stored.status(), TaskStatus::Running);
+
+    queue.set_resource_policy("gpu", None).await.unwrap();
+    let cleared = queue
+        .claim("worker-4")
+        .await
+        .unwrap()
+        .expect("clearing the policy must restore the unlimited default");
+    assert_eq!(cleared.task().id(), third.task().id());
+    assert_eq!(
+        queue.resource_policy().await.unwrap(),
+        vec![("disk".to_owned(), 1)]
+    );
+
+    queue.set_resource_policy("gpu", Some(3)).await.unwrap();
+    drop(queue);
+    let reopened = open_queue(&pool, NAMESPACE, QUEUE).await;
+    assert_eq!(
+        reopened.resource_policy().await.unwrap(),
+        vec![("disk".to_owned(), 1), ("gpu".to_owned(), 3)]
+    );
+
+    let error = reopened
+        .set_resource_policy("bad name", Some(1))
+        .await
+        .expect_err("a resource name must be validated");
+    assert!(matches!(
+        error,
+        Error::Validation {
+            field: "resource",
+            ..
+        }
+    ));
+    for limit in [Some(0), Some(u32::MAX)] {
+        let error = reopened
+            .set_resource_policy("gpu", limit)
+            .await
+            .expect_err("a resource limit must be positive and supported");
+        assert!(matches!(
+            error,
+            Error::Validation {
+                field: "max_concurrent_attempts",
+                ..
+            }
+        ));
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_borrowed_resource_policy_is_atomic_with_the_domain_write() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+
+    let mut transaction = pool.begin().await.unwrap();
+    queue
+        .set_resource_policy_in(&mut transaction, "gpu", Some(2))
+        .await
+        .unwrap();
+    write_app_domain(&mut transaction, "rolled back").await;
+    transaction.rollback().await.unwrap();
+    assert!(queue.resource_policy().await.unwrap().is_empty());
+    assert_eq!(app_domain_count(&pool).await, 0);
+
+    let mut transaction = pool.begin().await.unwrap();
+    queue
+        .set_resource_policy_in(&mut transaction, "gpu", Some(2))
+        .await
+        .unwrap();
+    write_app_domain(&mut transaction, "committed").await;
+    transaction.commit().await.unwrap();
+    assert_eq!(
+        queue.resource_policy().await.unwrap(),
+        vec![("gpu".to_owned(), 2)]
+    );
+    assert_eq!(app_domain_count(&pool).await, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_fair_claim_and_its_cursor_roll_back_with_the_caller() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(classified("a")).await.unwrap();
+
+    let mut transaction = pool.begin().await.unwrap();
+    let claim = queue
+        .claim_from_candidates_in(&mut transaction, &[task.task().id()], "worker-1")
+        .await
+        .unwrap()
+        .expect("the candidate must be granted");
+    assert_eq!(claim.task().id(), task.task().id());
+    write_app_domain(&mut transaction, "rolled back").await;
+    assert_eq!(
+        queue.class_cursor().await.unwrap(),
+        None,
+        "an uncommitted fair cursor must not be visible"
+    );
+    transaction.rollback().await.unwrap();
+    assert_eq!(queue.class_cursor().await.unwrap(), None);
+    assert_eq!(app_domain_count(&pool).await, 0);
+    assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 0);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.status(), TaskStatus::Queued);
+
+    let mut transaction = pool.begin().await.unwrap();
+    queue
+        .claim_from_candidates_in(&mut transaction, &[task.task().id()], "worker-2")
+        .await
+        .unwrap()
+        .expect("the candidate must be granted");
+    write_app_domain(&mut transaction, "committed").await;
+    transaction.commit().await.unwrap();
+    assert_eq!(queue.class_cursor().await.unwrap().as_deref(), Some("a"));
+    assert_eq!(app_domain_count(&pool).await, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn fair_claims_and_resource_policies_require_read_committed() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(classified("a")).await.unwrap();
+
+    for level in ["REPEATABLE READ", "SERIALIZABLE"] {
+        let mut transaction = isolation_transaction(&pool, level).await;
+        let error = queue
+            .claim_from_candidates_in(&mut transaction, &[task.task().id()], "worker")
+            .await
+            .expect_err("a non default isolation must be refused");
+        assert_claim_requires_read_committed(&error);
+        transaction.rollback().await.unwrap();
+
+        let mut transaction = isolation_transaction(&pool, level).await;
+        let error = queue
+            .set_resource_policy_in(&mut transaction, "gpu", Some(1))
+            .await
+            .expect_err("a non default isolation must be refused");
+        assert_claim_requires_read_committed(&error);
+        transaction.rollback().await.unwrap();
+    }
+
+    assert_eq!(queue.class_cursor().await.unwrap(), None);
+    assert!(queue.resource_policy().await.unwrap().is_empty());
+    assert_eq!(attempt_count(&pool, task.task().id().as_uuid()).await, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn borrowed_fair_claims_and_resource_policies_refuse_a_foreign_instance() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+
+    reset(&pool).await;
+    let mut transaction = pool.begin().await.unwrap();
+    let error = queue
+        .claim_from_candidates_in(&mut transaction, &[task.task().id()], "worker")
+        .await
+        .expect_err("a transaction of another schema instance must be refused");
+    assert!(
+        matches!(error, Error::InstanceMismatch { .. }),
+        "unexpected error: {error}"
+    );
+    let error = queue
+        .set_resource_policy_in(&mut transaction, "gpu", Some(1))
+        .await
+        .expect_err("a transaction of another schema instance must be refused");
+    assert!(
+        matches!(error, Error::InstanceMismatch { .. }),
+        "unexpected error: {error}"
+    );
+    transaction.rollback().await.unwrap();
+
+    let sibling = connect_to_sibling_database().await;
+    let mut transaction = sibling.begin().await.unwrap();
+    let error = queue
+        .claim_from_candidates_in(&mut transaction, &[task.task().id()], "worker")
+        .await
+        .expect_err("a transaction of another database must be refused");
+    assert!(
+        matches!(
+            error,
+            Error::InstanceMismatch { .. } | Error::SchemaMissing { .. }
+        ),
+        "unexpected error: {error}"
+    );
+    let error = queue
+        .set_resource_policy_in(&mut transaction, "gpu", Some(1))
+        .await
+        .expect_err("a transaction of another database must be refused");
+    assert!(
+        matches!(
+            error,
+            Error::InstanceMismatch { .. } | Error::SchemaMissing { .. }
+        ),
+        "unexpected error: {error}"
+    );
+    transaction.rollback().await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn fair_admission_skips_a_locked_head_without_losing_the_cursor() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let first = queue.enqueue(classified("a")).await.unwrap();
+    let second = queue.enqueue(classified("b")).await.unwrap();
+
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query_file!(
+        "sql/tests/addressed_lock_task.sql",
+        first.task().id().as_uuid()
+    )
+    .fetch_one(&mut *blocker)
+    .await
+    .expect("the task must be lockable");
+
+    let claim = queue
+        .claim_from_candidates(&[first.task().id(), second.task().id()], "worker")
+        .await
+        .unwrap()
+        .expect("a locked head must not stop the next candidate");
+    assert_eq!(claim.task().id(), second.task().id());
+    assert_eq!(queue.class_cursor().await.unwrap().as_deref(), Some("b"));
+    assert_eq!(attempt_count(&pool, first.task().id().as_uuid()).await, 0);
+    blocker.rollback().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn an_ordinary_claim_skips_a_locked_head() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let first = queue.enqueue(request().with_priority(10)).await.unwrap();
+    let second = queue.enqueue(request().with_priority(0)).await.unwrap();
+
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query_file!(
+        "sql/tests/addressed_lock_task.sql",
+        first.task().id().as_uuid()
+    )
+    .fetch_one(&mut *blocker)
+    .await
+    .expect("the task must be lockable");
+
+    let claim = queue
+        .claim("worker")
+        .await
+        .unwrap()
+        .expect("a locked head must not hide the next task");
+    assert_eq!(claim.task().id(), second.task().id());
+    blocker.rollback().await.unwrap();
+
+    let next = queue.claim("worker").await.unwrap().unwrap();
+    assert_eq!(next.task().id(), first.task().id());
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn class_and_resources_are_part_of_idempotency() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let keyed = request()
+        .with_class("batch")
+        .unwrap()
+        .with_resources(["gpu".to_owned(), "io".to_owned()])
+        .unwrap()
+        .with_idempotency_key("key-1")
+        .unwrap();
+
+    let first = queue.enqueue(keyed.clone()).await.unwrap();
+    assert!(first.is_created());
+    assert_eq!(first.task().class(), Some("batch"));
+    assert_eq!(
+        first.task().resources().to_vec(),
+        vec!["gpu".to_owned(), "io".to_owned()]
+    );
+
+    let replay = queue.enqueue(keyed).await.unwrap();
+    assert!(!replay.is_created());
+    assert_eq!(replay.task().id(), first.task().id());
+
+    let other_class = request()
+        .with_class("other")
+        .unwrap()
+        .with_resources(["gpu".to_owned(), "io".to_owned()])
+        .unwrap()
+        .with_idempotency_key("key-1")
+        .unwrap();
+    let error = queue
+        .enqueue(other_class)
+        .await
+        .expect_err("a changed class must conflict");
+    assert!(matches!(error, Error::IdempotencyConflict { .. }));
+
+    let other_resources = request()
+        .with_class("batch")
+        .unwrap()
+        .with_resources(["gpu".to_owned()])
+        .unwrap()
+        .with_idempotency_key("key-1")
+        .unwrap();
+    let error = queue
+        .enqueue(other_resources)
+        .await
+        .expect_err("changed resources must conflict");
+    assert!(matches!(error, Error::IdempotencyConflict { .. }));
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_global_policy_bounds_fair_and_addressed_claims() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let second = open_queue(&pool, NAMESPACE, QUEUE).await;
+    queue
+        .set_policy(QueuePolicy {
+            max_concurrent_attempts: Some(1),
+        })
+        .await
+        .unwrap();
+
+    let first = queue.enqueue(classified("a")).await.unwrap();
+    let second_task = queue.enqueue(classified("b")).await.unwrap();
+    let third_task = queue.enqueue(classified("c")).await.unwrap();
+
+    let claim = second
+        .claim_by_id(first.task().id(), "worker-1")
+        .await
+        .unwrap()
+        .expect("the first addressed claim must be admitted");
+    assert!(
+        queue
+            .claim_from_candidates(
+                &[second_task.task().id(), third_task.task().id()],
+                "worker-2"
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "a fair claim must obey the global policy"
+    );
+    assert_eq!(
+        queue.class_cursor().await.unwrap(),
+        None,
+        "a refused fair claim must not move the cursor"
+    );
+    assert!(queue.claim("worker-3").await.unwrap().is_none());
+
+    queue
+        .set_policy(QueuePolicy {
+            max_concurrent_attempts: Some(2),
+        })
+        .await
+        .unwrap();
+    let next = second
+        .claim_from_candidates(
+            &[second_task.task().id(), third_task.task().id()],
+            "worker-4",
+        )
+        .await
+        .unwrap()
+        .expect("the raised policy must admit the fair claim");
+    assert_eq!(next.task().id(), second_task.task().id());
+
+    queue
+        .set_policy(QueuePolicy {
+            max_concurrent_attempts: Some(1),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        queue
+            .get(claim.task().id())
+            .await
+            .unwrap()
+            .unwrap()
+            .status(),
+        TaskStatus::Running
+    );
+    assert_eq!(
+        queue.get(next.task().id()).await.unwrap().unwrap().status(),
+        TaskStatus::Running
+    );
+    assert!(
+        queue
+            .claim_by_id(third_task.task().id(), "worker-5")
+            .await
+            .unwrap()
+            .is_none(),
+        "a lower policy must block the next claim"
+    );
+
+    queue.complete(claim.attempt(), None).await.unwrap();
+    assert!(
+        queue
+            .claim_by_id(third_task.task().id(), "worker-6")
+            .await
+            .unwrap()
+            .is_none(),
+        "the second running attempt must still count"
+    );
+    queue.complete(next.attempt(), None).await.unwrap();
+    let last = queue
+        .claim_by_id(third_task.task().id(), "worker-7")
+        .await
+        .unwrap()
+        .expect("the sealed attempts must free the capacity");
+    assert_eq!(last.task().id(), third_task.task().id());
 }

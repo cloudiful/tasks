@@ -10,6 +10,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+use std::collections::HashSet;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -19,7 +20,7 @@ use crate::error::{Error, Result};
 use crate::migrate::check_schema;
 use crate::model::{
     Attempt, Claim, EnqueueOutcome, EnqueueRequest, Failure, ListCursor, Namespace, ProgressUpdate,
-    QueueName, Task, TaskId,
+    QueueName, Task, TaskId, validate_resource_name,
 };
 use crate::{idempotency, progress, store};
 
@@ -34,6 +35,9 @@ pub const MAX_RECOVERY_LIMIT: u32 = 1000;
 
 /// The largest length of a worker identifier.
 pub const MAX_WORKER_ID_LENGTH: usize = 128;
+
+/// The largest number of identifiers a fair candidate claim accepts.
+pub const MAX_CLAIM_CANDIDATES: usize = 1000;
 
 /// The durable execution policy of one namespace and queue.
 ///
@@ -159,6 +163,70 @@ impl Queue {
                 Err(error)
             }
         }
+    }
+
+    /// Reads the shared resource limits of the queue, sorted by resource.
+    ///
+    /// A resource without a stored limit is unlimited. The limits are read
+    /// from the database on every call.
+    pub async fn resource_policy(&self) -> Result<Vec<(String, u32)>> {
+        let mut connection = self.pool.acquire().await?;
+        self.verify_instance(&mut connection).await?;
+        store::resource_policies(&mut connection, &self.namespace, &self.queue).await
+    }
+
+    /// Replaces the shared resource limit of one resource of the queue.
+    ///
+    /// The replacement and every claim of the queue are serialized by the
+    /// queue scoped transaction lock. A lower limit applies to future claims
+    /// and never revokes a running attempt. `None` removes the exact resource
+    /// policy and restores the unlimited default of that resource.
+    pub async fn set_resource_policy(&self, resource: &str, max: Option<u32>) -> Result<()> {
+        validate_resource_name(resource)?;
+        let max = validate_resource_limit(max)?;
+        let mut transaction = self.pool.begin().await?;
+        let outcome = self
+            .set_resource_policy_on(&mut transaction, resource, max)
+            .await;
+        match outcome {
+            Ok(()) => {
+                transaction.commit().await?;
+                Ok(())
+            }
+            Err(error) => {
+                transaction.rollback().await.ok();
+                Err(error)
+            }
+        }
+    }
+
+    /// Replaces the shared resource limit of one resource in the transaction
+    /// of the caller.
+    ///
+    /// The transaction must belong to the schema instance of this queue,
+    /// otherwise the call is refused before any write. A refused change must
+    /// be rolled back by the caller.
+    pub async fn set_resource_policy_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        resource: &str,
+        max: Option<u32>,
+    ) -> Result<()> {
+        validate_resource_name(resource)?;
+        let max = validate_resource_limit(max)?;
+        self.verify_instance(transaction).await?;
+        self.set_resource_policy_on(transaction, resource, max)
+            .await
+    }
+
+    /// Reads the last class granted by fair candidate admission.
+    ///
+    /// `None` means that no candidate was granted yet. The empty string is the
+    /// class of a task without a class.
+    pub async fn class_cursor(&self) -> Result<Option<String>> {
+        let mut connection = self.pool.acquire().await?;
+        self.verify_instance(&mut connection).await?;
+        store::class_cursor(&mut connection, &self.namespace, &self.queue).await
     }
 
     /// Enqueues a task.
@@ -306,6 +374,75 @@ impl Queue {
         let worker_id = validate_worker_id(worker_id)?;
         self.verify_instance(transaction).await?;
         self.claim_on(transaction, worker_id, Some(task_id)).await
+    }
+
+    /// Claims the best admissible task of a bounded candidate set.
+    ///
+    /// The caller owns the complete eligible set and the locks of its domain
+    /// decision. The library never widens the set: an absent, not ready,
+    /// foreign or terminal identifier is ignored and the call never falls back
+    /// to a task outside the set. An empty, oversized or duplicate set is
+    /// refused before any write.
+    ///
+    /// Classes of the provided candidates rotate: the winner is the first
+    /// admissible class after the last granted class in ascending order,
+    /// wrapping to the remaining classes. Inside one class the priority order
+    /// applies. A class that cannot be admitted because of a shared resource
+    /// never hides another admissible class.
+    pub async fn claim_from_candidates(
+        &self,
+        candidate_ids: &[TaskId],
+        worker_id: &str,
+    ) -> Result<Option<Claim>> {
+        validate_candidate_ids(candidate_ids)?;
+        let worker_id = validate_worker_id(worker_id)?;
+        let mut transaction = self.pool.begin().await?;
+        let outcome = store::claim_candidates(
+            &mut transaction,
+            &self.namespace,
+            &self.queue,
+            worker_id,
+            self.lease_ttl,
+            candidate_ids,
+        )
+        .await;
+        match outcome {
+            Ok(claim) => {
+                transaction.commit().await?;
+                Ok(claim)
+            }
+            Err(error) => {
+                transaction.rollback().await.ok();
+                Err(error)
+            }
+        }
+    }
+
+    /// Claims the best admissible task of a bounded candidate set in the
+    /// transaction of the caller.
+    ///
+    /// The transaction must belong to the schema instance of this queue and
+    /// must run at `READ COMMITTED`; another isolation level is refused. The
+    /// claim and the business write of the caller share one commit, and a
+    /// rollback of the caller also rolls the fair cursor back.
+    pub async fn claim_from_candidates_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        candidate_ids: &[TaskId],
+        worker_id: &str,
+    ) -> Result<Option<Claim>> {
+        validate_candidate_ids(candidate_ids)?;
+        let worker_id = validate_worker_id(worker_id)?;
+        self.verify_instance(transaction).await?;
+        store::claim_candidates(
+            transaction,
+            &self.namespace,
+            &self.queue,
+            worker_id,
+            self.lease_ttl,
+            candidate_ids,
+        )
+        .await
     }
 
     /// Renews the lease of an attempt.
@@ -564,6 +701,32 @@ impl Queue {
         }
     }
 
+    async fn set_resource_policy_on(
+        &self,
+        connection: &mut PgConnection,
+        resource: &str,
+        max: Option<i32>,
+    ) -> Result<()> {
+        store::lock_queue(connection, &self.namespace, &self.queue).await?;
+        store::require_read_committed(connection).await?;
+        match max {
+            Some(limit) => {
+                store::set_resource_policy(
+                    connection,
+                    &self.namespace,
+                    &self.queue,
+                    resource,
+                    limit,
+                )
+                .await
+            }
+            None => {
+                store::clear_resource_policy(connection, &self.namespace, &self.queue, resource)
+                    .await
+            }
+        }
+    }
+
     /// Whether the captured attempt already holds a terminal seal.
     ///
     /// The check is scoped to the namespace, the queue, the task, the attempt
@@ -693,6 +856,46 @@ fn validate_worker_id(worker_id: &str) -> Result<&str> {
     Ok(worker_id)
 }
 
+fn validate_candidate_ids(candidate_ids: &[TaskId]) -> Result<()> {
+    if candidate_ids.is_empty() {
+        return Err(Error::Validation {
+            field: "candidate_ids",
+            reason: "must not be empty".to_owned(),
+        });
+    }
+    if candidate_ids.len() > MAX_CLAIM_CANDIDATES {
+        return Err(Error::Validation {
+            field: "candidate_ids",
+            reason: format!("must contain at most {MAX_CLAIM_CANDIDATES} identifiers"),
+        });
+    }
+    let mut seen = HashSet::with_capacity(candidate_ids.len());
+    if candidate_ids.iter().any(|task_id| !seen.insert(*task_id)) {
+        return Err(Error::Validation {
+            field: "candidate_ids",
+            reason: "must not contain duplicate identifiers".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_resource_limit(max: Option<u32>) -> Result<Option<i32>> {
+    let Some(max) = max else {
+        return Ok(None);
+    };
+    if max == 0 {
+        return Err(Error::Validation {
+            field: "max_concurrent_attempts",
+            reason: "must be at least 1".to_owned(),
+        });
+    }
+    let limit = i32::try_from(max).map_err(|_| Error::Validation {
+        field: "max_concurrent_attempts",
+        reason: format!("must not exceed {}", i32::MAX),
+    })?;
+    Ok(Some(limit))
+}
+
 fn validate_additional_attempts(additional_attempts: u32) -> Result<u32> {
     if additional_attempts == 0 {
         return Err(Error::Validation {
@@ -725,5 +928,25 @@ mod tests {
         assert!(validate_worker_id("").is_err());
         assert!(validate_worker_id(&"w".repeat(MAX_WORKER_ID_LENGTH + 1)).is_err());
         assert!(validate_worker_id("worker-1").is_ok());
+    }
+
+    #[test]
+    fn candidate_identifiers_are_bounded_unique_and_not_empty() {
+        assert!(validate_candidate_ids(&[]).is_err());
+        let too_many = (0..=MAX_CLAIM_CANDIDATES)
+            .map(|_| TaskId::new())
+            .collect::<Vec<_>>();
+        assert!(validate_candidate_ids(&too_many).is_err());
+        let duplicate = TaskId::new();
+        assert!(validate_candidate_ids(&[duplicate, duplicate]).is_err());
+        assert!(validate_candidate_ids(&[TaskId::new(), TaskId::new()]).is_ok());
+    }
+
+    #[test]
+    fn resource_limits_are_positive_and_supported() {
+        assert_eq!(validate_resource_limit(None).unwrap(), None);
+        assert!(validate_resource_limit(Some(0)).is_err());
+        assert!(validate_resource_limit(Some(u32::MAX)).is_err());
+        assert_eq!(validate_resource_limit(Some(4)).unwrap(), Some(4));
     }
 }

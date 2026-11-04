@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- Advances the fair admission cursor after a granted candidate.\n--\n-- The cursor only moves when a claim was granted. An empty class is the\n-- default class of a task without a class.\nINSERT INTO cloudiful_tasks.queue_class_cursors (\n    namespace,\n    queue,\n    last_class,\n    turn,\n    updated_at\n)\nVALUES ($1, $2, $3, 1, clock_timestamp())\nON CONFLICT (namespace, queue) DO UPDATE\nSET last_class = EXCLUDED.last_class,\n    turn = cloudiful_tasks.queue_class_cursors.turn + 1,\n    updated_at = clock_timestamp()\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1553975da2b78a269c47bb6fbbba8ef043b977a454b370e105f32a8ee7f55b69"
+}

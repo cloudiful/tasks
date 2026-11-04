@@ -33,6 +33,21 @@ pub fn canonical_request_spec(request: &EnqueueRequest) -> String {
     spec.insert("payload".to_owned(), canonical_value(request.payload()));
     spec.insert("priority".to_owned(), Value::from(request.priority()));
     spec.insert("retry".to_owned(), retry_value(request.retry_policy()));
+    if let Some(class) = request.class() {
+        spec.insert("class".to_owned(), Value::String(class.to_owned()));
+    }
+    if !request.resources().is_empty() {
+        spec.insert(
+            "resources".to_owned(),
+            Value::Array(
+                request
+                    .resources()
+                    .iter()
+                    .map(|resource| Value::String(resource.clone()))
+                    .collect(),
+            ),
+        );
+    }
     serde_json::to_string(&Value::Object(spec)).expect("a request specification is serializable")
 }
 
@@ -67,6 +82,8 @@ pub(crate) async fn enqueue_task(
         i32::try_from(request.retry_policy().max_attempts()).unwrap_or(i32::MAX),
         duration_nanos(request.retry_policy().initial_delay()),
         duration_nanos(request.retry_policy().max_delay()),
+        request.class().map(str::to_owned),
+        request.resources(),
     )
     .fetch_optional(&mut *connection)
     .await?;
@@ -167,6 +184,32 @@ mod tests {
             canonical_request_spec(&first),
             canonical_request_spec(&second)
         );
+    }
+
+    #[test]
+    fn the_default_specification_keeps_its_stored_shape() {
+        let request =
+            EnqueueRequest::new(TaskKind::new("demo").unwrap(), serde_json::json!({"a": 1}));
+
+        assert_eq!(
+            canonical_request_spec(&request),
+            "{\"available_at\":null,\"kind\":\"demo\",\"payload\":{\"a\":1},\"priority\":0,\
+             \"retry\":{\"initial_delay_ns\":0,\"max_attempts\":1,\"max_delay_ns\":0}}"
+        );
+    }
+
+    #[test]
+    fn the_specification_appends_non_default_admission_metadata() {
+        let request =
+            EnqueueRequest::new(TaskKind::new("demo").unwrap(), serde_json::json!({"a": 1}))
+                .with_class("batch")
+                .unwrap()
+                .with_resources(["io".to_owned(), "gpu".to_owned()])
+                .unwrap();
+        let spec = canonical_request_spec(&request);
+
+        assert!(spec.contains("\"class\":\"batch\""));
+        assert!(spec.contains("\"resources\":[\"gpu\",\"io\"]"));
     }
 
     #[test]

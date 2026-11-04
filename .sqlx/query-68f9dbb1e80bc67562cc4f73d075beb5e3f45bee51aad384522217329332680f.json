@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT resource, max_concurrent_attempts\nFROM cloudiful_tasks.queue_resource_policies\nWHERE namespace = $1 AND queue = $2\nORDER BY resource\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "resource",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.queue_resource_policies",
+            "name": "resource"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "max_concurrent_attempts",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.queue_resource_policies",
+            "name": "max_concurrent_attempts"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "68f9dbb1e80bc67562cc4f73d075beb5e3f45bee51aad384522217329332680f"
+}

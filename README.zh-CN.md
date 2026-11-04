@@ -25,6 +25,8 @@ schema 中。本库不会自行执行任务：worker 运行时由应用显式启
 - 持久化队列存储：带幂等键的入队、带租约的领取、续租、进度、完成、失败、取消、
   手动重试以及过期租约的恢复，
 - 持久化队列策略：可选地限制队列中同时运行的尝试数量，
+- 不可变的任务类别与共享资源键、对调用方提供的候选集进行公平准入，以及按队列
+  生效的资源限制，
 - worker 运行时：有界并发、租约心跳、协作式取消、过期租约恢复、唤醒通知、
   处理函数拥有的终态结果以及优雅停机。
 
@@ -108,6 +110,8 @@ if let Some(claim) = queue.claim("worker-1").await? {
 | 幂等 | 同一个键配同一个请求返回已有任务，即使任务已经结束；同一个键配不同请求返回 `IdempotencyConflict`。没有键的请求总是创建新任务。 |
 | 领取 | 只有就绪的任务会被领取，先按优先级，再按最早就绪的顺序。领取持有任务的租约，并携带全新的 fencing token。 |
 | 指定领取 | `claim_by_id` 只领取被指定的任务，绝不领取其他任务。该任务必须就绪且属于本队列，否则调用返回 `None` 且不领取任何任务。该调用会绕过队列的顺序，哪个任务可以执行仍由调用方决定。`claim_by_id_in` 运行在调用方的事务中。 |
+| 公平领取 | `claim_from_candidates` 从调用方提供的有界候选集中领取最合适的任务，绝不回退到集合之外。集合中的类别轮流获得机会，同一类别内按优先级顺序。集合最多包含 `MAX_CLAIM_CANDIDATES` 个唯一标识。`claim_from_candidates_in` 运行在调用方的事务中。 |
+| 资源 | 所有领取路径都会跳过已声明共享资源达到策略上限的任务。只有已封存的尝试才释放容量；过期的尝试在恢复封存之前仍然计数。 |
 | 租约 | 租约以数据库时钟为准。续租、进度上报、完成和失败都需要对应的尝试、其 token 和未过期的租约，否则调用返回 `LeaseLost` 且不做任何修改。租约在操作取得锁之后才按数据库时钟检查，因此等待锁的调用无法使用已过期的租约。 |
 | 恢复 | 过期的尝试被封为 interrupted，其任务在预算允许时重新排队，否则任务失败。恢复是幂等的。 |
 | 取消 | 排队中的任务立即取消，运行中的任务被标记为待取消。先于完成提交的取消优先生效：任务以 cancelled 结束，其结果被丢弃。外部副作用无法撤销。 |
@@ -147,6 +151,46 @@ let policy = queue.policy().await?;
 | 容量 | 所有领取路径在与策略替换相同的队列级事务咨询锁下统计运行中的尝试。已过期但尚未被恢复封存的尝试仍然计数；完成、失败、取消或恢复通过封存尝试释放容量。 |
 | 隔离级别 | 所有领取路径都要求 `READ COMMITTED`，无论队列是否存有策略；其他隔离级别会在读取策略前被拒绝。加锁语句与计数分开执行，因此等待中的领取在取得锁之后才计数，不能依赖在限制写入之前取得的快照。 |
 | 重置 | 设置 `None` 会删除策略并恢复不受限制的行为。 |
+
+### 公平准入与共享资源
+
+任务带有不可变的类别和不可变的共享资源键。两者都是可选的，因此已有调用方保持
+默认类别且不声明资源：
+
+```rust
+let request = EnqueueRequest::new(TaskKind::new("sync")?, json!({"cluster": "a"}))
+    .with_class("large")?
+    .with_resources(["gpu".to_owned(), "io".to_owned()])?;
+```
+
+当调用方拥有可执行集合时，从该集合领取。由库选择胜者，且绝不扩大集合：
+
+```rust
+use cloudiful_tasks::MAX_CLAIM_CANDIDATES;
+
+let candidates = eligible_ids_up_to(MAX_CLAIM_CANDIDATES);
+if let Some(claim) = queue.claim_from_candidates(&candidates, "worker-1").await? {
+    queue.complete(claim.attempt(), Some(json!({"ok": true}))).await?;
+}
+```
+
+限制按队列存储，并在每次领取时读取。`None` 只清除该资源的限制：
+
+```rust
+queue.set_resource_policy("gpu", Some(1)).await?;
+let limits = queue.resource_policy().await?;
+queue.set_resource_policy("gpu", None).await?;
+```
+
+| 主题 | 行为 |
+| --- | --- |
+| 公平范围 | 保证只覆盖所提供的可执行集合中实际存在的类别：每个类别获得一次机会，然后轮到下一个。同一类别内按当前优先级顺序。调用方若悄悄排除某个类别，只会削弱自身的公平性；库绝不会选择集合之外的任务。 |
+| 轮转 | 下一个类别是最后授予类别之后按升序的第一个类别，再回绕到其余类别。无类别任务的类别为空字符串，排在最前。 |
+| 游标 | `class_cursor` 报告最后授予的类别。只有公平领取真正授予任务时才移动，并与调用方共享事务，因此回滚会恢复它。普通领取和指定领取从不移动它。 |
+| 资源范围 | 资源限制作用于单个命名空间和队列，而不是整个命名空间。类别级限制就是一个只有该类任务声明的资源键。同一个共享资源键可以出现在多个类别中。 |
+| 多个键 | 只有每个已声明键都有容量时任务才可执行。每个运行中的尝试为其声明的每个键各计一次。 |
+| 容量 | 资源占用与全局策略和领取在同一队列级事务咨询锁下读取。调低或清除限制不会撤销运行中的尝试，只影响下一次领取。过期的尝试在恢复封存之前仍然计数。 |
+| 升级 | 协议版本 3 增加这些列和表。旧协议的构建会拒绝版本 3 的 schema，本构建也要求先运行 `migrate`，`check_schema` 才会接受数据库。请同时升级库并执行迁移；不支持降级。 |
 
 ### worker
 
@@ -207,6 +251,8 @@ worker 的语义：
 | --- | --- |
 | 入队 | `enqueue_in` |
 | 领取 | `claim_in` |
+| 公平候选领取 | `claim_from_candidates_in` |
+| 设置共享资源限制 | `set_resource_policy_in` |
 | 续租 | `renew_in` |
 | 进度报告 | `report_progress_in` |
 | 完成 | `complete_in` |
@@ -247,17 +293,22 @@ cargo run --example transactional
 SQLX_OFFLINE=true cargo check --locked --offline --all-targets
 ```
 
-仅针对共享非生产测试服务器上的专用开发数据库重新生成元数据：
+仅针对非生产测试服务器上由问题拥有的兄弟数据库重新生成元数据：
 
 ```sh
 DATABASE_URL="$CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL" \
   cargo sqlx prepare -- --all-targets
 ```
 
-实时测试从显式的 `CLOUDIFUL_TASKS_TEST_DATABASE_URL`（`cloudiful_tasks_test`）
-和 `CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL`（`cloudiful_tasks_dev`）读取
-测试库 URL。守卫会在任何夹具重置之前校验实际连接选项、数据库实际身份和精确的
-专用数据库注释；共享项目数据库永远不会被接受。
+实时测试从显式的 `CLOUDIFUL_TASKS_TEST_DATABASE_URL` 和
+`CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL` 读取两个测试库 URL。守卫会一起读取
+这一对值：主库必须是与兄弟库 `cloudiful_tasks_issue_<id>_sibling` 具有同一个
+规范正 `u32` 问题编号的 `cloudiful_tasks_issue_<id>`，且两者都不超过 63 字节。
+两者都必须使用固定端点 `unraid.cloud1ful.com:5432`，带角色且没有 socket 或连接
+选项覆盖。任何写入之前，数据库必须报告配置的角色、精确的问题数据库名、非回环
+TCP 地址、端口 `5432` 以及精确的问题拥有标记。共享名称、不匹配的配对和旧夹具
+都会被拒绝。问题数据库对由该问题的主库创建、迁移和填充，并在问题完成、重新核对
+标记后删除两个数据库；共享、其他问题以及生产数据库永远不会被重置。
 
 ## 许可证
 

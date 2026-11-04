@@ -1796,3 +1796,65 @@ async fn an_unsealed_external_terminal_fails_the_attempt() {
         Some(json!("external completion was not sealed"))
     );
 }
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_worker_skips_a_resource_blocked_head() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    queue.set_resource_policy("gpu", Some(1)).await.unwrap();
+
+    let holder = queue
+        .enqueue(request().with_resources(["gpu".to_owned()]).unwrap())
+        .await
+        .unwrap();
+    queue
+        .claim_by_id(holder.task().id(), "holder")
+        .await
+        .unwrap()
+        .expect("the resource holder must be claimed");
+
+    let blocked = queue
+        .enqueue(
+            request()
+                .with_priority(100)
+                .with_resources(["gpu".to_owned()])
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let admissible = queue.enqueue(request().with_priority(-100)).await.unwrap();
+    let recorder = Recorder::default();
+
+    let worker = Worker::builder(queue.clone(), worker_config())
+        .handler(
+            kind(),
+            Recording {
+                recorder: recorder.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let (shutdown, handle) = start(worker);
+
+    recorder.wait_for_handled(1).await;
+    shutdown.cancel();
+    handle.await.unwrap().unwrap();
+
+    assert_eq!(
+        attempt_count(&pool, admissible.task().id().as_uuid()).await,
+        1
+    );
+    assert_eq!(attempt_count(&pool, blocked.task().id().as_uuid()).await, 0);
+    assert_eq!(
+        queue
+            .get(blocked.task().id())
+            .await
+            .unwrap()
+            .unwrap()
+            .status(),
+        TaskStatus::Queued
+    );
+}

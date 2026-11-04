@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- Resources of the queue whose running occupancy reached the policy limit.\n--\n-- One grouped aggregate joins the queue scoped policies, the immutable\n-- resource keys of the tasks and the running attempts of the queue. Every\n-- attempt counts once per declared key, including an attempt whose lease\n-- expired but was not sealed by recovery yet. A resource without a policy row\n-- is unlimited and never blocks a claim.\nSELECT p.resource\nFROM cloudiful_tasks.queue_resource_policies AS p\nINNER JOIN cloudiful_tasks.tasks AS t\n    ON t.namespace = p.namespace\n    AND t.queue = p.queue\n    AND t.resources @> ARRAY[p.resource]\nINNER JOIN cloudiful_tasks.attempts AS a\n    ON a.task_id = t.id\n    AND a.status = 'running'\nWHERE p.namespace = $1\n  AND p.queue = $2\nGROUP BY p.resource, p.max_concurrent_attempts\nHAVING count(*) >= p.max_concurrent_attempts\nORDER BY p.resource\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "resource",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.queue_resource_policies",
+            "name": "resource"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "deab7cd163b5ec5426e4abf01968606f1271b85775385496912e72c0ef6db49c"
+}

@@ -5,7 +5,7 @@
 //! The example needs a database with the schema of the library:
 //!
 //! ```sh
-//! export DATABASE_URL=postgresql://dev@localhost:57664/cloudiful_tasks_dev
+//! export DATABASE_URL=postgresql://dev@localhost:57664/cloudiful_tasks_issue_1194
 //! cargo run --example transactional
 //! ```
 

@@ -42,6 +42,8 @@ pub(crate) struct TaskRow {
     cancel_requested_at: Option<DateTime<Utc>>,
     finished_at: Option<DateTime<Utc>>,
     terminal_reason: Option<String>,
+    class: Option<String>,
+    resources: Vec<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -52,6 +54,12 @@ struct LockRow {
 
 #[derive(sqlx::FromRow)]
 struct QueuePolicyRow {
+    max_concurrent_attempts: i32,
+}
+
+#[derive(sqlx::FromRow)]
+struct ResourcePolicyRow {
+    resource: String,
     max_concurrent_attempts: i32,
 }
 
@@ -207,6 +215,135 @@ async fn transaction_isolation(connection: &mut PgConnection) -> Result<String> 
             field: "transaction_isolation",
             reason: "the database did not report its isolation level".to_owned(),
         })
+}
+
+/// Requires the `READ COMMITTED` isolation level of a claim or policy write.
+///
+/// An older snapshot could miss a policy or an occupancy committed while the
+/// call waited for the queue lock, or act on stale admission state.
+pub(crate) async fn require_read_committed(connection: &mut PgConnection) -> Result<()> {
+    if transaction_isolation(connection).await? != "read committed" {
+        return Err(Error::Validation {
+            field: "transaction_isolation",
+            reason: "all task claims require READ COMMITTED".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Reads the shared resources whose running occupancy reached their policy.
+async fn blocked_resources(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+) -> Result<Vec<String>> {
+    Ok(sqlx::query_file_scalar!(
+        "sql/store_running_resource_counts.sql",
+        namespace.as_str(),
+        queue.as_str(),
+    )
+    .fetch_all(&mut *connection)
+    .await?)
+}
+
+/// Reads the shared resource policies of the queue, sorted by resource.
+pub(crate) async fn resource_policies(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+) -> Result<Vec<(String, u32)>> {
+    let rows = sqlx::query_file_as!(
+        ResourcePolicyRow,
+        "sql/store_resource_policies.sql",
+        namespace.as_str(),
+        queue.as_str(),
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let limit = u32::try_from(row.max_concurrent_attempts)
+                .ok()
+                .filter(|limit| *limit > 0)
+                .ok_or(Error::Validation {
+                    field: "max_concurrent_attempts",
+                    reason: "the stored resource policy is not a positive supported integer"
+                        .to_owned(),
+                })?;
+            Ok((row.resource, limit))
+        })
+        .collect()
+}
+
+/// Stores the positive concurrency limit of one shared resource.
+pub(crate) async fn set_resource_policy(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+    resource: &str,
+    max_concurrent_attempts: i32,
+) -> Result<()> {
+    sqlx::query_file!(
+        "sql/store_resource_policy_set.sql",
+        namespace.as_str(),
+        queue.as_str(),
+        resource,
+        max_concurrent_attempts,
+    )
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
+}
+
+/// Removes the stored limit of one shared resource.
+pub(crate) async fn clear_resource_policy(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+    resource: &str,
+) -> Result<()> {
+    sqlx::query_file!(
+        "sql/store_resource_policy_clear.sql",
+        namespace.as_str(),
+        queue.as_str(),
+        resource,
+    )
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
+}
+
+/// Reads the last class granted by fair candidate admission.
+pub(crate) async fn class_cursor(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+) -> Result<Option<String>> {
+    Ok(sqlx::query_file_scalar!(
+        "sql/store_claim_class_cursor_get.sql",
+        namespace.as_str(),
+        queue.as_str(),
+    )
+    .fetch_optional(&mut *connection)
+    .await?)
+}
+
+/// Advances the fair admission cursor to the class of the granted task.
+async fn turn_class_cursor(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+    last_class: &str,
+) -> Result<()> {
+    sqlx::query_file!(
+        "sql/store_claim_class_cursor_turn.sql",
+        namespace.as_str(),
+        queue.as_str(),
+        last_class,
+    )
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
 }
 
 /// Whether the captured attempt already holds a terminal seal.
@@ -424,12 +561,7 @@ pub(crate) async fn claim_task(
     // Every claim requires READ COMMITTED, whether or not the queue has a
     // policy now. An older snapshot could otherwise miss a policy committed
     // while the claim waited, or act on a stale policy and running count.
-    if transaction_isolation(connection).await? != "read committed" {
-        return Err(Error::Validation {
-            field: "transaction_isolation",
-            reason: "all task claims require READ COMMITTED".to_owned(),
-        });
-    }
+    require_read_committed(connection).await?;
     if let Some(limit) = queue_policy(connection, namespace, queue)
         .await?
         .max_concurrent_attempts
@@ -439,7 +571,30 @@ pub(crate) async fn claim_task(
             return Ok(None);
         }
     }
+    let blocked = blocked_resources(connection, namespace, queue).await?;
 
+    claim_target(
+        connection,
+        namespace,
+        queue,
+        worker_id,
+        lease_ttl,
+        target.map(|task_id| task_id.as_uuid()),
+        &blocked,
+    )
+    .await
+}
+
+/// Claims one ready task and returns it with the new attempt.
+async fn claim_target(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+    worker_id: &str,
+    lease_ttl: Duration,
+    target: Option<Uuid>,
+    blocked: &[String],
+) -> Result<Option<crate::model::Claim>> {
     let row = sqlx::query_file_as!(
         AttemptRow,
         "sql/store_claim.sql",
@@ -449,7 +604,8 @@ pub(crate) async fn claim_task(
         Uuid::new_v4(),
         Uuid::new_v4(),
         duration_millis(lease_ttl),
-        target.map(|task_id| task_id.as_uuid()),
+        target,
+        blocked,
     )
     .fetch_optional(&mut *connection)
     .await?;
@@ -461,6 +617,69 @@ pub(crate) async fn claim_task(
         .await?
         .ok_or(Error::NotFound)?;
     Ok(Some(crate::model::Claim::from_parts(task, attempt)))
+}
+
+/// Claims the best admissible candidate of a caller provided bounded set.
+///
+/// The fair cursor rotates the classes of the candidate set. It moves only
+/// when a candidate was granted, never when the call reports `None`.
+pub(crate) async fn claim_candidates(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+    worker_id: &str,
+    lease_ttl: Duration,
+    candidate_ids: &[TaskId],
+) -> Result<Option<crate::model::Claim>> {
+    lock_queue(connection, namespace, queue).await?;
+    require_read_committed(connection).await?;
+    if let Some(limit) = queue_policy(connection, namespace, queue)
+        .await?
+        .max_concurrent_attempts
+    {
+        let running = running_attempt_count(connection, namespace, queue).await?;
+        if running >= i64::from(limit) {
+            return Ok(None);
+        }
+    }
+    let blocked = blocked_resources(connection, namespace, queue).await?;
+    let last_class = class_cursor(connection, namespace, queue)
+        .await?
+        .unwrap_or_default();
+    let ids: Vec<Uuid> = candidate_ids
+        .iter()
+        .map(|task_id| task_id.as_uuid())
+        .collect();
+    let ordered = sqlx::query_file_scalar!(
+        "sql/store_claim_candidates.sql",
+        namespace.as_str(),
+        queue.as_str(),
+        &ids,
+        &blocked,
+        last_class,
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+
+    for task_id in ordered {
+        let Some(claim) = claim_target(
+            connection,
+            namespace,
+            queue,
+            worker_id,
+            lease_ttl,
+            Some(task_id),
+            &blocked,
+        )
+        .await?
+        else {
+            continue;
+        };
+        let last_class = claim.task().class().unwrap_or_default().to_owned();
+        turn_class_cursor(connection, namespace, queue, &last_class).await?;
+        return Ok(Some(claim));
+    }
+    Ok(None)
 }
 
 /// Renews the lease of an attempt.
@@ -659,6 +878,8 @@ fn task_from_row(row: TaskRow) -> Result<Task> {
         cancel_requested_at: row.cancel_requested_at,
         finished_at: row.finished_at,
         terminal_reason: row.terminal_reason,
+        class: row.class,
+        resources: row.resources,
     })
 }
 

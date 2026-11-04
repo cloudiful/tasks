@@ -19,7 +19,7 @@ pub const SCHEMA_NAME: &str = "cloudiful_tasks";
 pub const LIBRARY_ID: &str = "cloudiful-tasks";
 
 /// Schema protocol version implemented by this build.
-pub const PROTOCOL_VERSION: i32 = 2;
+pub const PROTOCOL_VERSION: i32 = 3;
 
 /// Table holding the ownership marker of the schema.
 const OWNERSHIP_TABLE: &str = "schema_ownership";
@@ -376,12 +376,12 @@ mod tests {
     #[test]
     fn lock_key_is_stable_and_database_specific() {
         assert_eq!(
-            migrate_lock_key("cloudiful_tasks_test"),
-            migrate_lock_key("cloudiful_tasks_test")
+            migrate_lock_key("cloudiful_tasks_issue_1194"),
+            migrate_lock_key("cloudiful_tasks_issue_1194")
         );
         assert_ne!(
-            migrate_lock_key("cloudiful_tasks_test"),
-            migrate_lock_key("cloudiful_tasks_dev")
+            migrate_lock_key("cloudiful_tasks_issue_1194"),
+            migrate_lock_key("cloudiful_tasks_issue_1194_sibling")
         );
     }
 }

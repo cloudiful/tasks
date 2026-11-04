@@ -222,6 +222,28 @@
             "name": "terminal_reason"
           }
         }
+      },
+      {
+        "ordinal": 20,
+        "name": "class",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "class"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "resources",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "resources"
+          }
+        }
       }
     ],
     "parameters": {
@@ -253,7 +275,9 @@
       false,
       true,
       true,
-      true
+      true,
+      true,
+      false
     ]
   },
   "hash": "644398c84d146852f9936f9d0ab30e5d61f69908298fe503ec272a576a84b87a"

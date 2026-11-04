@@ -6,14 +6,16 @@
 
 mod common;
 
-use cloudiful_tasks::{Error, check_schema, migrate};
+use cloudiful_tasks::{EnqueueRequest, Error, TaskId, TaskKind, check_schema, migrate};
 use sqlx::PgPool;
 use sqlx::Row;
 
 use common::{
     advisory_lock_count, cleanup, connect, create_empty_schema, create_foreign_schema,
-    create_ledger_only_schema, create_public_sentinels, relation_names, schema_exists,
+    create_ledger_only_schema, create_public_sentinels, open_queue, relation_names, schema_exists,
 };
+
+const FAIR_ADMISSION_SEED_V2_SQL: &str = include_str!("../sql/tests/fair_admission_seed_v2.sql");
 
 const BUMP_PROTOCOL_VERSION_SQL: &str =
     include_str!("../sql/tests/migration_bump_protocol_version.sql");
@@ -27,6 +29,79 @@ struct LedgerVersionRow {
     migration_version: i64,
 }
 
+#[derive(sqlx::FromRow)]
+struct FairAdmissionRow {
+    class: Option<String>,
+    resources: Vec<String>,
+    attempt_count: i32,
+    fencing_token: uuid::Uuid,
+}
+
+async fn seed_v2_task(pool: &PgPool) {
+    sqlx::raw_sql(FAIR_ADMISSION_SEED_V2_SQL)
+        .execute(pool)
+        .await
+        .expect("the representative old task must be insertable");
+}
+
+async fn assert_upgraded_task_metadata(pool: &PgPool) {
+    let row = sqlx::query_file_as!(
+        FairAdmissionRow,
+        "sql/tests/fair_admission_state.sql",
+        uuid::Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
+    )
+    .fetch_one(pool)
+    .await
+    .expect("the upgraded task must be readable");
+    assert_eq!(row.class, None);
+    assert!(row.resources.is_empty());
+    assert_eq!(row.attempt_count, 1);
+    assert_eq!(
+        row.fencing_token,
+        uuid::Uuid::from_u128(0x3333_3333_3333_3333_3333_3333_3333_3333)
+    );
+
+    let queue = open_queue(pool, "ns", "q").await;
+    let replayed = queue
+        .enqueue(
+            EnqueueRequest::new(
+                TaskKind::new("demo").unwrap(),
+                serde_json::json!({"legacy": true}),
+            )
+            .with_idempotency_key("legacy-key")
+            .unwrap(),
+        )
+        .await
+        .expect("the stored v2 request specification must replay");
+    assert!(!replayed.is_created());
+    assert_eq!(
+        replayed.task().id(),
+        TaskId::from_uuid(uuid::Uuid::from_u128(
+            0x1111_1111_1111_1111_1111_1111_1111_1111
+        ))
+    );
+}
+
+async fn remove_fair_admission_schema(pool: &PgPool, version: i64) {
+    sqlx::raw_sql(
+        "DROP INDEX cloudiful_tasks.tasks_claim_class_idx; \
+         DROP INDEX cloudiful_tasks.tasks_resources_gin; \
+         DROP TABLE cloudiful_tasks.queue_class_cursors; \
+         DROP TABLE cloudiful_tasks.queue_resource_policies; \
+         ALTER TABLE cloudiful_tasks.tasks \
+             DROP COLUMN class, \
+             DROP COLUMN resources",
+    )
+    .execute(pool)
+    .await
+    .expect("the fair admission schema fixture must be removable");
+    sqlx::query("DELETE FROM cloudiful_tasks._sqlx_migrations WHERE version = $1")
+        .bind(version)
+        .execute(pool)
+        .await
+        .expect("the ledger row must be removable");
+}
+
 #[tokio::test]
 #[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
 async fn migrate_creates_only_the_owned_schema() {
@@ -35,8 +110,8 @@ async fn migrate_creates_only_the_owned_schema() {
 
     let outcome = migrate(&pool).await.expect("the migration must succeed");
     assert!(outcome.applied());
-    assert_eq!(outcome.protocol_version(), 2);
-    assert_eq!(outcome.applied_versions().len(), 2);
+    assert_eq!(outcome.protocol_version(), 3);
+    assert_eq!(outcome.applied_versions().len(), 3);
     assert!(!outcome.instance_uuid().is_nil());
 
     let owned = relation_names(&pool, "cloudiful_tasks").await;
@@ -63,7 +138,7 @@ async fn migrate_creates_only_the_owned_schema() {
         .await
         .expect("the schema must be compatible");
     assert_eq!(info.instance_uuid(), outcome.instance_uuid());
-    assert_eq!(info.protocol_version(), 2);
+    assert_eq!(info.protocol_version(), 3);
 
     assert_eq!(
         advisory_lock_count(&pool).await,
@@ -90,7 +165,7 @@ async fn concurrent_migrations_are_idempotent() {
             .fetch_all(&pool)
             .await
             .expect("the migration ledger must be readable");
-    assert_eq!(versions.len(), 2);
+    assert_eq!(versions.len(), 3);
     assert_eq!(versions[0].migration_version, first.applied_versions()[0]);
 }
 
@@ -235,7 +310,7 @@ async fn a_newer_protocol_version_is_refused() {
             error,
             Error::UnsupportedSchemaVersion {
                 found: 999,
-                supported: 2
+                supported: 3
             }
         ),
         "unexpected error: {error}"
@@ -249,7 +324,7 @@ async fn a_newer_protocol_version_is_refused() {
             error,
             Error::UnsupportedSchemaVersion {
                 found: 999,
-                supported: 2
+                supported: 3
             }
         ),
         "unexpected error: {error}"
@@ -334,7 +409,7 @@ async fn the_migration_runs_on_an_empty_database() {
 
     let outcome = migrate(&pool).await.expect("the migration must succeed");
     assert!(outcome.applied());
-    assert_eq!(outcome.applied_versions().len(), 2);
+    assert_eq!(outcome.applied_versions().len(), 3);
 }
 
 #[tokio::test]
@@ -345,24 +420,24 @@ async fn an_owned_version_one_schema_is_upgraded() {
     let first = migrate(&pool)
         .await
         .expect("the first migration must succeed");
-    let latest = *first
-        .applied_versions()
-        .last()
-        .expect("the migration ledger must not be empty");
+    let versions = first.applied_versions().to_vec();
+    assert_eq!(versions.len(), 3);
 
+    remove_fair_admission_schema(&pool, versions[2]).await;
     sqlx::query("DROP TABLE cloudiful_tasks.queue_policies")
         .execute(&pool)
         .await
         .expect("the policy table fixture must be removable");
     sqlx::query("DELETE FROM cloudiful_tasks._sqlx_migrations WHERE version = $1")
-        .bind(latest)
+        .bind(versions[1])
         .execute(&pool)
         .await
-        .expect("the latest ledger row must be removable");
+        .expect("the version two ledger row must be removable");
     sqlx::query("UPDATE cloudiful_tasks.schema_ownership SET protocol_version = 1 WHERE singleton")
         .execute(&pool)
         .await
         .expect("the ownership marker must be writable");
+    seed_v2_task(&pool).await;
 
     let error = check_schema(&pool)
         .await
@@ -372,7 +447,7 @@ async fn an_owned_version_one_schema_is_upgraded() {
             error,
             Error::OutdatedSchemaVersion {
                 found: 1,
-                supported: 2
+                supported: 3
             }
         ),
         "unexpected error: {error}"
@@ -382,19 +457,66 @@ async fn an_owned_version_one_schema_is_upgraded() {
         .await
         .expect("an owned older schema must be upgraded");
     assert!(upgraded.applied());
-    assert_eq!(upgraded.protocol_version(), 2);
+    assert_eq!(upgraded.protocol_version(), 3);
     assert_eq!(upgraded.applied_versions(), first.applied_versions());
-    assert!(
-        relation_names(&pool, "cloudiful_tasks")
-            .await
-            .contains(&"queue_policies".to_owned()),
-        "the upgrade must create the policy table"
-    );
+    let relations = relation_names(&pool, "cloudiful_tasks").await;
+    assert!(relations.contains(&"queue_policies".to_owned()));
+    assert!(relations.contains(&"queue_class_cursors".to_owned()));
+    assert!(relations.contains(&"queue_resource_policies".to_owned()));
     assert_eq!(
         check_schema(&pool)
             .await
             .expect("the upgraded schema must be readable")
             .protocol_version(),
-        2
+        3
     );
+    assert_upgraded_task_metadata(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn an_owned_version_two_schema_is_upgraded() {
+    let pool = connect().await;
+    cleanup(&pool).await;
+    let first = migrate(&pool)
+        .await
+        .expect("the first migration must succeed");
+    let versions = first.applied_versions().to_vec();
+    assert_eq!(versions.len(), 3);
+
+    remove_fair_admission_schema(&pool, versions[2]).await;
+    sqlx::query("UPDATE cloudiful_tasks.schema_ownership SET protocol_version = 2 WHERE singleton")
+        .execute(&pool)
+        .await
+        .expect("the ownership marker must be writable");
+    seed_v2_task(&pool).await;
+
+    let error = check_schema(&pool)
+        .await
+        .expect_err("an older protocol version must not be read");
+    assert!(
+        matches!(
+            error,
+            Error::OutdatedSchemaVersion {
+                found: 2,
+                supported: 3
+            }
+        ),
+        "unexpected error: {error}"
+    );
+
+    let upgraded = migrate(&pool)
+        .await
+        .expect("an owned older schema must be upgraded");
+    assert!(upgraded.applied());
+    assert_eq!(upgraded.protocol_version(), 3);
+    assert_eq!(upgraded.applied_versions(), first.applied_versions());
+    assert_eq!(
+        check_schema(&pool)
+            .await
+            .expect("the upgraded schema must be readable")
+            .protocol_version(),
+        3
+    );
+    assert_upgraded_task_metadata(&pool).await;
 }

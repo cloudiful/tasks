@@ -12,7 +12,9 @@ INSERT INTO cloudiful_tasks.tasks (
     attempt_count,
     max_attempts,
     retry_initial_delay_ns,
-    retry_max_delay_ns
+    retry_max_delay_ns,
+    class,
+    resources
 )
 VALUES (
     $1,
@@ -28,7 +30,9 @@ VALUES (
     0,
     $10,
     $11,
-    $12
+    $12,
+    $13,
+    $14
 )
 ON CONFLICT (namespace, queue, idempotency_key) WHERE idempotency_key IS NOT NULL
 DO NOTHING

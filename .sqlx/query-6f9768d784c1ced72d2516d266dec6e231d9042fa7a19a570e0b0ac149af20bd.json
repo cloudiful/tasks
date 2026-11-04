@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- Ordered candidates of a fair claim.\n--\n-- The rotation starts with the classes above the last granted class in\n-- ascending order and wraps to the remaining classes. Inside one class the\n-- current priority order applies. The default class is the empty string.\n-- Tasks that declare a blocked shared resource are skipped, so a blocked head\n-- never hides an admissible candidate of the same class or of a later class.\nSELECT t.id\nFROM cloudiful_tasks.tasks AS t\nWHERE t.namespace = $1\n  AND t.queue = $2\n  AND t.id = ANY($3::uuid[])\n  AND t.status = 'queued'\n  AND t.available_at <= clock_timestamp()\n  AND NOT (t.resources && $4::text[])\nORDER BY\n    CASE WHEN COALESCE(t.class, '') > $5 THEN 0 ELSE 1 END,\n    COALESCE(t.class, ''),\n    t.priority DESC,\n    t.available_at,\n    t.created_at,\n    t.id\nLIMIT 1000\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "UuidArray",
+        "TextArray",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6f9768d784c1ced72d2516d266dec6e231d9042fa7a19a570e0b0ac149af20bd"
+}

@@ -29,6 +29,8 @@ The `v0.1` release implements:
   renewal, progress, completion, failure, cancellation, manual retry and
   recovery of expired leases,
 - durable queue policies with an optional global limit on running attempts,
+- immutable task classes and shared resource keys, fair admission of a
+  caller-provided candidate set and queue-scoped resource limits,
 - the worker runtime: bounded concurrency, lease heartbeat, cooperative
   cancellation, recovery of expired leases, wake up notifications, a
   handler-owned terminal outcome and a graceful shutdown.
@@ -115,6 +117,8 @@ The semantics of the store:
 | Idempotency | The same key with the same request returns the existing task, also when it already finished. The same key with a different request is an `IdempotencyConflict`. A request without a key always creates a task. |
 | Claim | Only a ready task is claimed, highest priority first, then the oldest ready one. The claim holds the lease of the task and carries a fresh fencing token. |
 | Addressed claim | `claim_by_id` claims exactly the requested task and never another one. The task must be ready and of the queue, otherwise the call reports `None` and claims nothing. The call bypasses the order of the queue, the decision which task is eligible stays with the caller. `claim_by_id_in` runs in the transaction of the caller. |
+| Fair claim | `claim_from_candidates` claims the best admissible task of a caller-provided bounded set and never falls back outside it. The classes of the set rotate, inside one class the priority order applies. The set may hold at most `MAX_CLAIM_CANDIDATES` unique identifiers. `claim_from_candidates_in` runs in the transaction of the caller. |
+| Resources | Every claim path skips a task whose declared shared resources are at their policy limit. Only a sealed attempt releases the capacity; an expired attempt still counts until recovery seals it. |
 | Lease | The lease expires on the clock of the database. A renewal, a progress report, a completion and a failure need the attempt, its token and an unexpired lease, otherwise the call reports `LeaseLost` and changes nothing. The lease is checked against the clock of the database after the locks of the operation are taken, so a call that waits for a lock cannot use an expired lease. |
 | Recovery | An expired attempt is sealed as interrupted and its task is scheduled again while the budget of the task allows it, otherwise the task fails. The recovery is idempotent. |
 | Cancellation | A queued task is cancelled at once, a running task is marked for cancellation. A cancellation that was requested before the completion wins: the task ends as cancelled and its result is discarded. External side effects cannot be undone. |
@@ -155,6 +159,48 @@ let policy = queue.policy().await?;
 | Capacity | Every claim path counts the running attempts of the queue under the same queue-scoped transaction advisory lock that replaces the policy. An expired running attempt still counts until recovery seals it, and a successful completion, failure, cancellation or recovery frees the capacity by sealing the attempt. |
 | Isolation | Every claim path requires `READ COMMITTED`, whether or not the queue has a stored policy; another isolation level is refused before the policy is read. The lock statement and the count run separately, so a waiting claim counts after it acquired the lock and cannot rely on a snapshot taken before a limit was stored. |
 | Reset | Setting `None` removes the policy and restores the unlimited behavior. |
+
+### Fair admission and shared resources
+
+A task carries an immutable class and immutable shared resource keys. Both are
+optional, so an existing caller keeps the default class and no resources:
+
+```rust
+let request = EnqueueRequest::new(TaskKind::new("sync")?, json!({"cluster": "a"}))
+    .with_class("large")?
+    .with_resources(["gpu".to_owned(), "io".to_owned()])?;
+```
+
+When a caller owns the eligible set, it claims from that set. The library
+chooses the winner and never widens the set:
+
+```rust
+use cloudiful_tasks::MAX_CLAIM_CANDIDATES;
+
+let candidates = eligible_ids_up_to(MAX_CLAIM_CANDIDATES);
+if let Some(claim) = queue.claim_from_candidates(&candidates, "worker-1").await? {
+    queue.complete(claim.attempt(), Some(json!({"ok": true}))).await?;
+}
+```
+
+The limits are stored per queue and read on every claim. `None` clears the
+limit of that exact resource:
+
+```rust
+queue.set_resource_policy("gpu", Some(1)).await?;
+let limits = queue.resource_policy().await?;
+queue.set_resource_policy("gpu", None).await?;
+```
+
+| Topic | Behaviour |
+| --- | --- |
+| Fairness bound | The guarantee covers only the classes present in the provided eligible set: one granted turn per class, then the next turn. Inside one class the current priority order applies. A caller that quietly excludes a class weakens its own fairness; the library never selects outside the set. |
+| Rotation | The next class is the first class after the last granted class in ascending order, wrapping to the remaining classes. The class of a task without a class is the empty string and sorts first. |
+| Cursor | `class_cursor` reports the last granted class. It moves only when a fair claim granted a task and shares the transaction of the caller, so a rollback restores it. Ordinary and addressed claims never move it. |
+| Resource scope | Resource limits are scoped to one namespace and queue, not to the whole namespace. A class-specific limit is a resource key that only the tasks of that class declare. A shared key may appear across classes. |
+| Multiple keys | A task is admissible only while every declared key has capacity. Each running attempt counts once for each key it declares. |
+| Capacity | Resource occupancy is read under the same queue-scoped transaction advisory lock as the global policy and the claim. A lower or cleared limit never revokes a running attempt; it applies to the next claim. An expired attempt still counts until recovery seals it. |
+| Rollout | Protocol version 3 adds these columns and tables. A build of the previous protocol refuses a version 3 schema, and this build requires `migrate` before `check_schema` accepts the database. Upgrade the library and run the migration together; no downgrade is supported. |
 
 ### The worker
 
@@ -215,6 +261,8 @@ caller, so a business write and the task share one commit:
 | --- | --- |
 | Enqueue | `enqueue_in` |
 | Claim | `claim_in` |
+| Fair candidate claim | `claim_from_candidates_in` |
+| Set a shared resource limit | `set_resource_policy_in` |
 | Renew the lease | `renew_in` |
 | Progress report | `report_progress_in` |
 | Complete | `complete_in` |
@@ -260,20 +308,27 @@ committed, so the crate builds without a database:
 SQLX_OFFLINE=true cargo check --locked --offline --all-targets
 ```
 
-Regenerate the metadata only against the dedicated development database of the
-shared non-production test server:
+Regenerate the metadata only against the issue-owned sibling database of the
+non-production test server:
 
 ```sh
 DATABASE_URL="$CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL" \
   cargo sqlx prepare -- --all-targets
 ```
 
-The live suites read their explicit fixture URLs from
-`CLOUDIFUL_TASKS_TEST_DATABASE_URL` (`cloudiful_tasks_test`) and
-`CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL` (`cloudiful_tasks_dev`). The guard
-checks the effective connection options, the actual database identity and the
-exact dedicated database comment before any fixture reset; a shared project
-database is never accepted.
+The live suites read both explicit fixture URLs from
+`CLOUDIFUL_TASKS_TEST_DATABASE_URL` and
+`CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL`. The guard reads the pair together:
+the primary must be `cloudiful_tasks_issue_<id>` and the sibling
+`cloudiful_tasks_issue_<id>_sibling` for the same canonical positive issue id,
+both within 63 bytes. Both must use the fixed `unraid.cloud1ful.com:5432`
+endpoint with a role and without socket or connection option overrides. Before
+any write the database must report the configured role, its exact issue
+database name, a non-loopback TCP server address, port `5432` and the exact
+issue-owned marker. Shared names, a mismatched pair and legacy fixtures are
+refused. The issue pair is created, migrated and seeded by the issue primary
+and both databases are dropped at issue completion after the markers are
+rechecked; shared, other-issue and production databases are never reset.
 
 ## License
 

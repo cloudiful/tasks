@@ -50,7 +50,9 @@ pub use crate::model::{
     FencingToken, ListCursor, Namespace, ProgressUpdate, QueueName, RetryPolicy, Task, TaskId,
     TaskKind, TaskStatus,
 };
-pub use crate::queue::{MAX_ATTEMPT_LIMIT, MAX_LIST_LIMIT, MAX_RECOVERY_LIMIT, Queue, QueuePolicy};
+pub use crate::queue::{
+    MAX_ATTEMPT_LIMIT, MAX_CLAIM_CANDIDATES, MAX_LIST_LIMIT, MAX_RECOVERY_LIMIT, Queue, QueuePolicy,
+};
 pub use crate::wake::{WAKE_CHANNEL, WakeListener, Wakeup};
 pub use crate::worker::{Worker, WorkerBuilder};
 pub use tokio_util::sync::CancellationToken;
