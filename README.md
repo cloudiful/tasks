@@ -152,6 +152,10 @@ queue
 let policy = queue.policy().await?;
 ```
 
+`set_policy_in` applies the same replacement inside the transaction of the
+caller, so a global policy, shared resource limits and a business write commit
+or roll back together.
+
 | Topic | Behaviour |
 | --- | --- |
 | Default | A queue without a stored policy is unlimited, which preserves the behavior of every existing queue. |
@@ -262,6 +266,7 @@ caller, so a business write and the task share one commit:
 | Enqueue | `enqueue_in` |
 | Claim | `claim_in` |
 | Fair candidate claim | `claim_from_candidates_in` |
+| Set the global policy | `set_policy_in` |
 | Set a shared resource limit | `set_resource_policy_in` |
 | Renew the lease | `renew_in` |
 | Progress report | `report_progress_in` |

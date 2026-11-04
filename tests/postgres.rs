@@ -3094,3 +3094,253 @@ async fn a_global_policy_bounds_fair_and_addressed_claims() {
         .expect("the sealed attempts must free the capacity");
     assert_eq!(last.task().id(), third_task.task().id());
 }
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_global_and_resource_policy_in_a_transaction_share_the_domain_commit() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let second = open_queue(&pool, NAMESPACE, QUEUE).await;
+
+    let mut transaction = pool.begin().await.unwrap();
+    queue
+        .set_policy_in(
+            &mut transaction,
+            QueuePolicy {
+                max_concurrent_attempts: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+    queue
+        .set_resource_policy_in(&mut transaction, "gpu", Some(1))
+        .await
+        .unwrap();
+    write_app_domain(&mut transaction, "rolled back").await;
+    transaction.rollback().await.unwrap();
+
+    assert_eq!(queue.policy().await.unwrap(), QueuePolicy::unlimited());
+    assert!(queue.resource_policy().await.unwrap().is_empty());
+    assert_eq!(app_domain_count(&pool).await, 0);
+
+    let mut transaction = pool.begin().await.unwrap();
+    queue
+        .set_policy_in(
+            &mut transaction,
+            QueuePolicy {
+                max_concurrent_attempts: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+    queue
+        .set_resource_policy_in(&mut transaction, "gpu", Some(1))
+        .await
+        .unwrap();
+    write_app_domain(&mut transaction, "committed").await;
+    transaction.commit().await.unwrap();
+
+    assert_eq!(
+        queue.policy().await.unwrap(),
+        QueuePolicy {
+            max_concurrent_attempts: Some(2),
+        }
+    );
+    assert_eq!(
+        queue.resource_policy().await.unwrap(),
+        vec![("gpu".to_owned(), 1)]
+    );
+    assert_eq!(
+        second.policy().await.unwrap().max_concurrent_attempts,
+        Some(2)
+    );
+    assert_eq!(app_domain_count(&pool).await, 1);
+
+    let mut transaction = pool.begin().await.unwrap();
+    queue
+        .set_policy_in(&mut transaction, QueuePolicy::unlimited())
+        .await
+        .unwrap();
+    write_app_domain(&mut transaction, "cleared").await;
+    transaction.commit().await.unwrap();
+    assert_eq!(queue.policy().await.unwrap(), QueuePolicy::unlimited());
+    assert_eq!(app_domain_count(&pool).await, 2);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_borrowed_global_policy_refuses_a_foreign_instance_and_database() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+
+    // The schema is migrated again, the queue of the caller holds the
+    // instance of the schema before the migration.
+    reset(&pool).await;
+
+    let mut transaction = pool.begin().await.unwrap();
+    let error = queue
+        .set_policy_in(
+            &mut transaction,
+            QueuePolicy {
+                max_concurrent_attempts: Some(1),
+            },
+        )
+        .await
+        .expect_err("a transaction of another schema instance must be refused");
+    assert!(
+        matches!(error, Error::InstanceMismatch { .. }),
+        "unexpected error: {error}"
+    );
+    transaction.rollback().await.unwrap();
+
+    let sibling = connect_to_sibling_database().await;
+    let mut transaction = sibling.begin().await.unwrap();
+    let error = queue
+        .set_policy_in(
+            &mut transaction,
+            QueuePolicy {
+                max_concurrent_attempts: Some(1),
+            },
+        )
+        .await
+        .expect_err("a transaction of another database must be refused");
+    assert!(
+        matches!(
+            error,
+            Error::InstanceMismatch { .. } | Error::SchemaMissing { .. }
+        ),
+        "unexpected error: {error}"
+    );
+    transaction.rollback().await.ok();
+
+    let current = open_queue(&pool, NAMESPACE, QUEUE).await;
+    assert_eq!(current.policy().await.unwrap(), QueuePolicy::unlimited());
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_borrowed_global_policy_requires_read_committed_and_validates_caps() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+
+    for level in ["REPEATABLE READ", "SERIALIZABLE"] {
+        let mut transaction = isolation_transaction(&pool, level).await;
+        let error = queue
+            .set_policy_in(
+                &mut transaction,
+                QueuePolicy {
+                    max_concurrent_attempts: Some(1),
+                },
+            )
+            .await
+            .expect_err("a non default isolation must be refused");
+        assert_claim_requires_read_committed(&error);
+        transaction.rollback().await.unwrap();
+    }
+    assert_eq!(queue.policy().await.unwrap(), QueuePolicy::unlimited());
+
+    for limit in [Some(0), Some(u32::MAX)] {
+        let mut transaction = pool.begin().await.unwrap();
+        let error = queue
+            .set_policy_in(
+                &mut transaction,
+                QueuePolicy {
+                    max_concurrent_attempts: limit,
+                },
+            )
+            .await
+            .expect_err("an invalid global limit must be refused");
+        assert!(
+            matches!(
+                error,
+                Error::Validation {
+                    field: "max_concurrent_attempts",
+                    ..
+                }
+            ),
+            "unexpected error: {error}"
+        );
+        transaction.rollback().await.unwrap();
+    }
+    assert_eq!(queue.policy().await.unwrap(), QueuePolicy::unlimited());
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_borrowed_policy_lowering_keeps_running_attempts() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let second = open_queue(&pool, NAMESPACE, QUEUE).await;
+    queue
+        .set_policy(QueuePolicy {
+            max_concurrent_attempts: Some(2),
+        })
+        .await
+        .unwrap();
+    let first = queue.enqueue(request()).await.unwrap();
+    let second_task = queue.enqueue(request()).await.unwrap();
+    let third = queue.enqueue(request()).await.unwrap();
+
+    let first_claim = queue.claim("worker-1").await.unwrap().unwrap();
+    let second_claim = second.claim("worker-2").await.unwrap().unwrap();
+    assert_eq!(first_claim.task().id(), first.task().id());
+    assert_eq!(second_claim.task().id(), second_task.task().id());
+
+    let mut transaction = pool.begin().await.unwrap();
+    queue
+        .set_policy_in(
+            &mut transaction,
+            QueuePolicy {
+                max_concurrent_attempts: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    assert_eq!(
+        queue
+            .get(first.task().id())
+            .await
+            .unwrap()
+            .unwrap()
+            .status(),
+        TaskStatus::Running
+    );
+    assert_eq!(
+        queue
+            .get(second_task.task().id())
+            .await
+            .unwrap()
+            .unwrap()
+            .status(),
+        TaskStatus::Running
+    );
+    assert!(
+        queue.claim("worker-3").await.unwrap().is_none(),
+        "a lower limit must not revoke a running attempt"
+    );
+
+    queue.complete(first_claim.attempt(), None).await.unwrap();
+    assert!(
+        queue
+            .claim_by_id(third.task().id(), "worker-4")
+            .await
+            .unwrap()
+            .is_none(),
+        "the remaining running attempt must still count"
+    );
+    queue.complete(second_claim.attempt(), None).await.unwrap();
+    let last = queue
+        .claim_by_id(third.task().id(), "worker-5")
+        .await
+        .unwrap()
+        .expect("the sealed attempts must free the capacity");
+    assert_eq!(last.task().id(), third.task().id());
+}

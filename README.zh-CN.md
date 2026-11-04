@@ -144,6 +144,9 @@ queue
 let policy = queue.policy().await?;
 ```
 
+`set_policy_in` 在调用方的事务中应用同样的替换，因此全局策略、共享资源限制和
+业务写入会一起提交或一起回滚。
+
 | 主题 | 行为 |
 | --- | --- |
 | 默认 | 没有存储策略的队列不受限制，所有已有队列的行为保持不变。 |
@@ -252,6 +255,7 @@ worker 的语义：
 | 入队 | `enqueue_in` |
 | 领取 | `claim_in` |
 | 公平候选领取 | `claim_from_candidates_in` |
+| 设置全局策略 | `set_policy_in` |
 | 设置共享资源限制 | `set_resource_policy_in` |
 | 续租 | `renew_in` |
 | 进度报告 | `report_progress_in` |

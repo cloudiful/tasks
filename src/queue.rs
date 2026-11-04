@@ -165,6 +165,24 @@ impl Queue {
         }
     }
 
+    /// Replaces the durable execution policy of the queue in the transaction
+    /// of the caller.
+    ///
+    /// The transaction must belong to the schema instance of this queue,
+    /// otherwise the call is refused before any write, and it must run at
+    /// `READ COMMITTED`. The transaction is never begun, committed or rolled
+    /// back by the library, so the caller owns the commit and the rollback.
+    /// The policy is only durable when the caller commits.
+    pub async fn set_policy_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        policy: QueuePolicy,
+    ) -> Result<()> {
+        policy.validate()?;
+        self.verify_instance(transaction).await?;
+        self.set_policy_on(transaction, policy).await
+    }
+
     /// Reads the shared resource limits of the queue, sorted by resource.
     ///
     /// A resource without a stored limit is unlimited. The limits are read
@@ -689,6 +707,7 @@ impl Queue {
         policy: QueuePolicy,
     ) -> Result<()> {
         store::lock_queue(connection, &self.namespace, &self.queue).await?;
+        store::require_read_committed(connection).await?;
         match policy.max_concurrent_attempts {
             Some(limit) => {
                 let limit = i32::try_from(limit).map_err(|_| Error::Validation {

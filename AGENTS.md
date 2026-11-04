@@ -65,9 +65,9 @@ other-issue and production databases are never reset.
 
 Every mutating queue operation has a variant that takes
 `&mut sqlx::Transaction<'_, sqlx::Postgres>`: `enqueue_in`, `claim_in`,
-`claim_from_candidates_in`, `set_resource_policy_in`, `renew_in`,
-`report_progress_in`, `complete_in`, `fail_in`, `request_cancel_in`,
-`retry_failed_in` and `recover_expired_in`.
+`claim_from_candidates_in`, `set_policy_in`, `set_resource_policy_in`,
+`renew_in`, `report_progress_in`, `complete_in`, `fail_in`,
+`request_cancel_in`, `retry_failed_in` and `recover_expired_in`.
 
 - A variant verifies the schema instance of the queue before it writes and
   refuses a transaction of another database or of another schema instance.
