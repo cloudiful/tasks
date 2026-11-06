@@ -12,7 +12,7 @@ use std::time::Duration;
 use chrono::{Duration as ChronoDuration, Utc};
 use cloudiful_tasks::{
     AttemptStatus, EnqueueRequest, Error, Failure, ProgressUpdate, QueuePolicy, RetryPolicy,
-    TaskId, TaskKind, TaskStatus,
+    TaskId, TaskKind, TaskPauseState, TaskStatus,
 };
 use serde_json::json;
 use sqlx::postgres::PgListener;
@@ -2095,4 +2095,419 @@ async fn a_waiting_policy_claim_uses_a_fresh_snapshot_after_the_queue_lock() {
         .expect("the waiting claim must see the capacity of the sealed attempt");
     assert_eq!(next.task().id(), second.task().id());
     assert_eq!(first.task().id(), claim.task().id());
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn pause_transitions_and_claim_exclusion() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let queued = queue.enqueue(request()).await.unwrap();
+    let available_at = queued.task().available_at();
+
+    // A queued task is paused at once and is not claimable by either path.
+    let paused = queue.request_pause(queued.task().id()).await.unwrap();
+    assert_eq!(paused.status(), TaskStatus::Queued);
+    assert_eq!(paused.pause_state(), TaskPauseState::Paused);
+    assert_eq!(paused.pause_generation(), 1);
+    assert_eq!(paused.available_at(), available_at);
+    assert!(queue.claim("worker").await.unwrap().is_none());
+    let other = queue.enqueue(request()).await.unwrap();
+    let other_claim = queue.claim("worker").await.unwrap().unwrap();
+    assert_eq!(other_claim.task().id(), other.task().id());
+    assert_eq!(
+        queue
+            .complete(other_claim.attempt(), None)
+            .await
+            .unwrap()
+            .status(),
+        TaskStatus::Succeeded
+    );
+    assert_eq!(
+        queue
+            .get(queued.task().id())
+            .await
+            .unwrap()
+            .unwrap()
+            .pause_state(),
+        TaskPauseState::Paused
+    );
+    assert!(
+        queue
+            .claim_by_id(queued.task().id(), "worker")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // A repeated request is idempotent and keeps the generation.
+    let repeated = queue.request_pause(queued.task().id()).await.unwrap();
+    assert_eq!(repeated.pause_generation(), 1);
+
+    // A resume preserves the available time and does not bump the generation.
+    let resumed = queue.resume(queued.task().id()).await.unwrap();
+    assert_eq!(resumed.status(), TaskStatus::Queued);
+    assert_eq!(resumed.pause_state(), TaskPauseState::Unpaused);
+    assert_eq!(resumed.pause_generation(), 1);
+    assert_eq!(resumed.available_at(), available_at);
+
+    let noop = queue.resume(queued.task().id()).await.unwrap();
+    assert_eq!(noop.pause_generation(), 1);
+    assert_eq!(noop.pause_state(), TaskPauseState::Unpaused);
+
+    // A running task enters pausing, keeps its lease and parks at the exact
+    // attempt.
+    let claim = queue.claim("worker").await.unwrap().unwrap();
+    let pausing = queue.request_pause(claim.task().id()).await.unwrap();
+    assert_eq!(pausing.status(), TaskStatus::Running);
+    assert_eq!(pausing.pause_state(), TaskPauseState::Pausing);
+    assert_eq!(pausing.pause_generation(), 2);
+    queue.renew(claim.attempt()).await.unwrap();
+
+    let parked = queue.park_paused(claim.attempt()).await.unwrap();
+    assert_eq!(parked.status(), TaskStatus::Queued);
+    assert_eq!(parked.pause_state(), TaskPauseState::Paused);
+    assert_eq!(parked.attempt_count(), 1);
+    assert_eq!(parked.paused_attempts(), 1);
+
+    let attempts = queue.attempts(claim.task().id(), 10).await.unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status(), AttemptStatus::Paused);
+    assert!(attempts[0].paused_at().is_some());
+    assert!(attempts[0].lease_expires_at().is_none());
+
+    // A parked task stays unclaimable until it is resumed.
+    assert!(queue.claim("worker").await.unwrap().is_none());
+    assert!(
+        queue
+            .claim_by_id(claim.task().id(), "worker")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Cancellation wins over a paused queued task and clears the actionable
+    // pause. A terminal task refuses pause and resume.
+    let cancelled = queue.request_cancel(claim.task().id()).await.unwrap();
+    assert_eq!(cancelled.status(), TaskStatus::Cancelled);
+    assert_eq!(cancelled.pause_state(), TaskPauseState::Unpaused);
+    assert!(matches!(
+        queue.request_pause(claim.task().id()).await,
+        Err(Error::InvalidTaskState { .. })
+    ));
+    assert!(matches!(
+        queue.resume(claim.task().id()).await,
+        Err(Error::InvalidTaskState { .. })
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn park_paused_and_stale_generation_after_resume() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+    let claim = queue.claim("worker").await.unwrap().unwrap();
+    let available_at = queue
+        .get(task.task().id())
+        .await
+        .unwrap()
+        .unwrap()
+        .available_at();
+
+    // The pause request advances the generation the attempt captured.
+    let pausing = queue.request_pause(task.task().id()).await.unwrap();
+    assert_eq!(pausing.pause_generation(), 1);
+    assert_eq!(claim.attempt().pause_generation(), 0);
+
+    // A resume clears the signal while the attempt still runs. A later park of
+    // that exact attempt seals it paused but leaves the task claimable, so a
+    // stale pause never stops the resumed task.
+    let resumed = queue.resume(task.task().id()).await.unwrap();
+    assert_eq!(resumed.pause_state(), TaskPauseState::Unpaused);
+    assert_eq!(resumed.pause_generation(), 1);
+
+    let parked = queue.park_paused(claim.attempt()).await.unwrap();
+    assert_eq!(parked.status(), TaskStatus::Queued);
+    assert_eq!(parked.pause_state(), TaskPauseState::Unpaused);
+    assert_eq!(parked.available_at(), available_at);
+    assert_eq!(parked.paused_attempts(), 1);
+
+    // The exact parked attempt is stale now: a second park loses the lease.
+    assert!(matches!(
+        queue.park_paused(claim.attempt()).await,
+        Err(Error::LeaseLost { .. })
+    ));
+
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status(), AttemptStatus::Paused);
+
+    // An unpaused continuation is claimable again and its attempt captures the
+    // retained generation.
+    let next = queue.claim("worker").await.unwrap().unwrap();
+    assert_eq!(next.attempt().attempt_number(), 2);
+    assert_eq!(next.attempt().pause_generation(), 1);
+    let paused = queue.request_pause(task.task().id()).await.unwrap();
+    assert_eq!(paused.pause_generation(), 2);
+    let parked = queue.park_paused(next.attempt()).await.unwrap();
+    assert_eq!(parked.status(), TaskStatus::Queued);
+    assert_eq!(parked.pause_state(), TaskPauseState::Paused);
+    assert_eq!(parked.paused_attempts(), 2);
+    assert_eq!(parked.attempt_count(), 2);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn transactional_pause_resume_are_atomic_and_refuse_foreign_instance() {
+    let pool = connect().await;
+    reset(&pool).await;
+    prepare_app_domain(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+
+    // The rollback discards the pause and the domain write together.
+    let mut transaction = pool.begin().await.unwrap();
+    let paused = queue
+        .request_pause_in(&mut transaction, task.task().id())
+        .await
+        .unwrap();
+    assert_eq!(paused.pause_state(), TaskPauseState::Paused);
+    write_app_domain(&mut transaction, "paused").await;
+    transaction.rollback().await.unwrap();
+
+    assert_eq!(app_domain_count(&pool).await, 0);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.pause_state(), TaskPauseState::Unpaused);
+    assert_eq!(stored.pause_generation(), 0);
+
+    // The commit makes the pause and the domain write durable together.
+    let mut transaction = pool.begin().await.unwrap();
+    let paused = queue
+        .request_pause_in(&mut transaction, task.task().id())
+        .await
+        .unwrap();
+    assert_eq!(paused.pause_state(), TaskPauseState::Paused);
+    write_app_domain(&mut transaction, "paused").await;
+    transaction.commit().await.unwrap();
+
+    assert_eq!(app_domain_count(&pool).await, 1);
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.pause_state(), TaskPauseState::Paused);
+
+    // The rollback of a resume keeps the pause.
+    let mut transaction = pool.begin().await.unwrap();
+    let resumed = queue
+        .resume_in(&mut transaction, task.task().id())
+        .await
+        .unwrap();
+    assert_eq!(resumed.pause_state(), TaskPauseState::Unpaused);
+    write_app_domain(&mut transaction, "resumed").await;
+    transaction.rollback().await.unwrap();
+
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.pause_state(), TaskPauseState::Paused);
+    assert_eq!(app_domain_count(&pool).await, 1);
+
+    // The commit makes the resume durable.
+    let mut transaction = pool.begin().await.unwrap();
+    queue
+        .resume_in(&mut transaction, task.task().id())
+        .await
+        .unwrap();
+    write_app_domain(&mut transaction, "resumed").await;
+    transaction.commit().await.unwrap();
+    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
+    assert_eq!(stored.pause_state(), TaskPauseState::Unpaused);
+    assert_eq!(app_domain_count(&pool).await, 2);
+
+    let claim = queue
+        .claim_by_id(task.task().id(), "worker")
+        .await
+        .unwrap()
+        .unwrap();
+    queue.request_pause(task.task().id()).await.unwrap();
+    let mut transaction = pool.begin().await.unwrap();
+    queue
+        .park_paused_in(&mut transaction, claim.attempt())
+        .await
+        .unwrap();
+    write_app_domain(&mut transaction, "parked rollback").await;
+    transaction.rollback().await.unwrap();
+    assert_eq!(app_domain_count(&pool).await, 2);
+    assert_eq!(
+        queue.get(task.task().id()).await.unwrap().unwrap().status(),
+        TaskStatus::Running
+    );
+    assert_eq!(
+        queue.attempts(task.task().id(), 10).await.unwrap()[0].status(),
+        AttemptStatus::Running
+    );
+
+    let mut transaction = pool.begin().await.unwrap();
+    queue
+        .park_paused_in(&mut transaction, claim.attempt())
+        .await
+        .unwrap();
+    write_app_domain(&mut transaction, "parked commit").await;
+    transaction.commit().await.unwrap();
+    assert_eq!(app_domain_count(&pool).await, 3);
+    assert_eq!(
+        queue
+            .get(task.task().id())
+            .await
+            .unwrap()
+            .unwrap()
+            .pause_state(),
+        TaskPauseState::Paused
+    );
+    assert_eq!(
+        queue.attempts(task.task().id(), 10).await.unwrap()[0].status(),
+        AttemptStatus::Paused
+    );
+
+    // A transaction of another database is refused before it writes.
+    let sibling = connect_to_sibling_database().await;
+    let mut transaction = sibling.begin().await.unwrap();
+    let error = queue
+        .park_paused_in(&mut transaction, claim.attempt())
+        .await
+        .expect_err("foreign database must be refused");
+    assert!(matches!(
+        error,
+        Error::InstanceMismatch { .. } | Error::SchemaMissing { .. }
+    ));
+    transaction.rollback().await.unwrap();
+
+    reset(&pool).await;
+    let mut transaction = pool.begin().await.unwrap();
+    let error = queue
+        .park_paused_in(&mut transaction, claim.attempt())
+        .await
+        .expect_err("foreign schema instance must be refused");
+    assert!(matches!(error, Error::InstanceMismatch { .. }));
+    transaction.rollback().await.unwrap();
+
+    let sibling = connect_to_sibling_database().await;
+    let mut transaction = sibling.begin().await.unwrap();
+    let error = queue
+        .request_pause_in(&mut transaction, task.task().id())
+        .await
+        .expect_err("a transaction of another database must be refused");
+    assert!(
+        matches!(
+            error,
+            Error::InstanceMismatch { .. } | Error::SchemaMissing { .. }
+        ),
+        "unexpected error: {error}"
+    );
+    transaction.rollback().await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn paused_expired_attempt_is_recovered_without_spending_budget() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue_with_short_lease(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+    let claim = queue.claim("worker").await.unwrap().unwrap();
+    queue.request_pause(task.task().id()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let restarted = open_queue_with_short_lease(&pool, NAMESPACE, QUEUE).await;
+    let recovered = restarted.recover_expired(10).await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].status(), TaskStatus::Queued);
+    assert_eq!(recovered[0].pause_state(), TaskPauseState::Paused);
+    assert_eq!(recovered[0].attempt_count(), 1);
+    assert_eq!(recovered[0].paused_attempts(), 1);
+    let attempts = restarted.attempts(task.task().id(), 10).await.unwrap();
+    assert_eq!(attempts[0].status(), AttemptStatus::Paused);
+    assert!(attempts[0].paused_at().is_some());
+    assert!(matches!(
+        restarted.park_paused(claim.attempt()).await,
+        Err(Error::LeaseLost { .. })
+    ));
+    assert!(restarted.claim("worker").await.unwrap().is_none());
+    restarted.resume(task.task().id()).await.unwrap();
+    assert!(restarted.claim("worker").await.unwrap().is_some());
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn retryable_failure_winning_pause_clears_pause_state() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let policy = RetryPolicy::new(2, Duration::from_millis(10), Duration::from_millis(50)).unwrap();
+    let task = queue
+        .enqueue(request().with_retry_policy(policy))
+        .await
+        .unwrap();
+    let claim = queue.claim("worker").await.unwrap().unwrap();
+    queue.request_pause(task.task().id()).await.unwrap();
+    let failed = queue
+        .fail(claim.attempt(), &Failure::retryable(None))
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), TaskStatus::Queued);
+    assert_eq!(failed.pause_state(), TaskPauseState::Unpaused);
+    assert_eq!(failed.pause_generation(), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn paused_attempts_do_not_consume_retry_budget() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let policy = RetryPolicy::new(2, Duration::from_millis(10), Duration::from_millis(50)).unwrap();
+    let task = queue
+        .enqueue(request().with_retry_policy(policy))
+        .await
+        .unwrap();
+
+    // The first attempt fails retryably and keeps the physical ordinal.
+    let claim = queue.claim("worker").await.unwrap().unwrap();
+    let failed = queue
+        .fail(claim.attempt(), &Failure::retryable(None))
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), TaskStatus::Queued);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // The second attempt parks at a pause checkpoint. It does not consume the
+    // failure budget, so the effective used attempts stay at one.
+    let claim = queue.claim("worker").await.unwrap().unwrap();
+    queue.request_pause(task.task().id()).await.unwrap();
+    let parked = queue.park_paused(claim.attempt()).await.unwrap();
+    assert_eq!(parked.attempt_count(), 2);
+    assert_eq!(parked.paused_attempts(), 1);
+    queue.resume(task.task().id()).await.unwrap();
+
+    // The third attempt fails permanently.
+    let claim = queue.claim("worker").await.unwrap().unwrap();
+    let failed = queue
+        .fail(
+            claim.attempt(),
+            &Failure::permanent(Some(json!({"reason": "boom"}))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), TaskStatus::Failed);
+    assert_eq!(failed.attempt_count(), 3);
+    assert_eq!(failed.paused_attempts(), 1);
+
+    // The budget is derived from the effective attempts, not the physical
+    // total: two used failure attempts plus one granted attempt.
+    let retried = queue.retry_failed(task.task().id(), 1).await.unwrap();
+    assert_eq!(retried.max_attempts(), 3);
+    assert_eq!(retried.status(), TaskStatus::Queued);
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(attempts[0].status(), AttemptStatus::Failed);
+    assert_eq!(attempts[1].status(), AttemptStatus::Paused);
+    assert_eq!(attempts[2].status(), AttemptStatus::Failed);
 }

@@ -5,6 +5,7 @@
 //! stops when the shutdown token of the caller is cancelled.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use uuid::Uuid;
 use crate::config::WorkerConfig;
 use crate::error::{Error, Result};
 use crate::handler::{HandlerError, Outcome, SharedHandler, TaskContext, TaskHandler};
-use crate::model::{Attempt, Failure, TaskId, TaskKind};
+use crate::model::{Attempt, Failure, TaskId, TaskKind, TaskPauseState};
 use crate::queue::Queue;
 use crate::wake::{WakeListener, Wakeup};
 
@@ -60,6 +61,7 @@ impl AttemptIdentity {
 struct ActiveAttempt {
     attempt: Attempt,
     cancel: CancellationToken,
+    pause: Arc<AtomicBool>,
     abort: Option<AbortHandle>,
     deadline: Instant,
     failures: u32,
@@ -83,6 +85,7 @@ impl Registry {
         task_id: TaskId,
         attempt: Attempt,
         cancel: CancellationToken,
+        pause: Arc<AtomicBool>,
         abort: Option<AbortHandle>,
         deadline: Instant,
     ) {
@@ -95,6 +98,7 @@ impl Registry {
             ActiveAttempt {
                 attempt,
                 cancel,
+                pause,
                 abort,
                 deadline,
                 failures: 0,
@@ -102,6 +106,23 @@ impl Registry {
                 terminal: false,
             },
         );
+    }
+
+    /// Sets the pause signal of an attempt.
+    ///
+    /// The signal belongs to the captured attempt; a callback of a replaced
+    /// attempt changes nothing. The handler reads the signal through its own
+    /// context, so one attempt never observes the pause of another task.
+    fn set_pause_signal(&self, task_id: &TaskId, identity: AttemptIdentity, requested: bool) {
+        let active = self
+            .active
+            .lock()
+            .expect("the registry of the worker is not poisoned");
+        if let Some(entry) = active.get(task_id)
+            && identity.matches(&entry.attempt)
+        {
+            entry.pause.store(requested, Ordering::Relaxed);
+        }
     }
 
     /// Takes the authority of an attempt out of the registry.
@@ -480,6 +501,7 @@ async fn claim_loop(context: Arc<RunContext>) -> Result<()> {
                     claim.task().kind().clone(),
                     claim.task().payload().clone(),
                     CancellationToken::new(),
+                    Arc::new(AtomicBool::new(false)),
                 );
                 let deadline = Instant::now() + context.config.lease_ttl
                     - authority_margin(context.config.lease_ttl);
@@ -524,6 +546,7 @@ async fn supervise(
     let attempt = task_context.attempt().clone();
     let identity = AttemptIdentity::of(&attempt);
     let cancel = task_context.cancellation_token();
+    let pause = task_context.pause_signal();
 
     let outcome = match handler {
         Some(handler) => {
@@ -533,6 +556,7 @@ async fn supervise(
                 task_id,
                 attempt.clone(),
                 cancel.clone(),
+                pause.clone(),
                 Some(abort),
                 deadline,
             );
@@ -556,9 +580,14 @@ async fn supervise(
             }
         }
         None => {
-            context
-                .registry
-                .register(task_id, attempt.clone(), cancel.clone(), None, deadline);
+            context.registry.register(
+                task_id,
+                attempt.clone(),
+                cancel.clone(),
+                pause,
+                None,
+                deadline,
+            );
             Outcome::failed(Failure::permanent(Some(failure_payload(
                 "no handler for the kind",
             ))))
@@ -585,6 +614,17 @@ async fn supervise(
     let result = match outcome {
         Outcome::Completed(result) => context.queue.complete(&attempt, result).await.map(|_| ()),
         Outcome::Failed(failure) => context.queue.fail(&attempt, &failure).await.map(|_| ()),
+        Outcome::Paused => context
+            .queue
+            .park_paused(&attempt)
+            .await
+            .map(|_| ())
+            // A park that lost the lease changes nothing; the newer attempt is
+            // authoritative.
+            .or_else(|error| match error {
+                Error::LeaseLost { .. } | Error::PauseGenerationMismatch { .. } => Ok(()),
+                other => Err(other),
+            }),
         Outcome::ExternallyCompleted => {
             match context.queue.attempt_is_sealed(&attempt).await {
                 // The handler committed the terminal of this exact attempt.
@@ -759,10 +799,18 @@ async fn cancellation_loop(context: Arc<RunContext>) {
         for (task_id, attempt, _) in context.registry.active_attempts() {
             match context.queue.get(task_id).await {
                 Ok(Some(task)) => {
+                    let identity = AttemptIdentity::of(&attempt);
                     if task.status() == crate::model::TaskStatus::CancelRequested {
-                        let identity = AttemptIdentity::of(&attempt);
                         context.registry.cancel(&task_id, identity);
                     }
+                    // The pause signal is scoped to this attempt and the
+                    // generation it captured. A resume clears the signal, so a
+                    // stale pause never stops a resumed task.
+                    let pause_requested = task.pause_state() != TaskPauseState::Unpaused
+                        && task.pause_generation() > attempt.pause_generation();
+                    context
+                        .registry
+                        .set_pause_signal(&task_id, identity, pause_requested);
                 }
                 Ok(None) => {}
                 Err(_) => {}
@@ -821,6 +869,8 @@ mod tests {
             error: None,
             progress: None,
             progress_updated_at: None,
+            pause_generation: 0,
+            paused_at: None,
         }
     }
 
@@ -837,7 +887,15 @@ mod tests {
         // The first attempt runs and is registered.
         let first = attempt(task_id, 1);
         let first_identity = AttemptIdentity::of(&first);
-        registry.register(task_id, first.clone(), token.clone(), None, Instant::now());
+        let first_pause = Arc::new(AtomicBool::new(false));
+        registry.register(
+            task_id,
+            first.clone(),
+            token.clone(),
+            first_pause.clone(),
+            None,
+            Instant::now(),
+        );
         assert!(registry.start_renewal(&task_id, first_identity));
 
         // The supervisor of the first attempt takes its authority out, the
@@ -845,10 +903,12 @@ mod tests {
         assert!(registry.take(&task_id, first_identity).is_some());
         let second = attempt(task_id, 2);
         let second_identity = AttemptIdentity::of(&second);
+        let second_pause = Arc::new(AtomicBool::new(false));
         registry.register(
             task_id,
             second.clone(),
             token.clone(),
+            second_pause.clone(),
             Some(handler.abort_handle()),
             Instant::now(),
         );
@@ -856,6 +916,16 @@ mod tests {
         // The second attempt starts its own renewal and counts a failure.
         assert!(registry.start_renewal(&task_id, second_identity));
         assert_eq!(registry.count_failure(&task_id, second_identity), 1);
+
+        // The pause signal of the first attempt is not the signal of the
+        // second one.
+        registry.set_pause_signal(&task_id, first_identity, true);
+        assert!(!first_pause.load(Ordering::Relaxed));
+        assert!(!second_pause.load(Ordering::Relaxed));
+        registry.set_pause_signal(&task_id, second_identity, true);
+        assert!(second_pause.load(Ordering::Relaxed));
+        registry.set_pause_signal(&task_id, second_identity, false);
+        assert!(!second_pause.load(Ordering::Relaxed));
 
         // The callbacks of the first attempt change nothing of the second one.
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -920,11 +990,25 @@ mod tests {
 
         let first = attempt(task_id, 1);
         let first_identity = AttemptIdentity::of(&first);
-        registry.register(task_id, first.clone(), token.clone(), None, Instant::now());
+        registry.register(
+            task_id,
+            first.clone(),
+            token.clone(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Instant::now(),
+        );
 
         let second = attempt(task_id, 2);
         let second_identity = AttemptIdentity::of(&second);
-        registry.register(task_id, second.clone(), token.clone(), None, Instant::now());
+        registry.register(
+            task_id,
+            second.clone(),
+            token.clone(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Instant::now(),
+        );
 
         // The failure of the first attempt is not counted for the second one.
         assert_eq!(registry.count_failure(&task_id, first_identity), 0);

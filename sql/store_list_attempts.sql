@@ -10,7 +10,9 @@ SELECT
     a.finished_at,
     a.error,
     a.progress,
-    a.progress_updated_at
+    a.progress_updated_at,
+    a.pause_generation,
+    a.paused_at
 FROM cloudiful_tasks.attempts AS a
 INNER JOIN cloudiful_tasks.tasks AS t ON t.id = a.task_id
 WHERE t.namespace = $1

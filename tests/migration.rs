@@ -6,13 +6,17 @@
 
 mod common;
 
-use cloudiful_tasks::{Error, check_schema, migrate};
+use cloudiful_tasks::{
+    AttemptStatus, EnqueueRequest, Error, TaskKind, TaskPauseState, TaskStatus, check_schema,
+    migrate,
+};
+use serde_json::json;
 use sqlx::PgPool;
 use sqlx::Row;
 
 use common::{
     advisory_lock_count, cleanup, connect, create_empty_schema, create_foreign_schema,
-    create_ledger_only_schema, create_public_sentinels, relation_names, schema_exists,
+    create_ledger_only_schema, create_public_sentinels, open_queue, relation_names, schema_exists,
 };
 
 const BUMP_PROTOCOL_VERSION_SQL: &str =
@@ -35,8 +39,8 @@ async fn migrate_creates_only_the_owned_schema() {
 
     let outcome = migrate(&pool).await.expect("the migration must succeed");
     assert!(outcome.applied());
-    assert_eq!(outcome.protocol_version(), 2);
-    assert_eq!(outcome.applied_versions().len(), 2);
+    assert_eq!(outcome.protocol_version(), 3);
+    assert_eq!(outcome.applied_versions().len(), 3);
     assert!(!outcome.instance_uuid().is_nil());
 
     let owned = relation_names(&pool, "cloudiful_tasks").await;
@@ -63,7 +67,18 @@ async fn migrate_creates_only_the_owned_schema() {
         .await
         .expect("the schema must be compatible");
     assert_eq!(info.instance_uuid(), outcome.instance_uuid());
-    assert_eq!(info.protocol_version(), 2);
+    assert_eq!(info.protocol_version(), 3);
+
+    let pause_columns = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM information_schema.columns \
+         WHERE table_schema = 'cloudiful_tasks' \
+           AND ((table_name = 'tasks' AND column_name IN ('pause_state', 'pause_generation', 'paused_attempts')) \
+             OR (table_name = 'attempts' AND column_name IN ('pause_generation', 'paused_at')))",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the pause columns must be readable");
+    assert_eq!(pause_columns, 5, "the pause columns must be present");
 
     assert_eq!(
         advisory_lock_count(&pool).await,
@@ -90,7 +105,7 @@ async fn concurrent_migrations_are_idempotent() {
             .fetch_all(&pool)
             .await
             .expect("the migration ledger must be readable");
-    assert_eq!(versions.len(), 2);
+    assert_eq!(versions.len(), 3);
     assert_eq!(versions[0].migration_version, first.applied_versions()[0]);
 }
 
@@ -235,7 +250,7 @@ async fn a_newer_protocol_version_is_refused() {
             error,
             Error::UnsupportedSchemaVersion {
                 found: 999,
-                supported: 2
+                supported: 3
             }
         ),
         "unexpected error: {error}"
@@ -249,7 +264,7 @@ async fn a_newer_protocol_version_is_refused() {
             error,
             Error::UnsupportedSchemaVersion {
                 found: 999,
-                supported: 2
+                supported: 3
             }
         ),
         "unexpected error: {error}"
@@ -334,7 +349,51 @@ async fn the_migration_runs_on_an_empty_database() {
 
     let outcome = migrate(&pool).await.expect("the migration must succeed");
     assert!(outcome.applied());
-    assert_eq!(outcome.applied_versions().len(), 2);
+    assert_eq!(outcome.applied_versions().len(), 3);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_populated_version_two_schema_is_upgraded() {
+    let pool = connect().await;
+    cleanup(&pool).await;
+    let mut old = sqlx::migrate!("./migrations");
+    old.migrations = std::borrow::Cow::Owned(old.migrations.iter().take(2).cloned().collect());
+    old.run(&pool).await.unwrap();
+    let id = uuid::Uuid::new_v4();
+    let attempt_id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO cloudiful_tasks.tasks (id, namespace, queue, kind, payload, status, request_spec, attempt_count, max_attempts) VALUES ($1, 'ns', 'q', 'demo', $2, 'running', $2, 1, 3)")
+        .bind(id).bind(json!({"stage": "saved"})).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cloudiful_tasks.attempts (id, task_id, attempt_number, worker_id, fencing_token, status, lease_expires_at) VALUES ($1, $2, 1, 'worker', $3, 'running', now() + interval '5 minutes')")
+        .bind(attempt_id).bind(id).bind(uuid::Uuid::new_v4()).execute(&pool).await.unwrap();
+    sqlx::query_file!("sql/store_queue_policy_set.sql", "ns", "q", Some(2_i32))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let upgraded = migrate(&pool).await.unwrap();
+    assert_eq!(upgraded.protocol_version(), 3);
+    assert!(upgraded.applied());
+    let queue = open_queue(&pool, "ns", "q").await;
+    assert_eq!(
+        queue.policy().await.unwrap().max_concurrent_attempts,
+        Some(2)
+    );
+    let task = queue
+        .get(cloudiful_tasks::TaskId::from_uuid(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.payload(), &json!({"stage": "saved"}));
+    assert_eq!(task.status(), TaskStatus::Running);
+    assert_eq!(task.pause_state(), TaskPauseState::Unpaused);
+    assert_eq!(task.pause_generation(), 0);
+    assert_eq!(task.paused_attempts(), 0);
+    let attempts = queue.attempts(task.id(), 10).await.unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].id().as_uuid(), attempt_id);
+    assert_eq!(attempts[0].status(), AttemptStatus::Running);
+    assert_eq!(attempts[0].pause_generation(), 0);
+    assert!(attempts[0].paused_at().is_none());
 }
 
 #[tokio::test]
@@ -345,24 +404,60 @@ async fn an_owned_version_one_schema_is_upgraded() {
     let first = migrate(&pool)
         .await
         .expect("the first migration must succeed");
-    let latest = *first
-        .applied_versions()
-        .last()
-        .expect("the migration ledger must not be empty");
+    let applied = first.applied_versions().to_vec();
+    assert_eq!(applied.len(), 3);
 
-    sqlx::query("DROP TABLE cloudiful_tasks.queue_policies")
+    // Seed one queued task and one claimed attempt before the downgrade. The
+    // rows must survive the upgrade with the additive defaults.
+    let queue = open_queue(&pool, "ns", "q").await;
+    let queued = queue
+        .enqueue(EnqueueRequest::new(
+            TaskKind::new("demo").unwrap(),
+            json!({"stage": "queued"}),
+        ))
+        .await
+        .unwrap();
+    let running = queue
+        .enqueue(EnqueueRequest::new(
+            TaskKind::new("demo").unwrap(),
+            json!({"stage": "running"}),
+        ))
+        .await
+        .unwrap();
+    let claim = queue
+        .claim_by_id(running.task().id(), "worker")
+        .await
+        .unwrap()
+        .expect("the running task must be claimed");
+
+    // Simulate an owned protocol version 1 schema: remove the version 2 and
+    // version 3 objects, restore the version 1 attempt status check and trim
+    // the ledger.
+    let downgrade = format!(
+        "ALTER TABLE cloudiful_tasks.attempts \
+             DROP CONSTRAINT attempts_paused_at_check, \
+             DROP CONSTRAINT attempts_pause_generation_check, \
+             DROP CONSTRAINT attempts_status_check, \
+             ADD CONSTRAINT attempts_status_check \
+                 CHECK (status IN ('running', 'succeeded', 'failed', 'cancelled', 'interrupted')), \
+             DROP COLUMN paused_at, \
+             DROP COLUMN pause_generation; \
+         ALTER TABLE cloudiful_tasks.tasks \
+             DROP CONSTRAINT tasks_paused_attempts_check, \
+             DROP CONSTRAINT tasks_pause_generation_check, \
+             DROP CONSTRAINT tasks_pause_state_check, \
+             DROP COLUMN paused_attempts, \
+             DROP COLUMN pause_generation, \
+             DROP COLUMN pause_state; \
+         DROP TABLE cloudiful_tasks.queue_policies; \
+         DELETE FROM cloudiful_tasks._sqlx_migrations WHERE version > {}; \
+         UPDATE cloudiful_tasks.schema_ownership SET protocol_version = 1 WHERE singleton;",
+        applied[0]
+    );
+    sqlx::raw_sql(sqlx::AssertSqlSafe(downgrade))
         .execute(&pool)
         .await
-        .expect("the policy table fixture must be removable");
-    sqlx::query("DELETE FROM cloudiful_tasks._sqlx_migrations WHERE version = $1")
-        .bind(latest)
-        .execute(&pool)
-        .await
-        .expect("the latest ledger row must be removable");
-    sqlx::query("UPDATE cloudiful_tasks.schema_ownership SET protocol_version = 1 WHERE singleton")
-        .execute(&pool)
-        .await
-        .expect("the ownership marker must be writable");
+        .expect("the version one fixture must be restorable");
 
     let error = check_schema(&pool)
         .await
@@ -372,7 +467,7 @@ async fn an_owned_version_one_schema_is_upgraded() {
             error,
             Error::OutdatedSchemaVersion {
                 found: 1,
-                supported: 2
+                supported: 3
             }
         ),
         "unexpected error: {error}"
@@ -382,8 +477,8 @@ async fn an_owned_version_one_schema_is_upgraded() {
         .await
         .expect("an owned older schema must be upgraded");
     assert!(upgraded.applied());
-    assert_eq!(upgraded.protocol_version(), 2);
-    assert_eq!(upgraded.applied_versions(), first.applied_versions());
+    assert_eq!(upgraded.protocol_version(), 3);
+    assert_eq!(upgraded.applied_versions(), applied);
     assert!(
         relation_names(&pool, "cloudiful_tasks")
             .await
@@ -395,6 +490,31 @@ async fn an_owned_version_one_schema_is_upgraded() {
             .await
             .expect("the upgraded schema must be readable")
             .protocol_version(),
-        2
+        3
     );
+
+    // The seeded rows survive with the additive pause defaults.
+    let queued = queue
+        .get(queued.task().id())
+        .await
+        .unwrap()
+        .expect("the queued task must survive");
+    assert_eq!(queued.status(), TaskStatus::Queued);
+    assert_eq!(queued.pause_state(), TaskPauseState::Unpaused);
+    assert_eq!(queued.pause_generation(), 0);
+    assert_eq!(queued.paused_attempts(), 0);
+
+    let running = queue
+        .get(running.task().id())
+        .await
+        .unwrap()
+        .expect("the running task must survive");
+    assert_eq!(running.status(), TaskStatus::Running);
+    assert_eq!(running.pause_state(), TaskPauseState::Unpaused);
+
+    let attempts = queue.attempts(claim.task().id(), 10).await.unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status(), AttemptStatus::Running);
+    assert_eq!(attempts[0].pause_generation(), 0);
+    assert!(attempts[0].paused_at().is_none());
 }

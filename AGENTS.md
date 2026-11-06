@@ -29,10 +29,15 @@ cargo test --locked --offline --test worker -- --include-ignored --test-threads=
 
 The test URL names `cloudiful_tasks_test`; the explicit sibling URL names
 `cloudiful_tasks_dev`. Both must use the fixed `unraid.cloud1ful.com:5432`
-endpoint. A live test fails when an environment value is missing or malformed,
-when the effective `PgConnectOptions` carries a socket or connection option
-override, or when the database does not report the configured role, a TCP
-server address, server port `5432` and the exact dedicated database comment
+endpoint. An equivalent dedicated non-production fixture is selected without
+changing the shipped defaults through the optional expectation overrides
+`CLOUDIFUL_TASKS_TEST_EXPECTED_HOST`, `..._PORT`, `..._SERVER_PORT`,
+`..._DATABASE` and `..._SIBLING_DATABASE`; the two URL variables stay
+independent and the exact database comments stay mandatory. A live test fails
+when an environment value is missing or malformed, when the effective
+`PgConnectOptions` carries a socket or connection option override, or when the
+database does not report the configured role, a TCP server address, the
+expected server port and the exact dedicated database comment
 (`cloudiful-tasks test fixture v1; non-production; dedicated` for the test
 database, `cloudiful-tasks development fixture v1; non-production; dedicated`
 for the sibling). The guard runs before any reset or destructive statement.
@@ -61,7 +66,8 @@ database and never derive one fixture URL from the other.
 Every mutating queue operation has a variant that takes
 `&mut sqlx::Transaction<'_, sqlx::Postgres>`: `enqueue_in`, `claim_in`,
 `renew_in`, `report_progress_in`, `complete_in`, `fail_in`,
-`request_cancel_in`, `retry_failed_in` and `recover_expired_in`.
+`request_cancel_in`, `request_pause_in`, `resume_in`, `park_paused_in`,
+`retry_failed_in` and `recover_expired_in`.
 
 - A variant verifies the schema instance of the queue before it writes and
   refuses a transaction of another database or of another schema instance.
@@ -73,6 +79,34 @@ Every mutating queue operation has a variant that takes
   the two cannot diverge in result, error or bounds.
 - The result of a variant is valid before the commit of the caller but not
   durable until it.
+
+## Cooperative pause
+
+`TaskPauseState { Unpaused, Pausing, Paused }` is an independent task field; it
+is not a `TaskStatus` variant. A queued task can be paused and stays nonterminal
+and unclaimable. A running task enters `Pausing` until its attempt parks.
+
+- `request_pause` locks the queue advisory lock and updates the task only. A
+  queued task is paused at once; a running task keeps its lease and heartbeat.
+  A repeated request keeps the generation, a terminal task is refused.
+- `park_paused` locks the task and then the attempt, like complete and fail.
+  It requires the exact running attempt, fence and an unexpired lease, seals
+  the attempt `paused` with `paused_at`, and queues the task. A park that races
+  a resume leaves the task unpaused and claimable; a cancellation that was
+  requested before the park wins.
+- `resume` clears `pausing`/`paused` without revoking the lease and without
+  changing `available_at` or the attempt history. It does not advance the
+  generation. A terminal task is refused.
+- An attempt captures the task pause generation at claim. `TaskContext::
+  pause_requested` is true only for its own task id while the state is pausing
+  or paused and the task generation exceeds the captured one, so a resume
+  clears the signal and one task's pause never stops another. The worker polls
+  the state with the existing cancellation poll interval.
+- `attempt_count` stays the monotonic physical total. `paused_attempts` counts
+  only parked checkpoints, so every claim, failure, recovery and retry budget
+  uses `attempt_count - paused_attempts`. An expired attempt of a pausing or
+  paused task is sealed `paused` (unless a cancellation was requested) and
+  never consumes the failure budget.
 
 ## Queue policies and external terminals
 
@@ -87,8 +121,8 @@ keeps an expired attempt counted until it seals it.
 
 `Outcome::ExternallyCompleted` means the handler already committed the terminal
 of the captured attempt. The worker verifies the namespace, queue, task,
-attempt, fencing token and a sealed `succeeded`, `failed` or `cancelled` status
-with `sql/store_attempt_sealed.sql`. Only a verified seal skips the worker
+attempt, fencing token and a sealed `succeeded`, `failed`, `cancelled` or
+`paused` status with `sql/store_attempt_sealed.sql`. Only a verified seal skips the worker
 terminal; an unsealed signal uses the normal failure write and a lost lease
 never touches a newer attempt.
 

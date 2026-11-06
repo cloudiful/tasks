@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "WITH guard AS (\n    SELECT id, status\n    FROM cloudiful_tasks.tasks\n    WHERE id = $3 AND namespace = $1 AND queue = $2\n    FOR UPDATE\n),\nsealed AS (\n    UPDATE cloudiful_tasks.attempts AS a\n    SET status = CASE WHEN guard.status = 'cancel_requested' THEN 'cancelled' ELSE 'failed' END,\n        finished_at = clock_timestamp(),\n        lease_expires_at = NULL,\n        error = $6::jsonb\n    FROM guard\n    WHERE a.id = $4\n      AND a.task_id = guard.id\n      AND a.fencing_token = $5\n      AND a.status = 'running'\n      AND a.lease_expires_at > clock_timestamp()\n    RETURNING a.task_id\n)\nUPDATE cloudiful_tasks.tasks AS t\nSET status = CASE\n        WHEN t.status = 'cancel_requested' THEN 'cancelled'\n        WHEN $7::boolean AND t.attempt_count < t.max_attempts THEN 'queued'\n        ELSE 'failed'\n    END,\n    available_at = CASE\n        WHEN t.status = 'cancel_requested' THEN t.available_at\n        WHEN $7::boolean AND t.attempt_count < t.max_attempts\n            THEN clock_timestamp() + ($8::bigint * interval '1 microsecond')\n        ELSE t.available_at\n    END,\n    result = NULL,\n    finished_at = CASE\n        WHEN t.status = 'cancel_requested' THEN clock_timestamp()\n        WHEN $7::boolean AND t.attempt_count < t.max_attempts THEN NULL\n        ELSE clock_timestamp()\n    END,\n    terminal_reason = CASE\n        WHEN t.status = 'cancel_requested' THEN 'cancelled'\n        WHEN $7::boolean AND t.attempt_count < t.max_attempts THEN NULL\n        ELSE 'failed'\n    END,\n    updated_at = clock_timestamp()\nFROM sealed\nWHERE t.id = sealed.task_id\nRETURNING t.*\n",
+  "query": "-- Resumes a pausing or paused task.\n--\n-- The available time and the attempt history are preserved, so a resume never\n-- bypasses the retry backoff. The pause generation is retained as history; a\n-- resume of an already unpaused task changes nothing.\nUPDATE cloudiful_tasks.tasks\nSET pause_state = 'unpaused',\n    updated_at = clock_timestamp()\nWHERE id = $3\n  AND namespace = $1\n  AND queue = $2\n  AND status IN ('queued', 'running')\n  AND pause_state IN ('pausing', 'paused')\nRETURNING *\n",
   "describe": {
     "columns": [
       {
@@ -222,18 +222,46 @@
             "name": "terminal_reason"
           }
         }
+      },
+      {
+        "ordinal": 20,
+        "name": "pause_state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "pause_state"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "pause_generation",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "pause_generation"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "paused_attempts",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "paused_attempts"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
         "Text",
         "Text",
-        "Uuid",
-        "Uuid",
-        "Uuid",
-        "Jsonb",
-        "Bool",
-        "Int8"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -256,8 +284,11 @@
       false,
       true,
       true,
-      true
+      true,
+      false,
+      false,
+      false
     ]
   },
-  "hash": "8cffd5cd927a3d06b09f687821b9158113971474bdd8f01d2a42aa61d64c965a"
+  "hash": "39858eb00edf6e6d267a5543e5c3e5bda3cf18daef402bd801588c68fc99a928"
 }

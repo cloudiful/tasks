@@ -22,6 +22,7 @@ SET status = CASE WHEN t.status = 'cancel_requested' THEN 'cancelled' ELSE 'succ
     result = CASE WHEN t.status = 'cancel_requested' THEN NULL ELSE $6::jsonb END,
     finished_at = clock_timestamp(),
     updated_at = clock_timestamp(),
+    pause_state = 'unpaused',
     terminal_reason = CASE WHEN t.status = 'cancel_requested' THEN 'cancelled' ELSE t.terminal_reason END
 FROM sealed
 WHERE t.id = sealed.task_id

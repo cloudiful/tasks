@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::migrate::{OwnershipRow, SCHEMA_NAME};
 use crate::model::{
     Attempt, AttemptId, AttemptStatus, Failure, FencingToken, ListCursor, Namespace,
-    ProgressUpdate, QueueName, Task, TaskId, TaskKind, TaskStatus,
+    ProgressUpdate, QueueName, Task, TaskId, TaskKind, TaskPauseState, TaskStatus,
 };
 use crate::queue::QueuePolicy;
 
@@ -42,6 +42,9 @@ pub(crate) struct TaskRow {
     cancel_requested_at: Option<DateTime<Utc>>,
     finished_at: Option<DateTime<Utc>>,
     terminal_reason: Option<String>,
+    pause_state: String,
+    pause_generation: i64,
+    paused_attempts: i32,
 }
 
 #[derive(sqlx::FromRow)]
@@ -69,6 +72,8 @@ pub(crate) struct AttemptRow {
     error: Option<Value>,
     progress: Option<Value>,
     progress_updated_at: Option<DateTime<Utc>>,
+    pause_generation: i64,
+    paused_at: Option<DateTime<Utc>>,
 }
 
 /// Checks that a connection belongs to the schema instance of the queue.
@@ -619,6 +624,103 @@ pub(crate) async fn retry_failed_task(
     }
 }
 
+/// Requests the cooperative pause of one task.
+pub(crate) async fn pause_task(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+    task_id: TaskId,
+) -> Result<Task> {
+    let row = sqlx::query_file_as!(
+        TaskRow,
+        "sql/store_pause_task.sql",
+        namespace.as_str(),
+        queue.as_str(),
+        task_id.as_uuid(),
+    )
+    .fetch_optional(&mut *connection)
+    .await?;
+    if let Some(row) = row {
+        return task_from_row(row);
+    }
+    match task_by_id(connection, namespace, queue, task_id).await? {
+        Some(task) if matches!(task.status(), TaskStatus::Queued | TaskStatus::Running) => Ok(task),
+        Some(task) => Err(Error::InvalidTaskState {
+            task_id: task_id.as_uuid(),
+            status: task.status().to_string(),
+            action: "paused",
+        }),
+        None => Err(Error::NotFound),
+    }
+}
+
+/// Resumes a pausing or paused task.
+pub(crate) async fn resume_task(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+    task_id: TaskId,
+) -> Result<Task> {
+    let row = sqlx::query_file_as!(
+        TaskRow,
+        "sql/store_resume_task.sql",
+        namespace.as_str(),
+        queue.as_str(),
+        task_id.as_uuid(),
+    )
+    .fetch_optional(&mut *connection)
+    .await?;
+    if let Some(row) = row {
+        return task_from_row(row);
+    }
+    match task_by_id(connection, namespace, queue, task_id).await? {
+        Some(task) if matches!(task.status(), TaskStatus::Queued | TaskStatus::Running) => Ok(task),
+        Some(task) => Err(Error::InvalidTaskState {
+            task_id: task_id.as_uuid(),
+            status: task.status().to_string(),
+            action: "resumed",
+        }),
+        None => Err(Error::NotFound),
+    }
+}
+
+/// Seals the exact attempt of a task as a parked pause checkpoint.
+pub(crate) async fn park_paused(
+    connection: &mut PgConnection,
+    namespace: &Namespace,
+    queue: &QueueName,
+    attempt: &Attempt,
+) -> Result<Task> {
+    lock_task_attempt(connection, namespace, queue, attempt).await?;
+    let task = task_by_id(connection, namespace, queue, attempt.task_id())
+        .await?
+        .ok_or(Error::NotFound)?;
+    if attempt.pause_generation() > task.pause_generation() {
+        return Err(Error::PauseGenerationMismatch {
+            task_id: attempt.task_id().as_uuid(),
+            expected: task.pause_generation(),
+            found: attempt.pause_generation(),
+        });
+    }
+    let row = sqlx::query_file_as!(
+        TaskRow,
+        "sql/store_park_paused.sql",
+        namespace.as_str(),
+        queue.as_str(),
+        attempt.task_id().as_uuid(),
+        attempt.id().as_uuid(),
+        attempt.fencing_token().as_uuid(),
+    )
+    .fetch_optional(&mut *connection)
+    .await?;
+    match row {
+        Some(row) => task_from_row(row),
+        None => Err(Error::LeaseLost {
+            task_id: attempt.task_id().as_uuid(),
+        }),
+    }
+}
+
 /// Seals the attempts whose lease expired and schedules their tasks again.
 pub(crate) async fn recover_expired_tasks(
     connection: &mut PgConnection,
@@ -659,6 +761,9 @@ fn task_from_row(row: TaskRow) -> Result<Task> {
         cancel_requested_at: row.cancel_requested_at,
         finished_at: row.finished_at,
         terminal_reason: row.terminal_reason,
+        pause_state: TaskPauseState::from_db(&row.pause_state)?,
+        pause_generation: row.pause_generation,
+        paused_attempts: u32::try_from(row.paused_attempts).unwrap_or_default(),
     })
 }
 
@@ -676,6 +781,8 @@ fn attempt_from_row(row: AttemptRow) -> Result<Attempt> {
         error: row.error,
         progress: row.progress.map(progress_from_json).transpose()?,
         progress_updated_at: row.progress_updated_at,
+        pause_generation: row.pause_generation,
+        paused_at: row.paused_at,
     })
 }
 

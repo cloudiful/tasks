@@ -19,7 +19,7 @@ pub const SCHEMA_NAME: &str = "cloudiful_tasks";
 pub const LIBRARY_ID: &str = "cloudiful-tasks";
 
 /// Schema protocol version implemented by this build.
-pub const PROTOCOL_VERSION: i32 = 2;
+pub const PROTOCOL_VERSION: i32 = 3;
 
 /// Table holding the ownership marker of the schema.
 const OWNERSHIP_TABLE: &str = "schema_ownership";

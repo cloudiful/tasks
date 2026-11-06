@@ -222,6 +222,39 @@
             "name": "terminal_reason"
           }
         }
+      },
+      {
+        "ordinal": 20,
+        "name": "pause_state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "pause_state"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "pause_generation",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "pause_generation"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "paused_attempts",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "paused_attempts"
+          }
+        }
       }
     ],
     "parameters": {
@@ -253,7 +286,10 @@
       false,
       true,
       true,
-      true
+      true,
+      false,
+      false,
+      false
     ]
   },
   "hash": "6b2ef13dd6a197fa171f99051ae42c1303b67ac7cc458c083b9759a10ad5059f"

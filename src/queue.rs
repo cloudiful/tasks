@@ -486,6 +486,92 @@ impl Queue {
         self.cancel_on(transaction, task_id).await
     }
 
+    /// Requests the cooperative pause of one task.
+    ///
+    /// A queued task is paused at once without an attempt; a running task
+    /// enters the pausing state and keeps its lease until its handler parks at
+    /// a checkpoint. A task that is already pausing or paused keeps its
+    /// generation. A terminal task is refused.
+    pub async fn request_pause(&self, task_id: TaskId) -> Result<Task> {
+        let mut connection = self.pool.acquire().await?;
+        self.pause_on(&mut connection, task_id).await
+    }
+
+    /// Requests the cooperative pause of a task in the transaction of the
+    /// caller.
+    ///
+    /// The pause and the business write of the caller are only durable when
+    /// the caller commits the transaction. The transaction must belong to the
+    /// schema instance of this queue, otherwise the call is refused.
+    pub async fn request_pause_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        task_id: TaskId,
+    ) -> Result<Task> {
+        self.verify_instance(transaction).await?;
+        self.pause_on(transaction, task_id).await
+    }
+
+    /// Resumes a pausing or paused task.
+    ///
+    /// A running task keeps its lease and stops reporting a pause; a parked
+    /// task is queued again with its available time and attempt history
+    /// unchanged. A resume of an unpaused task is an idempotent no-op.
+    pub async fn resume(&self, task_id: TaskId) -> Result<Task> {
+        let mut connection = self.pool.acquire().await?;
+        self.resume_on(&mut connection, task_id).await
+    }
+
+    /// Resumes a task in the transaction of the caller.
+    ///
+    /// The resume and the business write of the caller are only durable when
+    /// the caller commits the transaction. The transaction must belong to the
+    /// schema instance of this queue, otherwise the call is refused.
+    pub async fn resume_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        task_id: TaskId,
+    ) -> Result<Task> {
+        self.verify_instance(transaction).await?;
+        self.resume_on(transaction, task_id).await
+    }
+
+    /// Seals the exact attempt of a task as a parked pause checkpoint.
+    ///
+    /// The attempt must still hold its unexpired lease and fencing token. A
+    /// parked attempt is queued again and does not consume the failure budget.
+    /// A park that races a resume leaves the task claimable, a cancellation
+    /// that was requested before the park wins.
+    pub async fn park_paused(&self, attempt: &Attempt) -> Result<Task> {
+        let mut transaction = self.pool.begin().await?;
+        let outcome = self.park_on(&mut transaction, attempt).await;
+        match outcome {
+            Ok(task) => {
+                transaction.commit().await?;
+                Ok(task)
+            }
+            Err(error) => {
+                transaction.rollback().await.ok();
+                Err(error)
+            }
+        }
+    }
+
+    /// Seals a parked pause checkpoint in the transaction of the caller.
+    ///
+    /// The park and the business write of the caller are only durable when the
+    /// caller commits the transaction. A refused park must not be ignored,
+    /// otherwise the caller commits business side effects of an attempt that
+    /// lost its lease.
+    pub async fn park_paused_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        attempt: &Attempt,
+    ) -> Result<Task> {
+        self.verify_instance(transaction).await?;
+        self.park_on(transaction, attempt).await
+    }
+
     /// Schedules a failed task again with a larger budget.
     ///
     /// The new budget of the task is the number of the attempts that ran plus
@@ -617,6 +703,20 @@ impl Queue {
 
     async fn cancel_on(&self, connection: &mut PgConnection, task_id: TaskId) -> Result<Task> {
         store::cancel_task(connection, &self.namespace, &self.queue, task_id).await
+    }
+
+    async fn pause_on(&self, connection: &mut PgConnection, task_id: TaskId) -> Result<Task> {
+        store::lock_queue(connection, &self.namespace, &self.queue).await?;
+        store::pause_task(connection, &self.namespace, &self.queue, task_id).await
+    }
+
+    async fn resume_on(&self, connection: &mut PgConnection, task_id: TaskId) -> Result<Task> {
+        store::lock_queue(connection, &self.namespace, &self.queue).await?;
+        store::resume_task(connection, &self.namespace, &self.queue, task_id).await
+    }
+
+    async fn park_on(&self, connection: &mut PgConnection, attempt: &Attempt) -> Result<Task> {
+        store::park_paused(connection, &self.namespace, &self.queue, attempt).await
     }
 
     async fn retry_failed_on(
