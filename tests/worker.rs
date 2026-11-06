@@ -12,7 +12,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cloudiful_tasks::{
     AttemptStatus, CancellationToken, EnqueueRequest, Error, Failure, HandlerError, Outcome,
-    ProgressUpdate, Queue, TaskContext, TaskHandler, TaskKind, TaskStatus, Worker, WorkerConfig,
+    ProgressUpdate, Queue, TaskContext, TaskHandler, TaskKind, TaskPauseState, TaskStatus, Worker,
+    WorkerConfig,
 };
 use serde_json::json;
 use tokio::sync::Notify;
@@ -294,6 +295,27 @@ impl TaskHandler for ExternalCompletion {
             .complete(context.attempt(), Some(self.result.clone()))
             .await
             .map_err(|error| HandlerError::new(error.to_string()))?;
+        Ok(Outcome::ExternallyCompleted)
+    }
+}
+
+struct ExternalPause {
+    queue: Queue,
+    recorder: Recorder,
+}
+
+#[async_trait]
+impl TaskHandler for ExternalPause {
+    async fn handle(&self, context: TaskContext) -> Result<Outcome, HandlerError> {
+        self.queue
+            .request_pause(context.task_id())
+            .await
+            .map_err(|error| HandlerError::new(error.to_string()))?;
+        self.queue
+            .park_paused(context.attempt())
+            .await
+            .map_err(|error| HandlerError::new(error.to_string()))?;
+        self.recorder.handled(context.task_id().as_uuid());
         Ok(Outcome::ExternallyCompleted)
     }
 }
@@ -1795,4 +1817,182 @@ async fn an_unsealed_external_terminal_fails_the_attempt() {
             .cloned(),
         Some(json!("external completion was not sealed"))
     );
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn external_paused_seal_is_accepted_by_worker() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let task = queue.enqueue(request()).await.unwrap();
+    let recorder = Recorder::default();
+    let worker = Worker::builder(queue.clone(), worker_config())
+        .handler(
+            kind(),
+            ExternalPause {
+                queue: queue.clone(),
+                recorder: recorder.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let (shutdown, handle) = start(worker);
+    recorder.wait_for_handled(1).await;
+    let parked = wait_for_task(&queue, task.task().id(), |task| {
+        task.pause_state() == TaskPauseState::Paused
+    })
+    .await;
+    assert_eq!(parked.status(), TaskStatus::Queued);
+    assert_eq!(parked.paused_attempts(), 1);
+    let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status(), AttemptStatus::Paused);
+    let attempt = &attempts[0];
+    let sealed = sqlx::query_file_scalar!(
+        "sql/store_attempt_sealed.sql",
+        NAMESPACE,
+        QUEUE,
+        attempt.task_id().as_uuid(),
+        attempt.id().as_uuid(),
+        attempt.fencing_token().as_uuid()
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(sealed, Some(true));
+    let wrong_token = uuid::Uuid::new_v4();
+    let other = sqlx::query_file_scalar!(
+        "sql/store_attempt_sealed.sql",
+        NAMESPACE,
+        QUEUE,
+        attempt.task_id().as_uuid(),
+        attempt.id().as_uuid(),
+        wrong_token
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(other, Some(false));
+    let second = queue.enqueue(request()).await.unwrap();
+    recorder.wait_for_handled(2).await;
+    let second_parked = wait_for_task(&queue, second.task().id(), |task| {
+        task.pause_state() == TaskPauseState::Paused
+    })
+    .await;
+    assert_eq!(second_parked.status(), TaskStatus::Queued);
+    shutdown.cancel();
+    handle.await.unwrap().unwrap();
+}
+
+/// A handler that parks on its first attempt once its task is paused and
+/// completes every later attempt.
+struct PausingOnce {
+    recorder: Recorder,
+}
+
+#[async_trait]
+impl TaskHandler for PausingOnce {
+    async fn handle(&self, context: TaskContext) -> Result<Outcome, HandlerError> {
+        self.recorder.handled(context.task_id().as_uuid());
+        if context.attempt_number() == 1 {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !context.pause_requested() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the handler did not observe the pause signal in time"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            return Ok(Outcome::Paused);
+        }
+        Ok(Outcome::completed(Some(json!({"resumed": true}))))
+    }
+}
+
+async fn wait_for_task(
+    queue: &Queue,
+    task_id: cloudiful_tasks::TaskId,
+    predicate: impl Fn(&cloudiful_tasks::Task) -> bool,
+) -> cloudiful_tasks::Task {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let task = queue
+            .get(task_id)
+            .await
+            .unwrap()
+            .expect("the task must exist");
+        if predicate(&task) {
+            return task;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the task did not reach the expected state in time: {task:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn paused_outcome_parks_and_resume_clears_worker_pause_flag() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+    let first = queue.enqueue(request()).await.unwrap();
+    let recorder = Recorder::default();
+
+    let worker = Worker::builder(queue.clone(), worker_config())
+        .handler(
+            kind(),
+            PausingOnce {
+                recorder: recorder.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let (shutdown, handle) = start(worker);
+
+    // The pause request makes the running attempt park itself.
+    recorder.wait_for_handled(1).await;
+    let pausing = queue.request_pause(first.task().id()).await.unwrap();
+    assert_eq!(pausing.pause_state(), TaskPauseState::Pausing);
+    let parked = wait_for_task(&queue, first.task().id(), |task| {
+        task.status() == TaskStatus::Queued && task.pause_state() == TaskPauseState::Paused
+    })
+    .await;
+    assert_eq!(parked.paused_attempts(), 1);
+    assert_eq!(parked.attempt_count(), 1);
+    let attempts = queue.attempts(first.task().id(), 10).await.unwrap();
+    assert_eq!(attempts[0].status(), AttemptStatus::Paused);
+
+    // The resume clears the flag and the worker completes the next attempt.
+    queue.resume(first.task().id()).await.unwrap();
+    recorder.wait_for_handled(2).await;
+    let succeeded = wait_for_task(&queue, first.task().id(), |task| {
+        task.status() == TaskStatus::Succeeded
+    })
+    .await;
+    assert_eq!(succeeded.attempt_count(), 2);
+    assert_eq!(succeeded.paused_attempts(), 1);
+    assert_eq!(succeeded.pause_state(), TaskPauseState::Unpaused);
+
+    // A cancellation that lands while the task pauses still wins: the parked
+    // outcome is sealed as cancelled, not as paused.
+    let second = queue.enqueue(request()).await.unwrap();
+    recorder.wait_for_handled(3).await;
+    queue.request_pause(second.task().id()).await.unwrap();
+    queue.request_cancel(second.task().id()).await.unwrap();
+    let cancelled = wait_for_task(&queue, second.task().id(), |task| {
+        task.status() == TaskStatus::Cancelled
+    })
+    .await;
+    assert_eq!(cancelled.pause_state(), TaskPauseState::Unpaused);
+    let attempts = queue.attempts(second.task().id(), 10).await.unwrap();
+    assert_eq!(attempts[0].status(), AttemptStatus::Cancelled);
+
+    shutdown.cancel();
+    handle.await.unwrap().unwrap();
 }

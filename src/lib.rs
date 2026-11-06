@@ -48,7 +48,7 @@ pub use crate::migrate::{MigrationOutcome, SchemaInfo, check_schema, migrate};
 pub use crate::model::{
     Attempt, AttemptId, AttemptStatus, Claim, EnqueueOutcome, EnqueueRequest, Failure,
     FencingToken, ListCursor, Namespace, ProgressUpdate, QueueName, RetryPolicy, Task, TaskId,
-    TaskKind, TaskStatus,
+    TaskKind, TaskPauseState, TaskStatus,
 };
 pub use crate::queue::{MAX_ATTEMPT_LIMIT, MAX_LIST_LIMIT, MAX_RECOVERY_LIMIT, Queue, QueuePolicy};
 pub use crate::wake::{WAKE_CHANNEL, WakeListener, Wakeup};

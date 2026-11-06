@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "WITH guard AS (\n    SELECT id, status\n    FROM cloudiful_tasks.tasks\n    WHERE id = $3 AND namespace = $1 AND queue = $2\n    FOR UPDATE\n),\nsealed AS (\n    UPDATE cloudiful_tasks.attempts AS a\n    SET status = CASE WHEN guard.status = 'cancel_requested' THEN 'cancelled' ELSE 'succeeded' END,\n        finished_at = clock_timestamp(),\n        lease_expires_at = NULL\n    FROM guard\n    WHERE a.id = $4\n      AND a.task_id = guard.id\n      AND a.fencing_token = $5\n      AND a.status = 'running'\n      AND a.lease_expires_at > clock_timestamp()\n    RETURNING a.task_id\n)\nUPDATE cloudiful_tasks.tasks AS t\nSET status = CASE WHEN t.status = 'cancel_requested' THEN 'cancelled' ELSE 'succeeded' END,\n    result = CASE WHEN t.status = 'cancel_requested' THEN NULL ELSE $6::jsonb END,\n    finished_at = clock_timestamp(),\n    updated_at = clock_timestamp(),\n    terminal_reason = CASE WHEN t.status = 'cancel_requested' THEN 'cancelled' ELSE t.terminal_reason END\nFROM sealed\nWHERE t.id = sealed.task_id\nRETURNING t.*\n",
+  "query": "UPDATE cloudiful_tasks.tasks\nSET status = CASE\n        WHEN status = 'queued' THEN 'cancelled'\n        WHEN status = 'running' THEN 'cancel_requested'\n        ELSE status\n    END,\n    cancel_requested_at = CASE\n        WHEN status = 'queued' THEN clock_timestamp()\n        ELSE COALESCE(cancel_requested_at, clock_timestamp())\n    END,\n    finished_at = CASE WHEN status = 'queued' THEN clock_timestamp() ELSE finished_at END,\n    terminal_reason = CASE WHEN status = 'queued' THEN 'cancelled' ELSE terminal_reason END,\n    pause_state = CASE WHEN status = 'queued' THEN 'unpaused' ELSE pause_state END,\n    updated_at = clock_timestamp()\nWHERE id = $3 AND namespace = $1 AND queue = $2\n  AND status IN ('queued', 'running', 'cancel_requested')\nRETURNING *\n",
   "describe": {
     "columns": [
       {
@@ -222,16 +222,46 @@
             "name": "terminal_reason"
           }
         }
+      },
+      {
+        "ordinal": 20,
+        "name": "pause_state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "pause_state"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "pause_generation",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "pause_generation"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "paused_attempts",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "paused_attempts"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
         "Text",
         "Text",
-        "Uuid",
-        "Uuid",
-        "Uuid",
-        "Jsonb"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -254,8 +284,11 @@
       false,
       true,
       true,
-      true
+      true,
+      false,
+      false,
+      false
     ]
   },
-  "hash": "2c8cd083707c727041c0a91e76b59b75b0064823f4d0cd34a60ccfed01fa7d9c"
+  "hash": "7229f11b74729263c997115e31b10f24b4fb1c68e6d578009575c9b4219df6d0"
 }

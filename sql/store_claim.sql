@@ -1,9 +1,10 @@
 WITH candidate AS (
-    SELECT id, attempt_count
+    SELECT id, attempt_count, pause_generation
     FROM cloudiful_tasks.tasks
     WHERE namespace = $1
       AND queue = $2
       AND status = 'queued'
+      AND pause_state = 'unpaused'
       AND available_at <= clock_timestamp()
       AND ($7::uuid IS NULL OR id = $7)
     ORDER BY priority DESC, available_at, created_at, id
@@ -28,10 +29,12 @@ sealed_attempt AS (
         fencing_token,
         status,
         lease_expires_at,
-        started_at
+        started_at,
+        pause_generation
     )
     SELECT $4, c.id, c.attempt_count + 1, $3, $5, 'running',
-           clock_timestamp() + ($6::bigint * interval '1 millisecond'), clock_timestamp()
+           clock_timestamp() + ($6::bigint * interval '1 millisecond'), clock_timestamp(),
+           c.pause_generation
     FROM candidate AS c
     RETURNING *
 )
@@ -47,6 +50,8 @@ SELECT
     attempt.finished_at,
     attempt.error,
     attempt.progress,
-    attempt.progress_updated_at
+    attempt.progress_updated_at,
+    attempt.pause_generation,
+    attempt.paused_at
 FROM sealed_attempt AS attempt
 INNER JOIN claimed ON claimed.id = attempt.task_id

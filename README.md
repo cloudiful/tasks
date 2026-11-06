@@ -26,8 +26,8 @@ The `v0.1` release implements:
 - an explicit schema bootstrap with an ownership marker, a versioned schema
   protocol and migration checksum verification,
 - the durable queue store: enqueue with idempotency, claim with a lease,
-  renewal, progress, completion, failure, cancellation, manual retry and
-  recovery of expired leases,
+  renewal, progress, completion, failure, cancellation, manual retry,
+  cooperative per-task pause and resume, and recovery of expired leases,
 - durable queue policies with an optional global limit on running attempts,
 - the worker runtime: bounded concurrency, lease heartbeat, cooperative
   cancellation, recovery of expired leases, wake up notifications, a
@@ -116,9 +116,9 @@ The semantics of the store:
 | Claim | Only a ready task is claimed, highest priority first, then the oldest ready one. The claim holds the lease of the task and carries a fresh fencing token. |
 | Addressed claim | `claim_by_id` claims exactly the requested task and never another one. The task must be ready and of the queue, otherwise the call reports `None` and claims nothing. The call bypasses the order of the queue, the decision which task is eligible stays with the caller. `claim_by_id_in` runs in the transaction of the caller. |
 | Lease | The lease expires on the clock of the database. A renewal, a progress report, a completion and a failure need the attempt, its token and an unexpired lease, otherwise the call reports `LeaseLost` and changes nothing. The lease is checked against the clock of the database after the locks of the operation are taken, so a call that waits for a lock cannot use an expired lease. |
-| Recovery | An expired attempt is sealed as interrupted and its task is scheduled again while the budget of the task allows it, otherwise the task fails. The recovery is idempotent. |
-| Cancellation | A queued task is cancelled at once, a running task is marked for cancellation. A cancellation that was requested before the completion wins: the task ends as cancelled and its result is discarded. External side effects cannot be undone. |
-| Retry | A failure is permanent unless the caller marks it retryable, and a task is only retried again when the caller grants additional attempts with `retry_failed`. The new budget is the number of the attempts that ran plus the granted attempts, an unused budget is not granted again and the budget can shrink. The attempt history and the request of the task stay untouched. |
+| Recovery | An expired attempt is sealed as interrupted and its task is scheduled again while the budget of the task allows it, otherwise the task fails. An expired attempt of a task that is still pausing or paused is sealed as paused instead and never consumes the failure budget. The recovery is idempotent. |
+| Cancellation | A queued task is cancelled at once, a running task is marked for cancellation. A cancellation that was requested before the completion wins: the task ends as cancelled and its result is discarded. External side effects cannot be undone. A cancellation also wins over a pause request or a parked pause. |
+| Retry | A failure is permanent unless the caller marks it retryable, and a task is only retried again when the caller grants additional attempts with `retry_failed`. The new budget is the effective number of attempts that ran plus the granted attempts, where a parked pause attempt does not count. An unused budget is not granted again and the budget can shrink. The attempt history and the request of the task stay untouched. |
 
 A caller that admits a task itself claims that task by its identifier:
 
@@ -155,6 +155,32 @@ let policy = queue.policy().await?;
 | Capacity | Every claim path counts the running attempts of the queue under the same queue-scoped transaction advisory lock that replaces the policy. An expired running attempt still counts until recovery seals it, and a successful completion, failure, cancellation or recovery frees the capacity by sealing the attempt. |
 | Isolation | Every claim path requires `READ COMMITTED`, whether or not the queue has a stored policy; another isolation level is refused before the policy is read. The lock statement and the count run separately, so a waiting claim counts after it acquired the lock and cannot rely on a snapshot taken before a limit was stored. |
 | Reset | Setting `None` removes the policy and restores the unlimited behavior. |
+
+### Cooperative pause
+
+A pause is scoped to one task, not to the queue. The pause state is independent
+of the task status, so a queued task can be paused while it stays queued:
+
+```rust
+use cloudiful_tasks::TaskPauseState;
+
+let paused = queue.request_pause(task_id).await?;
+if paused.pause_state() == TaskPauseState::Pausing {
+    // A running attempt parks at its next checkpoint.
+}
+// Later, after the attempt parked:
+queue.resume(task_id).await?;
+```
+
+| Topic | Behaviour |
+| --- | --- |
+| Queued task | `request_pause` pauses the task at once without an attempt and preserves its available time. A paused queued task is not claimable by `claim` or `claim_by_id`. |
+| Running task | `request_pause` enters `Pausing` and keeps the lease and heartbeat. The handler persists its checkpoint, observes `TaskContext::pause_requested` and returns `Outcome::Paused`; the worker seals the exact attempt with `park_paused`. |
+| Idempotency | A repeated request or a resume of an already unpaused task changes nothing and does not advance the pause generation. A terminal task refuses both. |
+| Resume | A pausing task stops reporting a pause without revoking its lease; a paused task is queued again, preserving its available time, attempt history and effective failure budget. |
+| Pause generation | Every fresh pause request advances the generation. The attempt captures its generation at claim, so a resume clears the signal and a pause can never stop a resumed task. |
+| Races | A completion or failure that wins the terminal keeps the terminal. A cancellation wins over a request, a park and a pause recovery. A park that races a resume leaves the task claimable. |
+| Budget | `attempt_count` stays the monotonic physical total. `paused_attempts` counts only checkpoint parks, so the effective failure budget is `attempt_count - paused_attempts`. Recovery never leaves an expired paused attempt counted as running. |
 
 ### The worker
 
@@ -200,6 +226,7 @@ The semantics of the worker:
 | Concurrency | The number of running handlers is bounded by the configuration. A free slot takes the next ready task at once. |
 | Heartbeat | The worker renews the lease of its running attempts. The renewal is bounded by the lease that is left. A lost lease, a renewal that did not finish in time or repeated database errors stop the handler and block its write, also while the lease of the database is still live. |
 | Cancellation | The handler observes the token of its attempt. A cancelled task stops its handler. |
+| Pause | The worker polls the pause state of every running attempt by its own task id and generation. The handler observes `TaskContext::pause_requested`, persists its checkpoint and returns `Outcome::Paused`; the worker parks the exact attempt and the task waits for a resume. A pause of one task never stops another task. |
 | Recovery | The worker seals the attempts whose lease expired and schedules their tasks again. |
 | Wake up | The notification of the queue is a hint. The worker also polls, so a lost notification only delays the next task. |
 | A panic | The task fails permanently, the worker keeps running. The payload of the task is never printed. |
@@ -220,6 +247,9 @@ caller, so a business write and the task share one commit:
 | Complete | `complete_in` |
 | Fail | `fail_in` |
 | Request the cancellation | `request_cancel_in` |
+| Request a pause | `request_pause_in` |
+| Resume a pause | `resume_in` |
+| Park a paused attempt | `park_paused_in` |
 | Manual retry | `retry_failed_in` |
 | Recover the expired leases | `recover_expired_in` |
 

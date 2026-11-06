@@ -5,6 +5,7 @@
 //! its attempt and returns the outcome of the task.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -28,6 +29,13 @@ pub enum Outcome {
     /// An unsealed attempt is handled as a failure, and a lost lease is never
     /// written to a newer attempt.
     ExternallyCompleted,
+    /// The handler parked at a cooperative pause checkpoint.
+    ///
+    /// The worker seals the exact attempt as paused and queues the task until
+    /// a resume. A parked attempt is not a failed attempt and does not consume
+    /// the failure budget. A handler must persist its checkpoint before it
+    /// returns this outcome.
+    Paused,
 }
 
 impl Outcome {
@@ -86,6 +94,7 @@ pub struct TaskContext {
     kind: TaskKind,
     payload: Value,
     cancel: CancellationToken,
+    pause: Arc<AtomicBool>,
 }
 
 impl TaskContext {
@@ -96,6 +105,7 @@ impl TaskContext {
         kind: TaskKind,
         payload: Value,
         cancel: CancellationToken,
+        pause: Arc<AtomicBool>,
     ) -> Self {
         Self {
             queue,
@@ -104,6 +114,7 @@ impl TaskContext {
             kind,
             payload,
             cancel,
+            pause,
         }
     }
 
@@ -147,6 +158,21 @@ impl TaskContext {
         self.cancel.is_cancelled()
     }
 
+    /// The pause signal shared with the worker registry of the attempt.
+    pub(crate) fn pause_signal(&self) -> Arc<AtomicBool> {
+        self.pause.clone()
+    }
+
+    /// Whether the task of this attempt was asked to pause.
+    ///
+    /// The signal belongs to the running attempt and its captured pause
+    /// generation. A resume clears it, and a pause request of another task
+    /// never sets it. The handler persists its checkpoint and returns
+    /// [`Outcome::Paused`] when the signal is set.
+    pub fn pause_requested(&self) -> bool {
+        self.pause.load(Ordering::Relaxed)
+    }
+
     /// Writes the progress report of the attempt.
     ///
     /// The report belongs to the attempt, a new attempt starts without
@@ -173,6 +199,7 @@ impl std::fmt::Debug for TaskContext {
             .field("kind", &self.kind)
             .field("payload", &"<opaque>")
             .field("cancelled", &self.is_cancelled())
+            .field("pause_requested", &self.pause_requested())
             .finish()
     }
 }

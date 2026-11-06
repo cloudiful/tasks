@@ -201,6 +201,53 @@ impl fmt::Display for TaskStatus {
     }
 }
 
+/// Cooperative pause state of a task.
+///
+/// The pause state is independent of [`TaskStatus`]: a queued task can be
+/// paused while it keeps the queued status, and a running task first enters
+/// [`TaskPauseState::Pausing`] until its attempt is parked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPauseState {
+    /// No pause was requested or the task was resumed.
+    #[default]
+    Unpaused,
+    /// A running attempt was asked to park at its next checkpoint.
+    Pausing,
+    /// The task is parked and waits for a resume.
+    Paused,
+}
+
+impl TaskPauseState {
+    /// The value stored in the database.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unpaused => "unpaused",
+            Self::Pausing => "pausing",
+            Self::Paused => "paused",
+        }
+    }
+
+    /// Parses a value stored in the database.
+    pub fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "unpaused" => Ok(Self::Unpaused),
+            "pausing" => Ok(Self::Pausing),
+            "paused" => Ok(Self::Paused),
+            other => Err(Error::Validation {
+                field: "pause_state",
+                reason: format!("unknown task pause state `{other}`"),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for TaskPauseState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Lifecycle state of an attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -215,6 +262,8 @@ pub enum AttemptStatus {
     Cancelled,
     /// The attempt lost its lease and was sealed by recovery.
     Interrupted,
+    /// The attempt parked at a cooperative pause checkpoint.
+    Paused,
 }
 
 impl AttemptStatus {
@@ -226,6 +275,7 @@ impl AttemptStatus {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::Interrupted => "interrupted",
+            Self::Paused => "paused",
         }
     }
 
@@ -237,6 +287,7 @@ impl AttemptStatus {
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
             "interrupted" => Ok(Self::Interrupted),
+            "paused" => Ok(Self::Paused),
             other => Err(Error::Validation {
                 field: "status",
                 reason: format!("unknown attempt status `{other}`"),
@@ -658,6 +709,9 @@ pub struct Task {
     pub(crate) cancel_requested_at: Option<DateTime<Utc>>,
     pub(crate) finished_at: Option<DateTime<Utc>>,
     pub(crate) terminal_reason: Option<String>,
+    pub(crate) pause_state: TaskPauseState,
+    pub(crate) pause_generation: i64,
+    pub(crate) paused_attempts: u32,
 }
 
 impl Task {
@@ -756,6 +810,27 @@ impl Task {
         self.terminal_reason.as_deref()
     }
 
+    /// The cooperative pause state of the task.
+    pub fn pause_state(&self) -> TaskPauseState {
+        self.pause_state
+    }
+
+    /// The number of pause requests that were applied to the task.
+    ///
+    /// The generation is retained across a resume and marks the pause signal
+    /// of an attempt. A terminal task keeps its history.
+    pub fn pause_generation(&self) -> i64 {
+        self.pause_generation
+    }
+
+    /// The number of attempts that parked at a cooperative pause checkpoint.
+    ///
+    /// A parked attempt is not a failed attempt: the effective failure budget
+    /// of the task is `attempt_count - paused_attempts`.
+    pub fn paused_attempts(&self) -> u32 {
+        self.paused_attempts
+    }
+
     /// Whether the task reached a terminal state.
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
@@ -790,6 +865,9 @@ impl fmt::Debug for Task {
             .field("cancel_requested_at", &self.cancel_requested_at)
             .field("finished_at", &self.finished_at)
             .field("terminal_reason", &self.terminal_reason)
+            .field("pause_state", &self.pause_state)
+            .field("pause_generation", &self.pause_generation)
+            .field("paused_attempts", &self.paused_attempts)
             .finish()
     }
 }
@@ -812,6 +890,8 @@ pub struct Attempt {
     pub(crate) error: Option<Value>,
     pub(crate) progress: Option<ProgressUpdate>,
     pub(crate) progress_updated_at: Option<DateTime<Utc>>,
+    pub(crate) pause_generation: i64,
+    pub(crate) paused_at: Option<DateTime<Utc>>,
 }
 
 impl Attempt {
@@ -874,6 +954,16 @@ impl Attempt {
     pub fn progress_updated_at(&self) -> Option<DateTime<Utc>> {
         self.progress_updated_at
     }
+
+    /// The task pause generation that was captured when the attempt started.
+    pub fn pause_generation(&self) -> i64 {
+        self.pause_generation
+    }
+
+    /// The time at which the attempt parked at a pause checkpoint, if it did.
+    pub fn paused_at(&self) -> Option<DateTime<Utc>> {
+        self.paused_at
+    }
 }
 
 impl fmt::Debug for Attempt {
@@ -891,6 +981,8 @@ impl fmt::Debug for Attempt {
             .field("error", &self.error.as_ref().map(|_| "<opaque>"))
             .field("progress", &self.progress)
             .field("progress_updated_at", &self.progress_updated_at)
+            .field("pause_generation", &self.pause_generation)
+            .field("paused_at", &self.paused_at)
             .finish()
     }
 }
@@ -1054,6 +1146,30 @@ mod tests {
     }
 
     #[test]
+    fn pause_states_and_the_paused_attempt_seal_round_trip() {
+        for state in [
+            TaskPauseState::Unpaused,
+            TaskPauseState::Pausing,
+            TaskPauseState::Paused,
+        ] {
+            assert_eq!(
+                TaskPauseState::from_db(state.as_str()).unwrap(),
+                state,
+                "the pause state must round trip"
+            );
+        }
+        assert!(TaskPauseState::from_db("unknown").is_err());
+        assert_eq!(TaskPauseState::default(), TaskPauseState::Unpaused);
+
+        assert_eq!(
+            AttemptStatus::from_db(AttemptStatus::Paused.as_str()).unwrap(),
+            AttemptStatus::Paused
+        );
+        assert!(AttemptStatus::Paused.is_sealed());
+        assert!(!AttemptStatus::Running.is_sealed());
+    }
+
+    #[test]
     fn retry_policy_validates_bounds() {
         assert!(RetryPolicy::new(0, Duration::ZERO, Duration::ZERO).is_err());
         assert!(RetryPolicy::new(2, Duration::from_secs(2), Duration::from_secs(1)).is_err());
@@ -1201,6 +1317,9 @@ mod tests {
             cancel_requested_at: None,
             finished_at: None,
             terminal_reason: None,
+            pause_state: TaskPauseState::Unpaused,
+            pause_generation: 0,
+            paused_attempts: 0,
         };
         let attempt = Attempt {
             id: AttemptId::new(),
@@ -1215,6 +1334,8 @@ mod tests {
             error: Some(serde_json::json!({"secret": "value"})),
             progress: None,
             progress_updated_at: None,
+            pause_generation: 0,
+            paused_at: None,
         };
 
         let rendered = format!("{task:?} {attempt:?}");

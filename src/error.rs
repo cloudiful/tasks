@@ -113,4 +113,17 @@ pub enum Error {
         /// The rejected transition.
         action: &'static str,
     },
+
+    /// The attempt cannot park against the pause generation of its task.
+    #[error(
+        "attempt of task {task_id} captured pause generation {found} but the task is at {expected}"
+    )]
+    PauseGenerationMismatch {
+        /// Task whose pause generation does not match.
+        task_id: Uuid,
+        /// Pause generation of the task.
+        expected: i64,
+        /// Pause generation captured by the attempt.
+        found: i64,
+    },
 }

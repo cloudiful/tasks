@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "-- Grants the requested additional attempts to a failed task.\n--\n-- The new budget is the number of the attempts that ran plus the requested\n-- additional attempts, the unused budget of the task is not granted again.\n-- The limit is checked, the sum of both numbers cannot overflow the column.\nUPDATE cloudiful_tasks.tasks\nSET status = 'queued',\n    max_attempts = LEAST(attempt_count::bigint + $4::bigint, $5::bigint)::integer,\n    available_at = clock_timestamp(),\n    finished_at = NULL,\n    terminal_reason = NULL,\n    result = NULL,\n    updated_at = clock_timestamp()\nWHERE id = $3 AND namespace = $1 AND queue = $2 AND status = 'failed'\nRETURNING *\n",
+  "query": "-- Requests the cooperative pause of one task.\n--\n-- A queued task is paused at once without an attempt, a running task enters\n-- the pausing state until its attempt parks. A task that is already paused or\n-- pausing keeps its generation, so a repeated request is idempotent. The\n-- statement runs under the queue advisory lock of the caller.\nUPDATE cloudiful_tasks.tasks\nSET pause_state = CASE\n        WHEN status = 'queued' THEN 'paused'\n        ELSE 'pausing'\n    END,\n    pause_generation = pause_generation + 1,\n    updated_at = clock_timestamp()\nWHERE id = $3\n  AND namespace = $1\n  AND queue = $2\n  AND status IN ('queued', 'running')\n  AND pause_state = 'unpaused'\nRETURNING *\n",
   "describe": {
     "columns": [
       {
@@ -222,15 +222,46 @@
             "name": "terminal_reason"
           }
         }
+      },
+      {
+        "ordinal": 20,
+        "name": "pause_state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "pause_state"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "pause_generation",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "pause_generation"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "paused_attempts",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "paused_attempts"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
         "Text",
         "Text",
-        "Uuid",
-        "Int8",
-        "Int8"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -253,8 +284,11 @@
       false,
       true,
       true,
-      true
+      true,
+      false,
+      false,
+      false
     ]
   },
-  "hash": "644398c84d146852f9936f9d0ab30e5d61f69908298fe503ec272a576a84b87a"
+  "hash": "3bd321139e2bc7536f2d68e7cd017ddfd7437b864b62c5050b0a115122d3a453"
 }

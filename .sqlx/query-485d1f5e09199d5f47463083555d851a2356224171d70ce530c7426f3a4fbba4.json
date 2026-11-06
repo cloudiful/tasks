@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n    a.id,\n    a.task_id,\n    a.attempt_number,\n    a.worker_id,\n    a.fencing_token,\n    a.status,\n    a.lease_expires_at,\n    a.started_at,\n    a.finished_at,\n    a.error,\n    a.progress,\n    a.progress_updated_at\nFROM cloudiful_tasks.attempts AS a\nINNER JOIN cloudiful_tasks.tasks AS t ON t.id = a.task_id\nWHERE t.namespace = $1\n  AND t.queue = $2\n  AND a.task_id = $3\nORDER BY a.attempt_number DESC\nLIMIT $4\n",
+  "query": "SELECT\n    a.id,\n    a.task_id,\n    a.attempt_number,\n    a.worker_id,\n    a.fencing_token,\n    a.status,\n    a.lease_expires_at,\n    a.started_at,\n    a.finished_at,\n    a.error,\n    a.progress,\n    a.progress_updated_at,\n    a.pause_generation,\n    a.paused_at\nFROM cloudiful_tasks.attempts AS a\nINNER JOIN cloudiful_tasks.tasks AS t ON t.id = a.task_id\nWHERE t.namespace = $1\n  AND t.queue = $2\n  AND a.task_id = $3\nORDER BY a.attempt_number DESC\nLIMIT $4\n",
   "describe": {
     "columns": [
       {
@@ -134,6 +134,28 @@
             "name": "progress_updated_at"
           }
         }
+      },
+      {
+        "ordinal": 12,
+        "name": "pause_generation",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "pause_generation"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "paused_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.attempts",
+            "name": "paused_at"
+          }
+        }
       }
     ],
     "parameters": {
@@ -156,8 +178,10 @@
       true,
       true,
       true,
+      true,
+      false,
       true
     ]
   },
-  "hash": "64bb0439b4a6bb75b05bb843fb22e498d45bec4d7f953bf92138be2ec173f650"
+  "hash": "485d1f5e09199d5f47463083555d851a2356224171d70ce530c7426f3a4fbba4"
 }

@@ -21,22 +21,20 @@ pub const TEST_DATABASE_URL_ENV: &str = "CLOUDIFUL_TASKS_TEST_DATABASE_URL";
 /// Environment variable that holds the URL of the dedicated sibling database.
 pub const SIBLING_DATABASE_URL_ENV: &str = "CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL";
 
-/// Database the live tests are allowed to touch.
-pub const EXPECTED_DATABASE: &str = "cloudiful_tasks_test";
+/// Optional expectation override of the configured endpoint host.
+pub const EXPECTED_HOST_ENV: &str = "CLOUDIFUL_TASKS_TEST_EXPECTED_HOST";
 
-/// Sibling database of the fixture that holds a schema of the library too.
-pub const SIBLING_DATABASE: &str = "cloudiful_tasks_dev";
+/// Optional expectation override of the configured endpoint port.
+pub const EXPECTED_PORT_ENV: &str = "CLOUDIFUL_TASKS_TEST_EXPECTED_PORT";
 
-/// Fixed configured endpoint of the shared non-production test server.
-pub const EXPECTED_HOST: &str = "unraid.cloud1ful.com";
+/// Optional expectation override of the server reported port.
+pub const EXPECTED_SERVER_PORT_ENV: &str = "CLOUDIFUL_TASKS_TEST_EXPECTED_SERVER_PORT";
 
-/// Fixed configured port of the shared non-production test server.
-pub const EXPECTED_PORT: u16 = 5432;
+/// Optional expectation override of the database the live tests touch.
+pub const EXPECTED_DATABASE_ENV: &str = "CLOUDIFUL_TASKS_TEST_EXPECTED_DATABASE";
 
-/// Port reported by the test server backend.
-///
-/// The forwarded endpoint is not assumed to equal this server side value.
-pub const EXPECTED_SERVER_PORT: &str = "5432";
+/// Optional expectation override of the sibling database.
+pub const EXPECTED_SIBLING_DATABASE_ENV: &str = "CLOUDIFUL_TASKS_TEST_EXPECTED_SIBLING_DATABASE";
 
 /// Exact database comment of the dedicated test fixture.
 pub const TEST_DATABASE_MARKER: &str = "cloudiful-tasks test fixture v1; non-production; dedicated";
@@ -44,6 +42,122 @@ pub const TEST_DATABASE_MARKER: &str = "cloudiful-tasks test fixture v1; non-pro
 /// Exact database comment of the dedicated sibling fixture.
 pub const SIBLING_DATABASE_MARKER: &str =
     "cloudiful-tasks development fixture v1; non-production; dedicated";
+
+/// The expected identity of the dedicated fixture databases.
+///
+/// The legacy profile names the shared non-production fixture. An operator
+/// that runs the live tests against an equivalent dedicated fixture supplies
+/// the expectation overrides without changing the shipped defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetProfile {
+    host: String,
+    port: u16,
+    server_port: String,
+    database: String,
+    sibling_database: String,
+    database_marker: String,
+    sibling_marker: String,
+}
+
+impl TargetProfile {
+    /// The shared non-production fixture of the tasks checkout.
+    pub fn legacy() -> Self {
+        Self {
+            host: "unraid.cloud1ful.com".to_owned(),
+            port: 5432,
+            server_port: "5432".to_owned(),
+            database: "cloudiful_tasks_test".to_owned(),
+            sibling_database: "cloudiful_tasks_dev".to_owned(),
+            database_marker: TEST_DATABASE_MARKER.to_owned(),
+            sibling_marker: SIBLING_DATABASE_MARKER.to_owned(),
+        }
+    }
+
+    /// Builds a profile from explicit expectation inputs.
+    ///
+    /// The markers stay the exact non-production fixture markers, so an
+    /// equivalent fixture is accepted only with the same database comments.
+    pub fn from_inputs(
+        host: &str,
+        port: u16,
+        server_port: &str,
+        database: &str,
+        sibling_database: &str,
+    ) -> std::result::Result<Self, String> {
+        if host.is_empty() {
+            return Err("must name an endpoint host".to_owned());
+        }
+        if port == 0 {
+            return Err("must name a non-zero endpoint port".to_owned());
+        }
+        if server_port
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .is_none()
+        {
+            return Err("must name a non-zero server port".to_owned());
+        }
+        if database.is_empty() {
+            return Err("must name a test database".to_owned());
+        }
+        if sibling_database.is_empty() {
+            return Err("must name a sibling database".to_owned());
+        }
+        if database == sibling_database {
+            return Err("must name distinct test and sibling databases".to_owned());
+        }
+        Ok(Self {
+            host: host.to_owned(),
+            port,
+            server_port: server_port.to_owned(),
+            database: database.to_owned(),
+            sibling_database: sibling_database.to_owned(),
+            database_marker: TEST_DATABASE_MARKER.to_owned(),
+            sibling_marker: SIBLING_DATABASE_MARKER.to_owned(),
+        })
+    }
+
+    /// Reads the expectation overrides and falls back to the legacy profile.
+    fn from_env() -> std::result::Result<Self, String> {
+        let legacy = Self::legacy();
+        let host = std::env::var(EXPECTED_HOST_ENV).unwrap_or(legacy.host);
+        let port = match std::env::var(EXPECTED_PORT_ENV) {
+            Ok(value) => value
+                .parse::<u16>()
+                .map_err(|_| format!("{EXPECTED_PORT_ENV} must be a port number"))?,
+            Err(_) => legacy.port,
+        };
+        let server_port = std::env::var(EXPECTED_SERVER_PORT_ENV).unwrap_or(legacy.server_port);
+        let database = std::env::var(EXPECTED_DATABASE_ENV).unwrap_or(legacy.database);
+        let sibling_database =
+            std::env::var(EXPECTED_SIBLING_DATABASE_ENV).unwrap_or(legacy.sibling_database);
+        Self::from_inputs(&host, port, &server_port, &database, &sibling_database)
+    }
+
+    /// The test database of the profile.
+    pub fn database(&self) -> &str {
+        &self.database
+    }
+
+    /// The sibling database of the profile.
+    pub fn sibling_database(&self) -> &str {
+        &self.sibling_database
+    }
+
+    fn database_marker(&self, database: &str) -> &str {
+        if database == self.database {
+            &self.database_marker
+        } else {
+            &self.sibling_marker
+        }
+    }
+}
+
+fn target_profile() -> TargetProfile {
+    TargetProfile::from_env()
+        .unwrap_or_else(|reason| panic!("the expected fixture is invalid: {reason}"))
+}
 
 const CLEANUP_SQL: &str = include_str!("../../sql/tests/migration_cleanup.sql");
 const FOREIGN_SCHEMA_SQL: &str = include_str!("../../sql/tests/migration_foreign_schema.sql");
@@ -75,38 +189,45 @@ struct RelationRow {
     relation_name: String,
 }
 
-fn fixture_options(env: &str, expected_database: &str) -> PgConnectOptions {
+fn fixture_options(
+    env: &str,
+    expected_database: &str,
+    profile: &TargetProfile,
+) -> PgConnectOptions {
     let value = std::env::var(env).ok();
-    fixture_options_from(value.as_deref(), expected_database)
+    fixture_options_from(value.as_deref(), expected_database, profile)
         .unwrap_or_else(|reason| panic!("{env} {reason}"))
 }
 
 fn fixture_options_from(
     value: Option<&str>,
     expected_database: &str,
+    profile: &TargetProfile,
 ) -> std::result::Result<PgConnectOptions, String> {
     let url = value.ok_or_else(|| "must be set".to_owned())?;
     let options =
         PgConnectOptions::from_str(url).map_err(|_| "must be a valid postgres url".to_owned())?;
-    validate_fixture_options(&options, expected_database)?;
+    validate_fixture_options(&options, expected_database, profile)?;
     Ok(options)
 }
 
 fn validate_fixture_options(
     options: &PgConnectOptions,
     expected_database: &str,
+    profile: &TargetProfile,
 ) -> std::result::Result<(), String> {
     if options.get_database() != Some(expected_database) {
         return Err(format!(
             "must name the dedicated {expected_database} database"
         ));
     }
-    if options.get_host() != EXPECTED_HOST {
-        return Err(format!("must use the dedicated endpoint {EXPECTED_HOST}"));
+    if options.get_host() != profile.host.as_str() {
+        return Err(format!("must use the dedicated endpoint {}", profile.host));
     }
-    if options.get_port() != EXPECTED_PORT {
+    if options.get_port() != profile.port {
         return Err(format!(
-            "must use the dedicated endpoint port {EXPECTED_PORT}"
+            "must use the dedicated endpoint port {}",
+            profile.port
         ));
     }
     if options.get_username().is_empty() {
@@ -124,9 +245,10 @@ fn validate_fixture_options(
 fn validate_identity(
     row: &IdentityRow,
     options: &PgConnectOptions,
+    profile: &TargetProfile,
     expected_database: &str,
-    expected_marker: &str,
 ) -> std::result::Result<(), String> {
+    let expected_marker = profile.database_marker(expected_database);
     if row.database_name.as_deref() != Some(expected_database) {
         return Err(format!(
             "must report the dedicated {expected_database} database, not {:?}",
@@ -153,10 +275,10 @@ fn validate_identity(
         }
         Some(_) => {}
     }
-    if row.server_port.as_deref() != Some(EXPECTED_SERVER_PORT) {
+    if row.server_port.as_deref() != Some(profile.server_port.as_str()) {
         return Err(format!(
-            "must report server port {EXPECTED_SERVER_PORT}, not {:?}",
-            row.server_port
+            "must report server port {}, not {:?}",
+            profile.server_port, row.server_port
         ));
     }
     Ok(())
@@ -164,18 +286,20 @@ fn validate_identity(
 
 /// The connection options of the dedicated test database.
 pub fn test_database_options() -> PgConnectOptions {
-    fixture_options(TEST_DATABASE_URL_ENV, EXPECTED_DATABASE)
+    let profile = target_profile();
+    fixture_options(TEST_DATABASE_URL_ENV, &profile.database, &profile)
 }
 
 /// Connects to the test database and verifies that it is the expected fixture.
 pub async fn connect() -> PgPool {
-    let options = test_database_options();
+    let profile = target_profile();
+    let options = fixture_options(TEST_DATABASE_URL_ENV, &profile.database, &profile);
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
         .connect_with(options.clone())
         .await
         .expect("the dedicated test database must be reachable");
-    verify_identity(&pool, &options, EXPECTED_DATABASE, TEST_DATABASE_MARKER).await;
+    verify_identity(&pool, &options, &profile, &profile.database).await;
     pool
 }
 
@@ -320,13 +444,18 @@ pub async fn open_queue_with_config(
 /// transaction of another database is refused. The tests only read from it and
 /// roll their transactions back.
 pub async fn connect_to_sibling_database() -> PgPool {
-    let options = fixture_options(SIBLING_DATABASE_URL_ENV, SIBLING_DATABASE);
+    let profile = target_profile();
+    let options = fixture_options(
+        SIBLING_DATABASE_URL_ENV,
+        &profile.sibling_database,
+        &profile,
+    );
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
         .connect_with(options.clone())
         .await
         .expect("the dedicated sibling database must be reachable");
-    verify_identity(&pool, &options, SIBLING_DATABASE, SIBLING_DATABASE_MARKER).await;
+    verify_identity(&pool, &options, &profile, &profile.sibling_database).await;
     pool
 }
 
@@ -423,14 +552,14 @@ pub async fn app_domain_count(pool: &PgPool) -> i64 {
 async fn verify_identity(
     pool: &PgPool,
     options: &PgConnectOptions,
+    profile: &TargetProfile,
     expected_database: &str,
-    expected_marker: &str,
 ) {
     let row = sqlx::query_file_as!(IdentityRow, "sql/tests/migration_test_identity.sql")
         .fetch_one(pool)
         .await
         .expect("the dedicated database must report its identity");
-    if let Err(reason) = validate_identity(&row, options, expected_database, expected_marker) {
+    if let Err(reason) = validate_identity(&row, options, profile, expected_database) {
         panic!("the {expected_database} fixture is invalid: {reason}");
     }
 }
@@ -443,49 +572,61 @@ mod fixture_guard_tests {
         PgConnectOptions::from_str(url).expect("the test fixture url must parse")
     }
 
-    fn dedicated_options() -> PgConnectOptions {
-        options("postgres://postgres@unraid.cloud1ful.com:5432/cloudiful_tasks_test")
+    fn legacy_profile() -> TargetProfile {
+        TargetProfile::legacy()
     }
 
-    fn identity() -> IdentityRow {
+    fn dedicated_options(profile: &TargetProfile) -> PgConnectOptions {
+        options(&format!(
+            "postgres://postgres@{}:{}/{}",
+            profile.host, profile.port, profile.database
+        ))
+    }
+
+    fn identity(profile: &TargetProfile) -> IdentityRow {
         IdentityRow {
-            database_name: Some(EXPECTED_DATABASE.to_owned()),
+            database_name: Some(profile.database.clone()),
             user_name: Some("postgres".to_owned()),
             server_address: Some("172.19.0.30".to_owned()),
-            server_port: Some(EXPECTED_SERVER_PORT.to_owned()),
-            database_comment: Some(TEST_DATABASE_MARKER.to_owned()),
+            server_port: Some(profile.server_port.clone()),
+            database_comment: Some(profile.database_marker.clone()),
         }
     }
 
     #[test]
     fn missing_malformed_and_mismatched_urls_fail_closed() {
-        assert!(fixture_options_from(None, EXPECTED_DATABASE).is_err());
-        assert!(fixture_options_from(Some("not a url"), EXPECTED_DATABASE).is_err());
+        let profile = legacy_profile();
+        assert!(fixture_options_from(None, &profile.database, &profile).is_err());
+        assert!(fixture_options_from(Some("not a url"), &profile.database, &profile).is_err());
         assert!(
             fixture_options_from(
                 Some("postgres://postgres@unraid.cloud1ful.com:5432/postgres"),
-                EXPECTED_DATABASE
+                &profile.database,
+                &profile
             )
             .is_err()
         );
         assert!(
             fixture_options_from(
                 Some("postgres://postgres@localhost:5432/cloudiful_tasks_test"),
-                EXPECTED_DATABASE
+                &profile.database,
+                &profile
             )
             .is_err()
         );
         assert!(
             fixture_options_from(
                 Some("postgres://postgres@unraid.cloud1ful.com:5433/cloudiful_tasks_test"),
-                EXPECTED_DATABASE
+                &profile.database,
+                &profile
             )
             .is_err()
         );
         assert!(
             fixture_options_from(
                 Some("postgres://postgres@unraid.cloud1ful.com:5432/cloudiful_tasks_test"),
-                EXPECTED_DATABASE
+                &profile.database,
+                &profile
             )
             .is_ok()
         );
@@ -493,19 +634,22 @@ mod fixture_guard_tests {
 
     #[test]
     fn connection_option_overrides_are_refused() {
+        let profile = legacy_profile();
         assert!(
             validate_fixture_options(
                 &options(
                     "postgres://postgres@unraid.cloud1ful.com:5432/cloudiful_tasks_test?host=/tmp"
                 ),
-                EXPECTED_DATABASE
+                &profile.database,
+                &profile
             )
             .is_err()
         );
         assert!(
             validate_fixture_options(
                 &options("postgres://postgres@unraid.cloud1ful.com:5432/cloudiful_tasks_test?options=-csearch_path%3Dpublic"),
-                EXPECTED_DATABASE
+                &profile.database,
+                &profile
             )
             .is_err()
         );
@@ -513,44 +657,68 @@ mod fixture_guard_tests {
 
     #[test]
     fn identity_requires_the_dedicated_marker_and_endpoint() {
-        let options = dedicated_options();
-        let row = identity();
-        assert!(validate_identity(&row, &options, EXPECTED_DATABASE, TEST_DATABASE_MARKER).is_ok());
+        let profile = legacy_profile();
+        let options = dedicated_options(&profile);
+        let row = identity(&profile);
+        assert!(validate_identity(&row, &options, &profile, &profile.database).is_ok());
 
-        let mut wrong = identity();
+        let mut wrong = identity(&profile);
         wrong.database_name = Some("postgres".to_owned());
-        assert!(
-            validate_identity(&wrong, &options, EXPECTED_DATABASE, TEST_DATABASE_MARKER).is_err()
-        );
+        assert!(validate_identity(&wrong, &options, &profile, &profile.database).is_err());
 
-        let mut wrong = identity();
+        let mut wrong = identity(&profile);
         wrong.database_comment = Some("another fixture".to_owned());
-        assert!(
-            validate_identity(&wrong, &options, EXPECTED_DATABASE, TEST_DATABASE_MARKER).is_err()
-        );
+        assert!(validate_identity(&wrong, &options, &profile, &profile.database).is_err());
 
-        let mut wrong = identity();
+        let mut wrong = identity(&profile);
         wrong.user_name = Some("someone-else".to_owned());
-        assert!(
-            validate_identity(&wrong, &options, EXPECTED_DATABASE, TEST_DATABASE_MARKER).is_err()
-        );
+        assert!(validate_identity(&wrong, &options, &profile, &profile.database).is_err());
 
-        let mut wrong = identity();
+        let mut wrong = identity(&profile);
         wrong.server_address = None;
-        assert!(
-            validate_identity(&wrong, &options, EXPECTED_DATABASE, TEST_DATABASE_MARKER).is_err()
-        );
+        assert!(validate_identity(&wrong, &options, &profile, &profile.database).is_err());
 
-        let mut wrong = identity();
+        let mut wrong = identity(&profile);
         wrong.server_address = Some("127.0.0.1".to_owned());
+        assert!(validate_identity(&wrong, &options, &profile, &profile.database).is_err());
+
+        let mut wrong = identity(&profile);
+        wrong.server_port = Some("5434".to_owned());
+        assert!(validate_identity(&wrong, &options, &profile, &profile.database).is_err());
+    }
+
+    #[test]
+    fn an_explicit_profile_is_validated_and_accepted() {
+        let profile = TargetProfile::from_inputs(
+            "unraid.cloud1ful.com",
+            5439,
+            "5432",
+            "context69_issue_21_tasks_test",
+            "context69_issue_21_tasks_dev",
+        )
+        .expect("the explicit profile must be valid");
+        assert_eq!(profile.database(), "context69_issue_21_tasks_test");
+        assert_eq!(profile.sibling_database(), "context69_issue_21_tasks_dev");
+        assert_eq!(profile.port, 5439);
+
+        let connect_options = dedicated_options(&profile);
+        assert!(validate_fixture_options(&connect_options, profile.database(), &profile).is_ok());
+        // The same endpoint with the legacy database name is refused.
         assert!(
-            validate_identity(&wrong, &options, EXPECTED_DATABASE, TEST_DATABASE_MARKER).is_err()
+            validate_fixture_options(&connect_options, "cloudiful_tasks_test", &profile).is_err()
         );
 
-        let mut wrong = identity();
-        wrong.server_port = Some("5434".to_owned());
-        assert!(
-            validate_identity(&wrong, &options, EXPECTED_DATABASE, TEST_DATABASE_MARKER).is_err()
-        );
+        let row = identity(&profile);
+        assert!(validate_identity(&row, &connect_options, &profile, profile.database()).is_ok());
+
+        // A connection to another port is refused by the profile.
+        let foreign =
+            options("postgres://postgres@unraid.cloud1ful.com:5432/context69_issue_21_tasks_test");
+        assert!(validate_fixture_options(&foreign, profile.database(), &profile).is_err());
+
+        assert!(TargetProfile::from_inputs("", 5439, "5432", "a", "b").is_err());
+        assert!(TargetProfile::from_inputs("host", 0, "5432", "a", "b").is_err());
+        assert!(TargetProfile::from_inputs("host", 5439, "0", "a", "b").is_err());
+        assert!(TargetProfile::from_inputs("host", 5439, "5432", "a", "a").is_err());
     }
 }

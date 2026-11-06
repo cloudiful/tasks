@@ -11,5 +11,5 @@ SELECT EXISTS (
       AND a.task_id = $3
       AND a.id = $4
       AND a.fencing_token = $5
-      AND a.status IN ('succeeded', 'failed', 'cancelled')
+      AND a.status IN ('succeeded', 'failed', 'cancelled', 'paused')
 ) AS sealed

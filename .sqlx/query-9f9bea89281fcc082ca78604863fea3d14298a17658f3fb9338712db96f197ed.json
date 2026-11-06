@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "WITH expired AS (\n    SELECT\n        t.id AS task_id,\n        a.id AS attempt_id,\n        a.attempt_number,\n        a.fencing_token\n    FROM cloudiful_tasks.tasks AS t\n    INNER JOIN cloudiful_tasks.attempts AS a\n        ON a.task_id = t.id\n        AND a.status = 'running'\n        AND a.lease_expires_at <= clock_timestamp()\n    WHERE t.namespace = $1 AND t.queue = $2\n    ORDER BY a.lease_expires_at, a.id\n    FOR UPDATE OF t, a SKIP LOCKED\n    LIMIT $3\n),\nsealed AS (\n    UPDATE cloudiful_tasks.attempts AS a\n    SET status = 'interrupted',\n        finished_at = clock_timestamp(),\n        lease_expires_at = NULL,\n        error = jsonb_build_object('reason', 'lease_expired')\n    FROM expired\n    WHERE a.id = expired.attempt_id\n      AND a.status = 'running'\n      AND a.fencing_token = expired.fencing_token\n    RETURNING a.task_id, expired.attempt_number\n)\nUPDATE cloudiful_tasks.tasks AS t\nSET status = CASE\n        WHEN t.status = 'cancel_requested' THEN 'cancelled'\n        WHEN t.attempt_count < t.max_attempts THEN 'queued'\n        ELSE 'failed'\n    END,\n    available_at = CASE\n        WHEN t.status = 'cancel_requested' THEN t.available_at\n        WHEN t.attempt_count < t.max_attempts THEN clock_timestamp() + make_interval(\n            secs => LEAST(\n                t.retry_initial_delay_ns::numeric\n                    * power(2::numeric, LEAST(GREATEST(sealed.attempt_number - 1, 0), 31)),\n                t.retry_max_delay_ns::numeric\n            ) / 1000000000.0\n        )\n        ELSE t.available_at\n    END,\n    finished_at = CASE\n        WHEN t.status = 'cancel_requested' OR t.attempt_count >= t.max_attempts THEN clock_timestamp()\n        ELSE t.finished_at\n    END,\n    terminal_reason = CASE\n        WHEN t.status = 'cancel_requested' THEN 'cancelled'\n        WHEN t.attempt_count >= t.max_attempts THEN 'attempts_exhausted'\n        ELSE t.terminal_reason\n    END,\n    updated_at = clock_timestamp()\nFROM sealed\nWHERE t.id = sealed.task_id\n  AND t.status IN ('running', 'cancel_requested')\nRETURNING t.*\n",
+  "query": "-- Seals the exact attempt of a task as a parked pause checkpoint.\n--\n-- The task and the attempt are locked by the caller in task then attempt\n-- order. A running attempt that parked while a pause is still active leaves\n-- the task queued and paused; a park that races a resume leaves the task\n-- queued and unpaused so the continuation is claimable again. A cancellation\n-- that was requested before the park wins. The attempt count already counts\n-- the attempt, the park only adds it to the parked counter, so the effective\n-- failure budget is not consumed.\nWITH guard AS (\n    SELECT id, status, pause_state\n    FROM cloudiful_tasks.tasks\n    WHERE id = $3 AND namespace = $1 AND queue = $2\n),\nsealed AS (\n    UPDATE cloudiful_tasks.attempts AS a\n    SET status = CASE\n            WHEN guard.status = 'cancel_requested' THEN 'cancelled'\n            ELSE 'paused'\n        END,\n        finished_at = clock_timestamp(),\n        lease_expires_at = NULL,\n        error = CASE\n            WHEN guard.status = 'cancel_requested' THEN a.error\n            ELSE NULL\n        END,\n        paused_at = CASE\n            WHEN guard.status = 'cancel_requested' THEN NULL\n            ELSE clock_timestamp()\n        END\n    FROM guard\n    WHERE a.id = $4\n      AND a.task_id = guard.id\n      AND a.fencing_token = $5\n      AND a.status = 'running'\n      AND a.lease_expires_at > clock_timestamp()\n    RETURNING a.task_id, (a.status = 'paused') AS paused\n)\nUPDATE cloudiful_tasks.tasks AS t\nSET status = CASE\n        WHEN t.status = 'cancel_requested' THEN 'cancelled'\n        ELSE 'queued'\n    END,\n    pause_state = CASE\n        WHEN t.status = 'cancel_requested' THEN 'unpaused'\n        WHEN t.pause_state = 'unpaused' THEN 'unpaused'\n        ELSE 'paused'\n    END,\n    paused_attempts = t.paused_attempts + CASE WHEN sealed.paused THEN 1 ELSE 0 END,\n    finished_at = CASE\n        WHEN t.status = 'cancel_requested' THEN clock_timestamp()\n        ELSE NULL\n    END,\n    terminal_reason = CASE\n        WHEN t.status = 'cancel_requested' THEN 'cancelled'\n        ELSE NULL\n    END,\n    updated_at = clock_timestamp()\nFROM sealed\nWHERE t.id = sealed.task_id\nRETURNING t.*\n",
   "describe": {
     "columns": [
       {
@@ -222,13 +222,48 @@
             "name": "terminal_reason"
           }
         }
+      },
+      {
+        "ordinal": 20,
+        "name": "pause_state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "pause_state"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "pause_generation",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "pause_generation"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "paused_attempts",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "cloudiful_tasks.tasks",
+            "name": "paused_attempts"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
         "Text",
         "Text",
-        "Int8"
+        "Uuid",
+        "Uuid",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -251,8 +286,11 @@
       false,
       true,
       true,
-      true
+      true,
+      false,
+      false,
+      false
     ]
   },
-  "hash": "b09b6741dd77954847c76c06e58a33b8281f6235d670190d0e7e19f50b88a678"
+  "hash": "9f9bea89281fcc082ca78604863fea3d14298a17658f3fb9338712db96f197ed"
 }
