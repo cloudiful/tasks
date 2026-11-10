@@ -4,10 +4,10 @@
 //! `query_file!` or `query_file_as!`. The store never creates or alters the
 //! schema and never writes outside the schema of the library.
 
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgConnection;
 use std::time::Duration;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
@@ -28,9 +28,9 @@ pub(crate) struct TaskRow {
     result: Option<Value>,
     status: String,
     priority: i32,
-    available_at: DateTime<Utc>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    available_at: OffsetDateTime,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
     idempotency_key: Option<String>,
     // The specification is part of the row, the store never reads it.
     #[allow(dead_code)]
@@ -39,8 +39,8 @@ pub(crate) struct TaskRow {
     max_attempts: i32,
     retry_initial_delay_ns: i64,
     retry_max_delay_ns: i64,
-    cancel_requested_at: Option<DateTime<Utc>>,
-    finished_at: Option<DateTime<Utc>>,
+    cancel_requested_at: Option<OffsetDateTime>,
+    finished_at: Option<OffsetDateTime>,
     terminal_reason: Option<String>,
     pause_state: String,
     pause_generation: i64,
@@ -66,14 +66,14 @@ pub(crate) struct AttemptRow {
     worker_id: String,
     fencing_token: Uuid,
     status: String,
-    lease_expires_at: Option<DateTime<Utc>>,
-    started_at: DateTime<Utc>,
-    finished_at: Option<DateTime<Utc>>,
+    lease_expires_at: Option<OffsetDateTime>,
+    started_at: OffsetDateTime,
+    finished_at: Option<OffsetDateTime>,
     error: Option<Value>,
     progress: Option<Value>,
-    progress_updated_at: Option<DateTime<Utc>>,
+    progress_updated_at: Option<OffsetDateTime>,
     pause_generation: i64,
-    paused_at: Option<DateTime<Utc>>,
+    paused_at: Option<OffsetDateTime>,
 }
 
 /// Checks that a connection belongs to the schema instance of the queue.
@@ -371,7 +371,7 @@ pub(crate) async fn list_tasks(
     limit: u32,
 ) -> Result<Vec<Task>> {
     let (created_at, id) = match cursor {
-        Some(cursor) => (cursor.created_at(), cursor.id().as_uuid()),
+        Some(cursor) => (cursor.utc_created_at()?, cursor.id().as_uuid()),
         None => first_page_cursor(),
     };
     let rows = sqlx::query_file_as!(
@@ -475,7 +475,7 @@ pub(crate) async fn renew_attempt(
     queue: &QueueName,
     attempt: &Attempt,
     lease_ttl: Duration,
-) -> Result<DateTime<Utc>> {
+) -> Result<OffsetDateTime> {
     lock_attempt(connection, namespace, queue, attempt).await?;
     let row = sqlx::query_file!(
         "sql/store_renew.sql",
@@ -793,8 +793,8 @@ fn progress_from_json(value: Value) -> Result<ProgressUpdate> {
     })
 }
 
-fn first_page_cursor() -> (DateTime<Utc>, Uuid) {
-    let end_of_time = DateTime::UNIX_EPOCH + Duration::from_secs(253_402_300_799);
+fn first_page_cursor() -> (OffsetDateTime, Uuid) {
+    let end_of_time = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(253_402_300_799);
     (end_of_time, Uuid::from_u128(u128::MAX))
 }
 

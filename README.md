@@ -41,12 +41,17 @@ has no release yet, so the dependency pins the commit it was verified with:
 ```toml
 [dependencies]
 cloudiful-tasks = { git = "https://github.com/cloudiful/tasks", rev = "<COMMIT_SHA>" }
-sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "macros", "migrate", "json", "uuid", "chrono"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "macros", "migrate", "json", "uuid", "time"] }
 tokio-util = "0.7"
 ```
 
 Replace `<COMMIT_SHA>` with the commit you verified. The application depends on
 `sqlx` directly, because the public API takes a `sqlx::PgPool`.
+
+Timestamp APIs use `time::OffsetDateTime`; instants must be representable in UTC
+within the default `time` year range (-9999 through 9999). Existing PostgreSQL
+values outside that range are not supported. Persisted availability timestamps
+use UTC with exactly six fractional digits and a `Z` suffix.
 
 ## Usage
 

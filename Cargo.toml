@@ -28,7 +28,6 @@ path = "src/lib.rs"
 
 [dependencies]
 async-trait = "0.1"
-chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.9", default-features = false, features = [
@@ -37,12 +36,13 @@ sqlx = { version = "0.9", default-features = false, features = [
     "macros",
     "migrate",
     "uuid",
-    "chrono",
+    "time",
     "json",
     "tls-rustls",
     "sqlx-toml",
 ] }
 thiserror = "2"
+time = { version = "0.3", features = ["formatting", "macros"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "signal"] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["serde", "v4"] }

@@ -9,13 +9,16 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{Duration as ChronoDuration, Utc};
 use cloudiful_tasks::{
-    AttemptStatus, EnqueueRequest, Error, Failure, ProgressUpdate, QueuePolicy, RetryPolicy,
-    TaskId, TaskKind, TaskPauseState, TaskStatus,
+    AttemptStatus, EnqueueRequest, Error, Failure, ListCursor, ProgressUpdate, QueuePolicy,
+    RetryPolicy, TaskId, TaskKind, TaskPauseState, TaskStatus,
 };
 use serde_json::json;
 use sqlx::postgres::PgListener;
+use time::Duration as TimeDuration;
+use time::OffsetDateTime;
+use time::UtcOffset;
+use time::macros::datetime;
 use tokio::sync::Barrier;
 
 use common::{
@@ -25,6 +28,10 @@ use common::{
 
 const NAMESPACE: &str = "ns";
 const QUEUE: &str = "q";
+
+/// A task of an older build, whose persisted specification holds the fixed six
+/// microsecond representation of the availability.
+const LEGACY_TASK_SQL: &str = include_str!("../sql/tests/idempotency_legacy_task.sql");
 
 fn request() -> EnqueueRequest {
     EnqueueRequest::new(TaskKind::new("demo").unwrap(), json!({"a": 1}))
@@ -82,6 +89,54 @@ async fn an_idempotency_key_returns_the_same_task() {
         .enqueue(conflicting)
         .await
         .expect_err("a different request must be a conflict");
+    assert!(
+        matches!(error, Error::IdempotencyConflict { .. }),
+        "unexpected error: {error}"
+    );
+    assert_eq!(task_count(&pool, NAMESPACE, QUEUE).await, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_legacy_request_spec_is_still_the_same_request() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+
+    sqlx::raw_sql(LEGACY_TASK_SQL)
+        .execute(&pool)
+        .await
+        .expect("the task of the older build must be insertable");
+
+    let legacy = request()
+        .with_available_at(datetime!(2024-01-02 03:04:05.123456 UTC))
+        .with_idempotency_key("legacy-key")
+        .unwrap();
+
+    let outcome = queue.enqueue(legacy).await.unwrap();
+    assert!(
+        !outcome.is_created(),
+        "the task of the older build must be the existing one"
+    );
+    assert_eq!(
+        outcome.task().id(),
+        TaskId::from_uuid(uuid::Uuid::from_u128(4)),
+        "the existing task must be the task of the older build"
+    );
+    assert_eq!(
+        outcome.task().available_at(),
+        datetime!(2024-01-02 03:04:05.123456 UTC),
+        "the persisted availability must be decoded without a loss"
+    );
+
+    let changed = request()
+        .with_available_at(datetime!(2024-01-02 03:04:05.123457 UTC))
+        .with_idempotency_key("legacy-key")
+        .unwrap();
+    let error = queue
+        .enqueue(changed)
+        .await
+        .expect_err("a changed request must be a conflict");
     assert!(
         matches!(error, Error::IdempotencyConflict { .. }),
         "unexpected error: {error}"
@@ -187,7 +242,7 @@ async fn a_task_that_is_not_ready_yet_is_not_claimed() {
     reset(&pool).await;
     let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
 
-    let later = request().with_available_at(Utc::now() + ChronoDuration::hours(1));
+    let later = request().with_available_at(OffsetDateTime::now_utc() + TimeDuration::hours(1));
     queue.enqueue(later).await.unwrap();
 
     assert!(queue.claim("worker").await.unwrap().is_none());
@@ -378,7 +433,7 @@ async fn a_retryable_failure_schedules_the_task_again() {
         .await
         .unwrap();
     assert_eq!(failed.status(), TaskStatus::Queued);
-    assert!(failed.available_at() > Utc::now());
+    assert!(failed.available_at() > OffsetDateTime::now_utc());
 
     let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
     assert_eq!(attempts.len(), 1);
@@ -586,14 +641,73 @@ async fn the_listing_is_bounded_and_uses_a_cursor() {
 
     let first = queue.list(None, 2).await.unwrap();
     assert_eq!(first.len(), 2);
-    let second = queue.list(Some(first[1].cursor()), 2).await.unwrap();
+    let cursor = first[1].cursor();
+    assert_eq!(
+        cursor.created_at(),
+        first[1].created_at(),
+        "the cursor must carry the decoded creation time"
+    );
+    let second = queue.list(Some(cursor), 2).await.unwrap();
     assert_eq!(second.len(), 2);
     assert_ne!(first[0].id(), second[0].id());
     assert_ne!(first[1].id(), second[0].id());
+    assert_eq!(
+        first[0].created_at().offset(),
+        UtcOffset::UTC,
+        "the creation time must be decoded in UTC"
+    );
+    assert!(first[0].created_at() >= first[1].created_at());
+    assert!(first[1].created_at() >= second[0].created_at());
 
     assert!(queue.list(None, 0).await.is_err());
     assert!(queue.list(None, 101).await.is_err());
     assert!(queue.attempts(first[0].id(), 0).await.is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+async fn a_cursor_outside_the_supported_range_is_refused() {
+    let pool = connect().await;
+    reset(&pool).await;
+    let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
+
+    for _ in 0..3 {
+        queue.enqueue(request()).await.unwrap();
+    }
+
+    let listed = queue.list(None, 2).await.unwrap();
+    let cursor = listed[1].cursor();
+
+    // The same moment with another offset pages the same tasks.
+    let shifted = ListCursor::new(
+        cursor
+            .created_at()
+            .to_offset(UtcOffset::from_hms(2, 0, 0).unwrap()),
+        cursor.id(),
+    );
+    let page = queue.list(Some(shifted), 2).await.unwrap();
+    let reference = queue.list(Some(cursor), 2).await.unwrap();
+    assert_eq!(
+        page.iter().map(|task| task.id()).collect::<Vec<_>>(),
+        reference.iter().map(|task| task.id()).collect::<Vec<_>>()
+    );
+
+    // A cursor whose UTC wall clock leaves the supported range is refused.
+    let out_of_range = ListCursor::new(datetime!(9999-12-31 23:59:59 -01:00), cursor.id());
+    let error = queue
+        .list(Some(out_of_range), 2)
+        .await
+        .expect_err("the cursor must be refused");
+    assert!(
+        matches!(
+            error,
+            Error::Validation {
+                field: "created_at",
+                ..
+            }
+        ),
+        "unexpected error: {error}"
+    );
 }
 
 #[tokio::test]
@@ -1143,7 +1257,11 @@ async fn a_renewal_in_a_transaction_is_atomic_with_the_domain_write() {
     assert_eq!(app_domain_count(&pool).await, 1);
     assert!(expiry >= lease);
     let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
-    assert!(attempts[0].lease_expires_at().unwrap() >= expiry);
+    assert_eq!(
+        attempts[0].lease_expires_at(),
+        Some(expiry),
+        "the renewed lease must be decoded without a loss"
+    );
 }
 
 #[tokio::test]
@@ -1461,7 +1579,7 @@ async fn an_addressed_claim_of_an_ineligible_task_is_refused() {
     let terminal = queue.enqueue(request()).await.unwrap();
     queue.request_cancel(terminal.task().id()).await.unwrap();
     let later = queue
-        .enqueue(request().with_available_at(Utc::now() + ChronoDuration::hours(1)))
+        .enqueue(request().with_available_at(OffsetDateTime::now_utc() + TimeDuration::hours(1)))
         .await
         .unwrap();
 

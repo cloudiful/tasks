@@ -868,7 +868,7 @@ async fn repeated_renewal_failures_revoke_the_authority_of_the_attempt() {
     assert!(
         attempts[0]
             .lease_expires_at()
-            .is_some_and(|expiry| expiry > chrono::Utc::now()),
+            .is_some_and(|expiry| expiry > time::OffsetDateTime::now_utc()),
         "the lease of the database must still be live"
     );
 }

@@ -7,10 +7,10 @@
 //! Opening a queue never creates or alters the schema. The schema must be
 //! owned by the library, otherwise the queue refuses to open.
 
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use std::time::Duration;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::backoff;
@@ -313,7 +313,7 @@ impl Queue {
     /// The lock of the attempt and the renewal run in one transaction, so
     /// that the lease is checked against the clock of the database after the
     /// lock was taken.
-    pub async fn renew(&self, attempt: &Attempt) -> Result<DateTime<Utc>> {
+    pub async fn renew(&self, attempt: &Attempt) -> Result<OffsetDateTime> {
         let mut transaction = self.pool.begin().await?;
         let outcome = self.renew_on(&mut transaction, attempt).await;
         match outcome {
@@ -340,7 +340,7 @@ impl Queue {
         &self,
         transaction: &mut Transaction<'_, Postgres>,
         attempt: &Attempt,
-    ) -> Result<DateTime<Utc>> {
+    ) -> Result<OffsetDateTime> {
         self.verify_instance(transaction).await?;
         self.renew_on(transaction, attempt).await
     }
@@ -680,7 +680,7 @@ impl Queue {
         &self,
         connection: &mut PgConnection,
         attempt: &Attempt,
-    ) -> Result<DateTime<Utc>> {
+    ) -> Result<OffsetDateTime> {
         store::renew_attempt(
             connection,
             &self.namespace,

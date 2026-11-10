@@ -3,10 +3,10 @@
 use std::fmt;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use time::{OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
@@ -421,7 +421,7 @@ pub struct EnqueueRequest {
     payload: Value,
     idempotency_key: Option<String>,
     priority: i32,
-    available_at: Option<DateTime<Utc>>,
+    available_at: Option<OffsetDateTime>,
     retry: RetryPolicy,
 }
 
@@ -457,7 +457,12 @@ impl EnqueueRequest {
     }
 
     /// Sets the earliest time at which the task may be claimed.
-    pub fn with_available_at(mut self, available_at: DateTime<Utc>) -> Self {
+    ///
+    /// The offset of the timestamp is normalized to UTC when the request is
+    /// canonicalized, so the moment of the request is what counts. A timestamp
+    /// whose UTC wall clock lies outside the supported range is refused when
+    /// the request is enqueued.
+    pub fn with_available_at(mut self, available_at: OffsetDateTime) -> Self {
         self.available_at = Some(available_at);
         self
     }
@@ -489,7 +494,7 @@ impl EnqueueRequest {
     }
 
     /// The earliest time at which the task may be claimed, if any.
-    pub fn available_at(&self) -> Option<DateTime<Utc>> {
+    pub fn available_at(&self) -> Option<OffsetDateTime> {
         self.available_at
     }
 
@@ -698,16 +703,16 @@ pub struct Task {
     pub(crate) result: Option<Value>,
     pub(crate) status: TaskStatus,
     pub(crate) priority: i32,
-    pub(crate) available_at: DateTime<Utc>,
-    pub(crate) created_at: DateTime<Utc>,
-    pub(crate) updated_at: DateTime<Utc>,
+    pub(crate) available_at: OffsetDateTime,
+    pub(crate) created_at: OffsetDateTime,
+    pub(crate) updated_at: OffsetDateTime,
     pub(crate) idempotency_key: Option<String>,
     pub(crate) attempt_count: u32,
     pub(crate) max_attempts: u32,
     pub(crate) retry_initial_delay_ns: i64,
     pub(crate) retry_max_delay_ns: i64,
-    pub(crate) cancel_requested_at: Option<DateTime<Utc>>,
-    pub(crate) finished_at: Option<DateTime<Utc>>,
+    pub(crate) cancel_requested_at: Option<OffsetDateTime>,
+    pub(crate) finished_at: Option<OffsetDateTime>,
     pub(crate) terminal_reason: Option<String>,
     pub(crate) pause_state: TaskPauseState,
     pub(crate) pause_generation: i64,
@@ -756,17 +761,17 @@ impl Task {
     }
 
     /// The earliest time at which the task may be claimed.
-    pub fn available_at(&self) -> DateTime<Utc> {
+    pub fn available_at(&self) -> OffsetDateTime {
         self.available_at
     }
 
     /// The time at which the task was created.
-    pub fn created_at(&self) -> DateTime<Utc> {
+    pub fn created_at(&self) -> OffsetDateTime {
         self.created_at
     }
 
     /// The time at which the task was changed the last time.
-    pub fn updated_at(&self) -> DateTime<Utc> {
+    pub fn updated_at(&self) -> OffsetDateTime {
         self.updated_at
     }
 
@@ -796,12 +801,12 @@ impl Task {
     }
 
     /// The time at which a cancellation was requested, if it was.
-    pub fn cancel_requested_at(&self) -> Option<DateTime<Utc>> {
+    pub fn cancel_requested_at(&self) -> Option<OffsetDateTime> {
         self.cancel_requested_at
     }
 
     /// The time at which the task reached a terminal state, if it did.
-    pub fn finished_at(&self) -> Option<DateTime<Utc>> {
+    pub fn finished_at(&self) -> Option<OffsetDateTime> {
         self.finished_at
     }
 
@@ -884,14 +889,14 @@ pub struct Attempt {
     pub(crate) worker_id: String,
     pub(crate) fencing_token: FencingToken,
     pub(crate) status: AttemptStatus,
-    pub(crate) lease_expires_at: Option<DateTime<Utc>>,
-    pub(crate) started_at: DateTime<Utc>,
-    pub(crate) finished_at: Option<DateTime<Utc>>,
+    pub(crate) lease_expires_at: Option<OffsetDateTime>,
+    pub(crate) started_at: OffsetDateTime,
+    pub(crate) finished_at: Option<OffsetDateTime>,
     pub(crate) error: Option<Value>,
     pub(crate) progress: Option<ProgressUpdate>,
-    pub(crate) progress_updated_at: Option<DateTime<Utc>>,
+    pub(crate) progress_updated_at: Option<OffsetDateTime>,
     pub(crate) pause_generation: i64,
-    pub(crate) paused_at: Option<DateTime<Utc>>,
+    pub(crate) paused_at: Option<OffsetDateTime>,
 }
 
 impl Attempt {
@@ -926,17 +931,17 @@ impl Attempt {
     }
 
     /// The time at which the lease of the attempt expires.
-    pub fn lease_expires_at(&self) -> Option<DateTime<Utc>> {
+    pub fn lease_expires_at(&self) -> Option<OffsetDateTime> {
         self.lease_expires_at
     }
 
     /// The time at which the attempt started.
-    pub fn started_at(&self) -> DateTime<Utc> {
+    pub fn started_at(&self) -> OffsetDateTime {
         self.started_at
     }
 
     /// The time at which the attempt was sealed, if it was.
-    pub fn finished_at(&self) -> Option<DateTime<Utc>> {
+    pub fn finished_at(&self) -> Option<OffsetDateTime> {
         self.finished_at
     }
 
@@ -951,7 +956,7 @@ impl Attempt {
     }
 
     /// The time at which the last progress report was written.
-    pub fn progress_updated_at(&self) -> Option<DateTime<Utc>> {
+    pub fn progress_updated_at(&self) -> Option<OffsetDateTime> {
         self.progress_updated_at
     }
 
@@ -961,7 +966,7 @@ impl Attempt {
     }
 
     /// The time at which the attempt parked at a pause checkpoint, if it did.
-    pub fn paused_at(&self) -> Option<DateTime<Utc>> {
+    pub fn paused_at(&self) -> Option<OffsetDateTime> {
         self.paused_at
     }
 }
@@ -1049,24 +1054,42 @@ impl EnqueueOutcome {
 /// The position of a task in a listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListCursor {
-    created_at: DateTime<Utc>,
+    created_at: OffsetDateTime,
     id: TaskId,
 }
 
 impl ListCursor {
     /// Builds a cursor for a position in a listing.
-    pub fn new(created_at: DateTime<Utc>, id: TaskId) -> Self {
+    ///
+    /// The creation time keeps its offset, the listing compares the moment it
+    /// names.
+    pub fn new(created_at: OffsetDateTime, id: TaskId) -> Self {
         Self { created_at, id }
     }
 
     /// The creation time of the task the cursor points at.
-    pub fn created_at(&self) -> DateTime<Utc> {
+    pub fn created_at(&self) -> OffsetDateTime {
         self.created_at
     }
 
     /// The task the cursor points at.
     pub fn id(&self) -> TaskId {
         self.id
+    }
+
+    /// The creation time of the cursor in UTC.
+    ///
+    /// The listing binds the cursor to the database, which converts the
+    /// timestamp to UTC. A timestamp whose UTC wall clock lies outside the
+    /// supported range is refused with an error, so that no conversion of the
+    /// binding can overflow.
+    pub(crate) fn utc_created_at(&self) -> Result<OffsetDateTime> {
+        self.created_at
+            .checked_to_offset(UtcOffset::UTC)
+            .ok_or_else(|| Error::Validation {
+                field: "created_at",
+                reason: "the timestamp is outside the supported range in UTC".to_owned(),
+            })
     }
 }
 
@@ -1200,10 +1223,14 @@ mod tests {
             );
 
         assert_eq!(
-            canonical_request_spec(&first),
-            canonical_request_spec(&second)
+            canonical_request_spec(&first).unwrap(),
+            canonical_request_spec(&second).unwrap()
         );
-        assert!(canonical_request_spec(&first).contains("\"available_at\":null"));
+        assert!(
+            canonical_request_spec(&first)
+                .unwrap()
+                .contains("\"available_at\":null")
+        );
     }
 
     #[test]
@@ -1215,12 +1242,12 @@ mod tests {
             EnqueueRequest::new(kind, serde_json::json!({"a": 1})).with_priority(1);
 
         assert_ne!(
-            canonical_request_spec(&base),
-            canonical_request_spec(&other_payload)
+            canonical_request_spec(&base).unwrap(),
+            canonical_request_spec(&other_payload).unwrap()
         );
         assert_ne!(
-            canonical_request_spec(&base),
-            canonical_request_spec(&other_priority)
+            canonical_request_spec(&base).unwrap(),
+            canonical_request_spec(&other_priority).unwrap()
         );
     }
 
@@ -1306,9 +1333,9 @@ mod tests {
             result: Some(serde_json::json!({"secret": "value"})),
             status: TaskStatus::Queued,
             priority: 0,
-            available_at: DateTime::UNIX_EPOCH,
-            created_at: DateTime::UNIX_EPOCH,
-            updated_at: DateTime::UNIX_EPOCH,
+            available_at: OffsetDateTime::UNIX_EPOCH,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
             idempotency_key: None,
             attempt_count: 0,
             max_attempts: 1,
@@ -1328,8 +1355,8 @@ mod tests {
             worker_id: "worker-1".to_owned(),
             fencing_token: FencingToken::new(),
             status: AttemptStatus::Running,
-            lease_expires_at: Some(DateTime::UNIX_EPOCH),
-            started_at: DateTime::UNIX_EPOCH,
+            lease_expires_at: Some(OffsetDateTime::UNIX_EPOCH),
+            started_at: OffsetDateTime::UNIX_EPOCH,
             finished_at: None,
             error: Some(serde_json::json!({"secret": "value"})),
             progress: None,
@@ -1342,6 +1369,38 @@ mod tests {
         assert!(
             !rendered.contains("secret"),
             "the payload of a task must not be printed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_cursor_outside_the_supported_range_is_refused() {
+        let cursor = ListCursor::new(
+            time::macros::datetime!(9999-12-31 23:59:59 -01:00),
+            TaskId::new(),
+        );
+
+        let error = cursor
+            .utc_created_at()
+            .expect_err("the utc wall clock of the cursor is out of range");
+        assert!(matches!(
+            error,
+            Error::Validation {
+                field: "created_at",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_cursor_keeps_its_moment_when_the_offset_changes() {
+        let cursor = ListCursor::new(
+            time::macros::datetime!(2024-01-02 03:04:05.123456 +02:00),
+            TaskId::new(),
+        );
+
+        assert_eq!(
+            cursor.utc_created_at().unwrap(),
+            time::macros::datetime!(2024-01-02 01:04:05.123456 UTC)
         );
     }
 }

@@ -36,12 +36,16 @@ schema 中。本库不会自行执行任务：worker 运行时由应用显式启
 ```toml
 [dependencies]
 cloudiful-tasks = { git = "https://github.com/cloudiful/tasks", rev = "<COMMIT_SHA>" }
-sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "macros", "migrate", "json", "uuid", "chrono"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "macros", "migrate", "json", "uuid", "time"] }
 tokio-util = "0.7"
 ```
 
 请将 `<COMMIT_SHA>` 替换为你验证过的提交。公开 API 接收 `sqlx::PgPool`，因此
 应用需要直接依赖 `sqlx`。
+
+时间戳 API 使用 `time::OffsetDateTime`，时刻必须能以 UTC 表示在 `time`
+默认的年份范围内（-9999 至 9999）。不支持超出该范围的既有 PostgreSQL
+时间值。持久化的可用时间使用 UTC、固定六位小数及 `Z` 后缀。
 
 ## 使用
 

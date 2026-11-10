@@ -5,9 +5,9 @@
 //! that exists without the ownership marker of this library is refused instead
 //! of being adopted.
 
-use chrono::{DateTime, Utc};
 use sqlx::migrate::Migrator;
 use sqlx::{PgConnection, PgPool};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
@@ -34,7 +34,7 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 pub struct SchemaInfo {
     protocol_version: i32,
     instance_uuid: Uuid,
-    installed_at: DateTime<Utc>,
+    installed_at: OffsetDateTime,
     applied_versions: Vec<i64>,
 }
 
@@ -51,7 +51,7 @@ impl SchemaInfo {
     }
 
     /// Time at which the schema was installed.
-    pub fn installed_at(&self) -> DateTime<Utc> {
+    pub fn installed_at(&self) -> OffsetDateTime {
         self.installed_at
     }
 
@@ -360,7 +360,7 @@ pub(crate) struct OwnershipRow {
     pub(crate) library: String,
     pub(crate) protocol_version: i32,
     pub(crate) instance_uuid: Uuid,
-    pub(crate) installed_at: DateTime<Utc>,
+    pub(crate) installed_at: OffsetDateTime,
 }
 
 #[derive(sqlx::FromRow)]
