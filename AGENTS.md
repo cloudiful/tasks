@@ -18,8 +18,8 @@ The live tests are ignored by default. They use the dedicated non-production
 databases on the shared test server and run serially:
 
 The live tests read two explicit environment values:
-`CLOUDIFUL_TASKS_TEST_DATABASE_URL` for `cloudiful_tasks_test` and
-`CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL` for `cloudiful_tasks_dev`.
+`TASKS_TEST_DATABASE_URL` for `cloudiful_tasks_test` and
+`TASKS_TEST_SIBLING_DATABASE_URL` for `cloudiful_tasks_dev`.
 
 ```sh
 cargo test --locked --offline --test migration -- --include-ignored --test-threads=1
@@ -31,7 +31,7 @@ The test URL names `cloudiful_tasks_test`; the explicit sibling URL names
 `cloudiful_tasks_dev`. Both must use the fixed `unraid.cloud1ful.com:5432`
 endpoint. An equivalent dedicated non-production fixture is selected without
 changing the shipped defaults through the optional expectation overrides
-`CLOUDIFUL_TASKS_TEST_EXPECTED_HOST`, `..._PORT`, `..._SERVER_PORT`,
+`TASKS_TEST_EXPECTED_HOST`, `..._PORT`, `..._SERVER_PORT`,
 `..._DATABASE` and `..._SIBLING_DATABASE`; the two URL variables stay
 independent and the exact database comments stay mandatory. A live test fails
 when an environment value is missing or malformed, when the effective
@@ -52,7 +52,7 @@ for the sibling). The guard runs before any reset or destructive statement.
 Only the development database is used to regenerate the query metadata:
 
 ```sh
-DATABASE_URL="$CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL" \
+DATABASE_URL="$TASKS_TEST_SIBLING_DATABASE_URL" \
   cargo sqlx prepare -- --all-targets
 ```
 

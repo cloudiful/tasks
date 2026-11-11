@@ -16,25 +16,25 @@ use sqlx::postgres::PgConnectOptions;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 /// Environment variable that holds the URL of the dedicated test database.
-pub const TEST_DATABASE_URL_ENV: &str = "CLOUDIFUL_TASKS_TEST_DATABASE_URL";
+pub const TEST_DATABASE_URL_ENV: &str = "TASKS_TEST_DATABASE_URL";
 
 /// Environment variable that holds the URL of the dedicated sibling database.
-pub const SIBLING_DATABASE_URL_ENV: &str = "CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL";
+pub const SIBLING_DATABASE_URL_ENV: &str = "TASKS_TEST_SIBLING_DATABASE_URL";
 
 /// Optional expectation override of the configured endpoint host.
-pub const EXPECTED_HOST_ENV: &str = "CLOUDIFUL_TASKS_TEST_EXPECTED_HOST";
+pub const EXPECTED_HOST_ENV: &str = "TASKS_TEST_EXPECTED_HOST";
 
 /// Optional expectation override of the configured endpoint port.
-pub const EXPECTED_PORT_ENV: &str = "CLOUDIFUL_TASKS_TEST_EXPECTED_PORT";
+pub const EXPECTED_PORT_ENV: &str = "TASKS_TEST_EXPECTED_PORT";
 
 /// Optional expectation override of the server reported port.
-pub const EXPECTED_SERVER_PORT_ENV: &str = "CLOUDIFUL_TASKS_TEST_EXPECTED_SERVER_PORT";
+pub const EXPECTED_SERVER_PORT_ENV: &str = "TASKS_TEST_EXPECTED_SERVER_PORT";
 
 /// Optional expectation override of the database the live tests touch.
-pub const EXPECTED_DATABASE_ENV: &str = "CLOUDIFUL_TASKS_TEST_EXPECTED_DATABASE";
+pub const EXPECTED_DATABASE_ENV: &str = "TASKS_TEST_EXPECTED_DATABASE";
 
 /// Optional expectation override of the sibling database.
-pub const EXPECTED_SIBLING_DATABASE_ENV: &str = "CLOUDIFUL_TASKS_TEST_EXPECTED_SIBLING_DATABASE";
+pub const EXPECTED_SIBLING_DATABASE_ENV: &str = "TASKS_TEST_EXPECTED_SIBLING_DATABASE";
 
 /// Exact database comment of the dedicated test fixture.
 pub const TEST_DATABASE_MARKER: &str = "cloudiful-tasks test fixture v1; non-production; dedicated";

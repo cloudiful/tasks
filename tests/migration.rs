@@ -2,7 +2,7 @@
 //!
 //! The tests need the fixture database of the tasks checkout. They are
 //! ignored by default and run with
-//! `CLOUDIFUL_TASKS_TEST_DATABASE_URL=<url> cargo test --test migration -- --include-ignored --test-threads=1`.
+//! `TASKS_TEST_DATABASE_URL=<url> cargo test --test migration -- --include-ignored --test-threads=1`.
 
 mod common;
 
@@ -32,7 +32,7 @@ struct LedgerVersionRow {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn migrate_creates_only_the_owned_schema() {
     let pool = connect().await;
     cleanup(&pool).await;
@@ -88,7 +88,7 @@ async fn migrate_creates_only_the_owned_schema() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn concurrent_migrations_are_idempotent() {
     let pool = connect().await;
     cleanup(&pool).await;
@@ -110,7 +110,7 @@ async fn concurrent_migrations_are_idempotent() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_foreign_schema_is_refused() {
     let pool = connect().await;
     cleanup(&pool).await;
@@ -150,7 +150,7 @@ async fn a_foreign_schema_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn an_empty_schema_is_refused() {
     let pool = connect().await;
     cleanup(&pool).await;
@@ -182,7 +182,7 @@ async fn an_empty_schema_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_schema_with_the_ledger_alone_is_refused() {
     let pool = connect().await;
     cleanup(&pool).await;
@@ -211,7 +211,7 @@ async fn a_schema_with_the_ledger_alone_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_missing_schema_is_reported_and_never_created() {
     let pool = connect().await;
     cleanup(&pool).await;
@@ -231,7 +231,7 @@ async fn a_missing_schema_is_reported_and_never_created() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_newer_protocol_version_is_refused() {
     let pool = connect().await;
     cleanup(&pool).await;
@@ -272,7 +272,7 @@ async fn a_newer_protocol_version_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_drifted_migration_checksum_is_detected() {
     let pool = connect().await;
     cleanup(&pool).await;
@@ -307,7 +307,7 @@ async fn a_drifted_migration_checksum_is_detected() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn the_public_schema_is_untouched() {
     let pool = connect().await;
     cleanup(&pool).await;
@@ -342,7 +342,7 @@ async fn the_public_schema_is_untouched() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn the_migration_runs_on_an_empty_database() {
     let pool: PgPool = connect().await;
     cleanup(&pool).await;
@@ -353,7 +353,7 @@ async fn the_migration_runs_on_an_empty_database() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_populated_version_two_schema_is_upgraded() {
     let pool = connect().await;
     cleanup(&pool).await;
@@ -397,7 +397,7 @@ async fn a_populated_version_two_schema_is_upgraded() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn an_owned_version_one_schema_is_upgraded() {
     let pool = connect().await;
     cleanup(&pool).await;

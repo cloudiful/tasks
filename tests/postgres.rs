@@ -2,7 +2,7 @@
 //!
 //! The tests need the fixture database of the tasks checkout. They are
 //! ignored by default and run with
-//! `CLOUDIFUL_TASKS_TEST_DATABASE_URL=<url> cargo test --test postgres -- --include-ignored --test-threads=1`.
+//! `TASKS_TEST_DATABASE_URL=<url> cargo test --test postgres -- --include-ignored --test-threads=1`.
 
 mod common;
 
@@ -67,7 +67,7 @@ async fn isolation_transaction<'a>(
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn an_idempotency_key_returns_the_same_task() {
     let pool = connect().await;
     reset(&pool).await;
@@ -97,7 +97,7 @@ async fn an_idempotency_key_returns_the_same_task() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_legacy_request_spec_is_still_the_same_request() {
     let pool = connect().await;
     reset(&pool).await;
@@ -145,7 +145,7 @@ async fn a_legacy_request_spec_is_still_the_same_request() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn concurrent_enqueues_with_the_same_key_create_one_task() {
     let pool = connect().await;
     reset(&pool).await;
@@ -177,7 +177,7 @@ async fn concurrent_enqueues_with_the_same_key_create_one_task() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn namespaces_and_queues_are_isolated() {
     let pool = connect().await;
     reset(&pool).await;
@@ -203,7 +203,7 @@ async fn namespaces_and_queues_are_isolated() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_concurrent_claim_gives_the_lease_to_one_worker() {
     let pool = connect().await;
     reset(&pool).await;
@@ -236,7 +236,7 @@ async fn a_concurrent_claim_gives_the_lease_to_one_worker() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_task_that_is_not_ready_yet_is_not_claimed() {
     let pool = connect().await;
     reset(&pool).await;
@@ -249,7 +249,7 @@ async fn a_task_that_is_not_ready_yet_is_not_claimed() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn claims_are_ordered_by_priority() {
     let pool = connect().await;
     reset(&pool).await;
@@ -270,7 +270,7 @@ async fn claims_are_ordered_by_priority() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn an_expired_lease_cannot_be_used() {
     let pool = connect().await;
     reset(&pool).await;
@@ -318,7 +318,7 @@ async fn an_expired_lease_cannot_be_used() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn recovery_seals_the_expired_attempt_and_schedules_the_task_again() {
     let pool = connect().await;
     reset(&pool).await;
@@ -356,7 +356,7 @@ async fn recovery_seals_the_expired_attempt_and_schedules_the_task_again() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn recovery_fails_a_task_without_budget() {
     let pool = connect().await;
     reset(&pool).await;
@@ -374,7 +374,7 @@ async fn recovery_fails_a_task_without_budget() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_failed_task_is_scheduled_again_with_a_larger_budget() {
     let pool = connect().await;
     reset(&pool).await;
@@ -413,7 +413,7 @@ async fn a_failed_task_is_scheduled_again_with_a_larger_budget() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_retryable_failure_schedules_the_task_again() {
     let pool = connect().await;
     reset(&pool).await;
@@ -441,7 +441,7 @@ async fn a_retryable_failure_schedules_the_task_again() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_cancellation_of_a_queued_task_is_immediate() {
     let pool = connect().await;
     reset(&pool).await;
@@ -461,7 +461,7 @@ async fn a_cancellation_of_a_queued_task_is_immediate() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_cancellation_wins_over_a_later_completion() {
     let pool = connect().await;
     reset(&pool).await;
@@ -484,7 +484,7 @@ async fn a_cancellation_wins_over_a_later_completion() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_completion_wins_over_a_later_cancellation() {
     let pool = connect().await;
     reset(&pool).await;
@@ -504,7 +504,7 @@ async fn a_completion_wins_over_a_later_cancellation() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn the_progress_of_an_attempt_is_stored() {
     let pool = connect().await;
     reset(&pool).await;
@@ -540,7 +540,7 @@ async fn the_progress_of_an_attempt_is_stored() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_transaction_of_another_database_is_refused() {
     let pool = connect().await;
     reset(&pool).await;
@@ -565,7 +565,7 @@ async fn a_transaction_of_another_database_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn an_enqueue_in_a_rolled_back_transaction_leaves_no_task() {
     let pool = connect().await;
     reset(&pool).await;
@@ -580,7 +580,7 @@ async fn an_enqueue_in_a_rolled_back_transaction_leaves_no_task() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_completion_in_a_rolled_back_transaction_leaves_the_task_running() {
     let pool = connect().await;
     reset(&pool).await;
@@ -603,7 +603,7 @@ async fn a_completion_in_a_rolled_back_transaction_leaves_the_task_running() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_refused_completion_in_a_transaction_is_reported() {
     let pool = connect().await;
     reset(&pool).await;
@@ -629,7 +629,7 @@ async fn a_refused_completion_in_a_transaction_is_reported() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn the_listing_is_bounded_and_uses_a_cursor() {
     let pool = connect().await;
     reset(&pool).await;
@@ -665,7 +665,7 @@ async fn the_listing_is_bounded_and_uses_a_cursor() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_cursor_outside_the_supported_range_is_refused() {
     let pool = connect().await;
     reset(&pool).await;
@@ -711,7 +711,7 @@ async fn a_cursor_outside_the_supported_range_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn an_enqueue_wakes_the_workers_after_the_commit() {
     let pool = connect().await;
     reset(&pool).await;
@@ -740,7 +740,7 @@ async fn an_enqueue_wakes_the_workers_after_the_commit() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_transaction_that_started_before_the_expiry_cannot_finalize_the_task() {
     let pool = connect().await;
     reset(&pool).await;
@@ -790,7 +790,7 @@ async fn a_transaction_that_started_before_the_expiry_cannot_finalize_the_task()
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_lock_wait_that_crosses_the_expiry_refuses_the_write() {
     let pool = connect().await;
     reset(&pool).await;
@@ -832,7 +832,7 @@ async fn a_lock_wait_that_crosses_the_expiry_refuses_the_write() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_lock_wait_that_crosses_the_expiry_refuses_the_renewal() {
     let pool = connect().await;
     reset(&pool).await;
@@ -869,7 +869,7 @@ async fn a_lock_wait_that_crosses_the_expiry_refuses_the_renewal() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_lock_wait_that_crosses_the_expiry_refuses_the_progress_report() {
     let pool = connect().await;
     reset(&pool).await;
@@ -910,7 +910,7 @@ async fn a_lock_wait_that_crosses_the_expiry_refuses_the_progress_report() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_manual_retry_grants_only_the_requested_attempts() {
     let pool = connect().await;
     reset(&pool).await;
@@ -976,7 +976,7 @@ async fn a_manual_retry_grants_only_the_requested_attempts() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_claim_in_a_transaction_is_atomic_with_the_domain_write() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1022,7 +1022,7 @@ async fn a_claim_in_a_transaction_is_atomic_with_the_domain_write() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_cancellation_in_a_transaction_is_atomic_with_the_domain_write() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1061,7 +1061,7 @@ async fn a_cancellation_in_a_transaction_is_atomic_with_the_domain_write() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_retry_in_a_transaction_is_atomic_with_the_domain_write() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1115,7 +1115,7 @@ async fn a_retry_in_a_transaction_is_atomic_with_the_domain_write() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_recovery_in_a_transaction_is_atomic_with_the_domain_write() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1180,7 +1180,7 @@ async fn a_recovery_in_a_transaction_is_atomic_with_the_domain_write() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_progress_report_in_a_transaction_is_atomic_with_the_domain_write() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1222,7 +1222,7 @@ async fn a_progress_report_in_a_transaction_is_atomic_with_the_domain_write() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_renewal_in_a_transaction_is_atomic_with_the_domain_write() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1265,7 +1265,7 @@ async fn a_renewal_in_a_transaction_is_atomic_with_the_domain_write() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_borrowed_operation_of_another_schema_instance_is_refused() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1345,7 +1345,7 @@ async fn a_borrowed_operation_of_another_schema_instance_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_borrowed_operation_of_another_database_is_refused() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1435,7 +1435,7 @@ async fn a_borrowed_operation_of_another_database_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn an_expired_lease_is_refused_by_the_borrowed_operations() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1478,7 +1478,7 @@ async fn an_expired_lease_is_refused_by_the_borrowed_operations() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_lock_wait_that_crosses_the_expiry_refuses_the_borrowed_renewal() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1523,7 +1523,7 @@ async fn a_lock_wait_that_crosses_the_expiry_refuses_the_borrowed_renewal() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn an_addressed_claim_selects_the_requested_task() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1554,7 +1554,7 @@ async fn an_addressed_claim_selects_the_requested_task() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn an_addressed_claim_of_an_ineligible_task_is_refused() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1641,7 +1641,7 @@ async fn an_addressed_claim_of_an_ineligible_task_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn an_addressed_claim_of_a_locked_task_is_refused() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1678,7 +1678,7 @@ async fn an_addressed_claim_of_a_locked_task_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn two_concurrent_addressed_claims_give_the_lease_to_one_worker() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1713,7 +1713,7 @@ async fn two_concurrent_addressed_claims_give_the_lease_to_one_worker() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn an_addressed_claim_and_a_generic_claim_give_the_lease_to_one_worker() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1747,7 +1747,7 @@ async fn an_addressed_claim_and_a_generic_claim_give_the_lease_to_one_worker() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn an_addressed_claim_in_a_transaction_is_atomic_with_the_domain_write() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1793,7 +1793,7 @@ async fn an_addressed_claim_in_a_transaction_is_atomic_with_the_domain_write() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn an_addressed_claim_in_a_transaction_of_another_schema_instance_is_refused() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1828,7 +1828,7 @@ async fn an_addressed_claim_in_a_transaction_of_another_schema_instance_is_refus
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_queue_policy_limits_every_claim_path_across_instances() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1906,7 +1906,7 @@ async fn a_queue_policy_limits_every_claim_path_across_instances() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn failure_cancellation_and_recovery_free_policy_capacity() {
     let pool = connect().await;
     reset(&pool).await;
@@ -1977,7 +1977,7 @@ async fn failure_cancellation_and_recovery_free_policy_capacity() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_queue_policy_is_durable_and_unlimited_by_default() {
     let pool = connect().await;
     reset(&pool).await;
@@ -2030,7 +2030,7 @@ async fn a_queue_policy_is_durable_and_unlimited_by_default() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_policy_protected_claim_requires_read_committed() {
     let pool = connect().await;
     reset(&pool).await;
@@ -2070,7 +2070,7 @@ async fn a_policy_protected_claim_requires_read_committed() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn an_unlimited_claim_requires_read_committed() {
     let pool = connect().await;
     reset(&pool).await;
@@ -2115,7 +2115,7 @@ fn assert_claim_requires_read_committed(error: &Error) {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn an_old_snapshot_cannot_bypass_a_policy_installed_while_it_waits() {
     let pool = connect().await;
     reset(&pool).await;
@@ -2166,7 +2166,7 @@ async fn an_old_snapshot_cannot_bypass_a_policy_installed_while_it_waits() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn a_waiting_policy_claim_uses_a_fresh_snapshot_after_the_queue_lock() {
     let pool = connect().await;
     reset(&pool).await;
@@ -2216,7 +2216,7 @@ async fn a_waiting_policy_claim_uses_a_fresh_snapshot_after_the_queue_lock() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn pause_transitions_and_claim_exclusion() {
     let pool = connect().await;
     reset(&pool).await;
@@ -2321,7 +2321,7 @@ async fn pause_transitions_and_claim_exclusion() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn park_paused_and_stale_generation_after_resume() {
     let pool = connect().await;
     reset(&pool).await;
@@ -2378,7 +2378,7 @@ async fn park_paused_and_stale_generation_after_resume() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn transactional_pause_resume_are_atomic_and_refuse_foreign_instance() {
     let pool = connect().await;
     reset(&pool).await;
@@ -2525,7 +2525,7 @@ async fn transactional_pause_resume_are_atomic_and_refuse_foreign_instance() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn paused_expired_attempt_is_recovered_without_spending_budget() {
     let pool = connect().await;
     reset(&pool).await;
@@ -2554,7 +2554,7 @@ async fn paused_expired_attempt_is_recovered_without_spending_budget() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn retryable_failure_winning_pause_clears_pause_state() {
     let pool = connect().await;
     reset(&pool).await;
@@ -2576,7 +2576,7 @@ async fn retryable_failure_winning_pause_clears_pause_state() {
 }
 
 #[tokio::test]
-#[ignore = "requires CLOUDIFUL_TASKS_TEST_DATABASE_URL"]
+#[ignore = "requires TASKS_TEST_DATABASE_URL"]
 async fn paused_attempts_do_not_consume_retry_budget() {
     let pool = connect().await;
     reset(&pool).await;
