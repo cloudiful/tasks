@@ -7,46 +7,46 @@
 
 Durable task execution on PostgreSQL.
 
-`cloudiful-tasks` keeps tasks, their attempts and their leases in one
-PostgreSQL schema that the library owns. The library never runs work on its
-own: a worker runtime is started explicitly by the application.
+`cloudiful-tasks` keeps tasks, their attempts and their leases in one PostgreSQL
+schema that the library owns. Nothing runs on its own: a worker runtime is
+started explicitly by the application.
 
 Execution is **at least once**. A worker that loses its lease can still finish
 its work, so handlers must be idempotent and side effects must be fenced with
 the fencing token of the attempt.
 
-## Status
+## Capabilities
 
-The `v0.1` release implements:
-
-- the data model: namespaces, queues, task kinds, task and attempt states,
-  retry policies, progress reports and fencing tokens,
-- the worker configuration contract with its validation rules,
-- bounded, overflow safe exponential backoff,
+- the data model: namespaces, queues, task kinds, task and attempt states, retry
+  policies, progress reports and fencing tokens,
 - an explicit schema bootstrap with an ownership marker, a versioned schema
   protocol and migration checksum verification,
 - the durable queue store: enqueue with idempotency, claim with a lease,
   renewal, progress, completion, failure, cancellation, manual retry,
   cooperative per-task pause and resume, and recovery of expired leases,
-- durable queue policies with an optional global limit on running attempts,
+- durable queue policies with an optional limit on running attempts,
 - the worker runtime: bounded concurrency, lease heartbeat, cooperative
   cancellation, recovery of expired leases, wake up notifications, a
   handler-owned terminal outcome and a graceful shutdown.
 
 ## Install
 
-The crate is not published to crates.io. Use the Git dependency. The repository
-has no release yet, so the dependency pins the commit it was verified with:
+The crate is not published to crates.io. Use the Git dependency and pin the
+commit you verified:
 
 ```toml
 [dependencies]
 cloudiful-tasks = { git = "https://github.com/cloudiful/tasks", rev = "<COMMIT_SHA>" }
-sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "macros", "migrate", "json", "uuid", "chrono"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "macros", "migrate", "json", "uuid", "time"] }
 tokio-util = "0.7"
 ```
 
-Replace `<COMMIT_SHA>` with the commit you verified. The application depends on
-`sqlx` directly, because the public API takes a `sqlx::PgPool`.
+The public API takes a `sqlx::PgPool`, so the application depends on `sqlx`
+directly. Timestamps are `time::OffsetDateTime` and must be representable in UTC
+within the default `time` year range (-9999 through 9999); PostgreSQL values
+outside that range are not supported. A persisted availability timestamp uses
+UTC with exactly six fractional digits and a `Z` suffix, so the same request
+keeps the same identity across builds.
 
 ## Usage
 
@@ -59,140 +59,57 @@ creates or alters schema.
 use cloudiful_tasks::{check_schema, migrate};
 use sqlx::postgres::PgPoolOptions;
 
-let pool = PgPoolOptions::new()
-    .max_connections(5)
-    .connect("postgresql://user@localhost/tasks")
-    .await?;
-
+let pool = PgPoolOptions::new().max_connections(5).connect("postgresql://user@localhost/tasks").await?;
 migrate(&pool).await?;
-let schema = check_schema(&pool).await?;
-println!("schema instance {} at version {}", schema.instance_uuid(), schema.protocol_version());
+check_schema(&pool).await?;
 ```
 
-`migrate` is idempotent and serialized per database, so concurrent callers
-apply the migrations exactly once. `check_schema` only reads.
-
-Both calls refuse a database that is not ready:
-
-| Situation | Result |
-| --- | --- |
-| The schema does not exist | `check_schema` reports `SchemaMissing`, `migrate` creates it |
-| The schema exists without the ownership marker of the library | `ForeignSchema` |
-| The schema was written by a newer library version | `UnsupportedSchemaVersion` |
-| An owned schema uses an older supported protocol version | `migrate` upgrades it; `check_schema` reports `OutdatedSchemaVersion` |
-| An applied migration no longer matches the migration source | `ChecksumMismatch` |
-
-A schema that the library does not own is never adopted and never overwritten.
+`migrate` is idempotent and serialized per database: it creates a missing schema
+and upgrades a supported older version. `check_schema` only reads and reports
+`SchemaMissing` or `OutdatedSchemaVersion` instead. Both refuse foreign schemas
+(`ForeignSchema`) and newer protocols (`UnsupportedSchemaVersion`); a schema
+that the library does not own is never adopted or overwritten.
 
 ### The queue
 
-A queue addresses the tasks of one namespace and one queue name. Every
-operation of the queue is scoped that way.
+A queue addresses the tasks of one namespace and one queue name.
 
 ```rust
-use cloudiful_tasks::{EnqueueRequest, ProgressUpdate, Queue, TaskKind, WorkerConfig};
+use cloudiful_tasks::{EnqueueRequest, Queue, TaskKind, WorkerConfig};
 use serde_json::json;
 
 let queue = Queue::open(pool.clone(), "stock", "k8s", &WorkerConfig::default()).await?;
-
-let outcome = queue
-    .enqueue(EnqueueRequest::new(TaskKind::new("sync")?, json!({"cluster": "a"})))
-    .await?;
+let request = EnqueueRequest::new(TaskKind::new("sync")?, json!({"cluster": "a"})).with_idempotency_key("sync:cluster-a")?;
+queue.enqueue(request).await?;
 
 if let Some(claim) = queue.claim("worker-1").await? {
     queue.renew(claim.attempt()).await?;
-    queue
-        .report_progress(claim.attempt(), &ProgressUpdate::new("pull").with_total(10))
-        .await?;
     queue.complete(claim.attempt(), Some(json!({"ok": true}))).await?;
 }
 ```
 
-The semantics of the store:
-
-| Topic | Behaviour |
-| --- | --- |
-| Idempotency | The same key with the same request returns the existing task, also when it already finished. The same key with a different request is an `IdempotencyConflict`. A request without a key always creates a task. |
-| Claim | Only a ready task is claimed, highest priority first, then the oldest ready one. The claim holds the lease of the task and carries a fresh fencing token. |
-| Addressed claim | `claim_by_id` claims exactly the requested task and never another one. The task must be ready and of the queue, otherwise the call reports `None` and claims nothing. The call bypasses the order of the queue, the decision which task is eligible stays with the caller. `claim_by_id_in` runs in the transaction of the caller. |
-| Lease | The lease expires on the clock of the database. A renewal, a progress report, a completion and a failure need the attempt, its token and an unexpired lease, otherwise the call reports `LeaseLost` and changes nothing. The lease is checked against the clock of the database after the locks of the operation are taken, so a call that waits for a lock cannot use an expired lease. |
-| Recovery | An expired attempt is sealed as interrupted and its task is scheduled again while the budget of the task allows it, otherwise the task fails. An expired attempt of a task that is still pausing or paused is sealed as paused instead and never consumes the failure budget. The recovery is idempotent. |
-| Cancellation | A queued task is cancelled at once, a running task is marked for cancellation. A cancellation that was requested before the completion wins: the task ends as cancelled and its result is discarded. External side effects cannot be undone. A cancellation also wins over a pause request or a parked pause. |
-| Retry | A failure is permanent unless the caller marks it retryable, and a task is only retried again when the caller grants additional attempts with `retry_failed`. The new budget is the effective number of attempts that ran plus the granted attempts, where a parked pause attempt does not count. An unused budget is not granted again and the budget can shrink. The attempt history and the request of the task stay untouched. |
-
-A caller that admits a task itself claims that task by its identifier:
-
-```rust
-if let Some(claim) = queue.claim_by_id(task_id, "worker-1").await? {
-    queue.complete(claim.attempt(), Some(json!({"ok": true}))).await?;
-}
-```
-
-The claim needs the same lease and the same fencing token as every other
-claim, and the caller keeps the decision which task is eligible.
-
-### Queue policies
-
-A policy is stored per namespace and queue, so every instance that opens the
-same queue enforces the same limit:
-
-```rust
-use cloudiful_tasks::QueuePolicy;
-
-queue
-    .set_policy(QueuePolicy {
-        max_concurrent_attempts: Some(1),
-    })
-    .await?;
-
-let policy = queue.policy().await?;
-```
-
-| Topic | Behaviour |
-| --- | --- |
-| Default | A queue without a stored policy is unlimited, which preserves the behavior of every existing queue. |
-| Limit | `Some(n)` accepts a positive supported integer and rejects zero or an out-of-range value. A lower limit applies to future claims and never cancels running attempts. |
-| Capacity | Every claim path counts the running attempts of the queue under the same queue-scoped transaction advisory lock that replaces the policy. An expired running attempt still counts until recovery seals it, and a successful completion, failure, cancellation or recovery frees the capacity by sealing the attempt. |
-| Isolation | Every claim path requires `READ COMMITTED`, whether or not the queue has a stored policy; another isolation level is refused before the policy is read. The lock statement and the count run separately, so a waiting claim counts after it acquired the lock and cannot rely on a snapshot taken before a limit was stored. |
-| Reset | Setting `None` removes the policy and restores the unlimited behavior. |
-
-### Cooperative pause
-
-A pause is scoped to one task, not to the queue. The pause state is independent
-of the task status, so a queued task can be paused while it stays queued:
-
-```rust
-use cloudiful_tasks::TaskPauseState;
-
-let paused = queue.request_pause(task_id).await?;
-if paused.pause_state() == TaskPauseState::Pausing {
-    // A running attempt parks at its next checkpoint.
-}
-// Later, after the attempt parked:
-queue.resume(task_id).await?;
-```
-
-| Topic | Behaviour |
-| --- | --- |
-| Queued task | `request_pause` pauses the task at once without an attempt and preserves its available time. A paused queued task is not claimable by `claim` or `claim_by_id`. |
-| Running task | `request_pause` enters `Pausing` and keeps the lease and heartbeat. The handler persists its checkpoint, observes `TaskContext::pause_requested` and returns `Outcome::Paused`; the worker seals the exact attempt with `park_paused`. |
-| Idempotency | A repeated request or a resume of an already unpaused task changes nothing and does not advance the pause generation. A terminal task refuses both. |
-| Resume | A pausing task stops reporting a pause without revoking its lease; a paused task is queued again, preserving its available time, attempt history and effective failure budget. |
-| Pause generation | Every fresh pause request advances the generation. The attempt captures its generation at claim, so a resume clears the signal and a pause can never stop a resumed task. |
-| Races | A completion or failure that wins the terminal keeps the terminal. A cancellation wins over a request, a park and a pause recovery. A park that races a resume leaves the task claimable. |
-| Budget | `attempt_count` stays the monotonic physical total. `paused_attempts` counts only checkpoint parks, so the effective failure budget is `attempt_count - paused_attempts`. Recovery never leaves an expired paused attempt counted as running. |
+- The same idempotency key with the same request returns the existing task,
+  also when it already finished; a different request with the same key is an
+  `IdempotencyConflict`. A request without a key always creates a task.
+- Only a ready task is claimed, highest priority first. The claim holds the
+  lease and a fresh fencing token; a renewal, a progress report, a completion
+  and a failure need the attempt, its token and an unexpired lease, otherwise
+  the call reports `LeaseLost` and changes nothing.
+- An expired attempt is sealed as interrupted and its task is scheduled again
+  while the budget allows it. Retryable failures are retried automatically within
+  the remaining budget; `retry_failed` manually retries a terminal failed task.
+  A cancellation that was requested before the completion wins.
+- `claim_by_id` claims exactly the requested task. A queue policy, set with
+  `queue.set_policy(QueuePolicy { max_concurrent_attempts: Some(1) })`, limits
+  the running attempts of a queue for every instance that opens it.
 
 ### The worker
 
-A worker claims the tasks of its queue and runs the handlers of their kinds.
 Nothing starts before `run` is called.
 
 ```rust
 use async_trait::async_trait;
-use cloudiful_tasks::{
-    CancellationToken, HandlerError, Outcome, ProgressUpdate, Queue, TaskContext, TaskHandler,
-    TaskKind, Worker, WorkerConfig,
-};
+use cloudiful_tasks::{CancellationToken, HandlerError, Outcome, TaskContext, TaskHandler, TaskKind, Worker, WorkerConfig};
 use serde_json::json;
 
 struct Sync;
@@ -200,58 +117,53 @@ struct Sync;
 #[async_trait]
 impl TaskHandler for Sync {
     async fn handle(&self, context: TaskContext) -> Result<Outcome, HandlerError> {
-        context
-            .progress(&ProgressUpdate::new("sync").with_total(2))
-            .await
-            .map_err(|error| HandlerError::new(error.to_string()))?;
         Ok(Outcome::completed(Some(json!({"synced": true}))))
     }
 }
 
 let config = WorkerConfig::default();
 let queue = Queue::open(pool.clone(), "stock", "k8s", &config).await?;
-let worker = Worker::builder(queue, config)
-    .handler(TaskKind::new("sync")?, Sync)?
-    .build()?;
-
-let shutdown = CancellationToken::new();
-worker.run(shutdown).await?;
+let worker = Worker::builder(queue, config).handler(TaskKind::new("sync")?, Sync)?.build()?;
+worker.run(CancellationToken::new()).await?;
 ```
 
-The semantics of the worker:
+- The number of running handlers is bounded by the configuration. The worker
+  renews the lease of its running attempts and stops a handler whose lease was
+  lost, so such a handler cannot write.
+- A cancelled task stops its handler, a panic fails the task permanently and the
+  worker keeps running. The payload of a task is never printed.
+- `Outcome::ExternallyCompleted` tells the worker that the handler already
+  committed the terminal of its attempt; the worker verifies the attempt, the
+  fencing token and the sealed status before it skips its own terminal write.
+  On shutdown it stops claiming, asks the handlers to stop and waits for the
+  grace period.
 
-| Topic | Behaviour |
-| --- | --- |
-| Start | The worker runs only when `run` is called. Opening a queue or building a worker starts nothing. |
-| Concurrency | The number of running handlers is bounded by the configuration. A free slot takes the next ready task at once. |
-| Heartbeat | The worker renews the lease of its running attempts. The renewal is bounded by the lease that is left. A lost lease, a renewal that did not finish in time or repeated database errors stop the handler and block its write, also while the lease of the database is still live. |
-| Cancellation | The handler observes the token of its attempt. A cancelled task stops its handler. |
-| Pause | The worker polls the pause state of every running attempt by its own task id and generation. The handler observes `TaskContext::pause_requested`, persists its checkpoint and returns `Outcome::Paused`; the worker parks the exact attempt and the task waits for a resume. A pause of one task never stops another task. |
-| Recovery | The worker seals the attempts whose lease expired and schedules their tasks again. |
-| Wake up | The notification of the queue is a hint. The worker also polls, so a lost notification only delays the next task. |
-| A panic | The task fails permanently, the worker keeps running. The payload of the task is never printed. |
-| External terminal | `Outcome::ExternallyCompleted` tells the worker that the handler already committed the terminal of its attempt with `Queue::complete`, `Queue::fail` or `Queue::complete_in`/`fail_in`. The worker verifies the captured attempt id, task, fencing token and a sealed succeeded, failed or cancelled status, then skips its own terminal write. An unsealed signal fails the still owned attempt; a lost lease never touches a newer attempt. |
-| Shutdown | The worker stops claiming, asks its handlers to stop, waits for the grace period and aborts the rest. The aborted handlers are dropped, also when they ignore the cancellation token of their attempt. Their leases stay recoverable, no task is finished with a result the worker did not produce. |
+### Cooperative pause
+
+A pause is scoped to one task and is independent of the task status, so a queued
+task can be paused while it stays queued.
+
+```rust
+let paused = queue.request_pause(task_id).await?;
+if paused.pause_state() == cloudiful_tasks::TaskPauseState::Pausing {
+    // A running attempt parks at its next checkpoint.
+}
+queue.resume(task_id).await?;
+```
+
+A running task keeps its lease while it pauses. The handler observes
+`TaskContext::pause_requested`, persists its checkpoint and returns
+`Outcome::Paused`, and the worker seals the exact attempt with `park_paused`. A
+resume queues the paused task again, keeping its available time, its attempt
+history and its effective failure budget. A pause of one task never stops
+another task.
 
 ### The transaction API
 
 Every mutating operation has a variant that runs inside the transaction of the
-caller, so a business write and the task share one commit:
-
-| Operation | Variant |
-| --- | --- |
-| Enqueue | `enqueue_in` |
-| Claim | `claim_in` |
-| Renew the lease | `renew_in` |
-| Progress report | `report_progress_in` |
-| Complete | `complete_in` |
-| Fail | `fail_in` |
-| Request the cancellation | `request_cancel_in` |
-| Request a pause | `request_pause_in` |
-| Resume a pause | `resume_in` |
-| Park a paused attempt | `park_paused_in` |
-| Manual retry | `retry_failed_in` |
-| Recover the expired leases | `recover_expired_in` |
+caller: `enqueue_in`, `claim_in`, `renew_in`, `report_progress_in`,
+`complete_in`, `fail_in`, `request_cancel_in`, `request_pause_in`, `resume_in`,
+`park_paused_in`, `retry_failed_in` and `recover_expired_in`.
 
 ```rust
 let mut transaction = pool.begin().await?;
@@ -260,31 +172,18 @@ write_business_row(&mut transaction).await?;
 transaction.commit().await?;
 ```
 
-A variant returns the same result as its counterpart that commits on its own
-and never begins, commits or rolls back a transaction. The commit and the
-rollback stay with the caller, so the result of a variant is valid before the
-commit of the caller but not durable until it. `renew_in` and
-`report_progress_in` hold the lock of the attempt until the caller ends the
-transaction, so the lease is checked against the clock of the database after
-the lock was taken.
-
-The transaction must belong to the schema instance of the queue, otherwise the
-call is refused before it writes. A refused operation must not be ignored: roll
-the transaction back, otherwise the business side effects of an attempt that
-lost its lease are committed.
-
-Two examples show both sides of the library:
-
-```sh
-cargo run --example basic
-cargo run --example transactional
-```
+A variant never begins, commits or rolls back a transaction, so its result is
+valid before the commit of the caller but not durable until it. The transaction
+must belong to the schema instance of the queue, otherwise the call is refused
+before it writes. A refused operation must not be ignored: roll the transaction
+back, otherwise the business side effects of an attempt that lost its lease are
+committed.
 
 ## Build
 
-All SQL of the library lives in `sql/*.sql` and is loaded through
-`query_file!` and `query_file_as!`. The query metadata in `.sqlx` is
-committed, so the crate builds without a database:
+All SQL of the library lives in `sql/*.sql` and is loaded through `query_file!`
+and `query_file_as!`. The query metadata in `.sqlx` is committed, so the crate
+builds without a database:
 
 ```sh
 SQLX_OFFLINE=true cargo check --locked --offline --all-targets
@@ -294,16 +193,12 @@ Regenerate the metadata only against the dedicated development database of the
 shared non-production test server:
 
 ```sh
-DATABASE_URL="$CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL" \
-  cargo sqlx prepare -- --all-targets
+DATABASE_URL="$TASKS_TEST_SIBLING_DATABASE_URL" cargo sqlx prepare -- --all-targets
 ```
 
-The live suites read their explicit fixture URLs from
-`CLOUDIFUL_TASKS_TEST_DATABASE_URL` (`cloudiful_tasks_test`) and
-`CLOUDIFUL_TASKS_TEST_SIBLING_DATABASE_URL` (`cloudiful_tasks_dev`). The guard
-checks the effective connection options, the actual database identity and the
-exact dedicated database comment before any fixture reset; a shared project
-database is never accepted.
+The live suites read their fixture URLs from `TASKS_TEST_DATABASE_URL` and
+`TASKS_TEST_SIBLING_DATABASE_URL`. The examples show the library on both sides:
+`cargo run --example basic` and `cargo run --example transactional`.
 
 ## License
 

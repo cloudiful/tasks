@@ -6,25 +6,40 @@
 //! deterministic request specification, not the order of the keys of the
 //! payload.
 
-use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 use sqlx::PgConnection;
 use std::time::Duration;
+use time::format_description::StaticFormatDescription;
+use time::macros::format_description;
+use time::{OffsetDateTime, UtcOffset};
 
 use crate::error::{Error, Result};
 use crate::model::{EnqueueOutcome, EnqueueRequest, Namespace, QueueName, RetryPolicy, TaskId};
 use crate::store;
+
+/// Canonical representation of an availability timestamp in the persisted
+/// request specification.
+///
+/// The representation is the UTC wall clock with exactly six fractional
+/// digits, `YYYY-MM-DDTHH:MM:SS.ffffffZ`. Nanoseconds below the sixth digit
+/// are truncated, the offset of the timestamp is normalized to UTC.
+const AVAILABLE_AT_FORMAT: StaticFormatDescription =
+    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]Z");
 
 /// Builds the deterministic request specification of an enqueue request.
 ///
 /// The specification covers every immutable part of the request. Two requests
 /// with the same specification are the same intent, independent of the order
 /// of the keys of the payload and of the moment the request was made.
-pub fn canonical_request_spec(request: &EnqueueRequest) -> String {
+///
+/// The availability of the request is canonicalized to UTC. A timestamp whose
+/// UTC wall clock lies outside the supported range is refused with an error
+/// instead of a specification that cannot be compared.
+pub fn canonical_request_spec(request: &EnqueueRequest) -> Result<String> {
     let mut spec = serde_json::Map::new();
     spec.insert(
         "available_at".to_owned(),
-        available_at_value(request.available_at()),
+        available_at_value(request.available_at())?,
     );
     spec.insert(
         "kind".to_owned(),
@@ -33,7 +48,8 @@ pub fn canonical_request_spec(request: &EnqueueRequest) -> String {
     spec.insert("payload".to_owned(), canonical_value(request.payload()));
     spec.insert("priority".to_owned(), Value::from(request.priority()));
     spec.insert("retry".to_owned(), retry_value(request.retry_policy()));
-    serde_json::to_string(&Value::Object(spec)).expect("a request specification is serializable")
+    Ok(serde_json::to_string(&Value::Object(spec))
+        .expect("a request specification is serializable"))
 }
 
 /// Enqueues a task and resolves its idempotency key.
@@ -47,7 +63,7 @@ pub(crate) async fn enqueue_task(
     queue: &QueueName,
     request: &EnqueueRequest,
 ) -> Result<EnqueueOutcome> {
-    let spec = canonical_request_spec(request);
+    let spec = canonical_request_spec(request)?;
     let spec_value = serde_json::from_str::<Value>(&spec).map_err(|error| Error::Validation {
         field: "request",
         reason: format!("the request specification is not valid json: {error}"),
@@ -111,10 +127,24 @@ struct IdempotencyMatch {
     spec_matches: Option<bool>,
 }
 
-fn available_at_value(available_at: Option<DateTime<Utc>>) -> Value {
+fn available_at_value(available_at: Option<OffsetDateTime>) -> Result<Value> {
     match available_at {
-        Some(at) => Value::String(at.to_rfc3339_opts(SecondsFormat::Micros, true)),
-        None => Value::Null,
+        Some(at) => {
+            let utc = at
+                .checked_to_offset(UtcOffset::UTC)
+                .ok_or_else(|| Error::Validation {
+                    field: "available_at",
+                    reason: "the timestamp is outside the supported range in UTC".to_owned(),
+                })?;
+            let value = utc
+                .format(AVAILABLE_AT_FORMAT)
+                .map_err(|error| Error::Validation {
+                    field: "available_at",
+                    reason: format!("the timestamp cannot be represented: {error}"),
+                })?;
+            Ok(Value::String(value))
+        }
+        None => Ok(Value::Null),
     }
 }
 
@@ -156,6 +186,11 @@ fn canonical_value(value: &Value) -> Value {
 mod tests {
     use super::*;
     use crate::model::TaskKind;
+    use time::macros::datetime;
+
+    fn availability_value(available_at: OffsetDateTime) -> Value {
+        available_at_value(Some(available_at)).unwrap()
+    }
 
     #[test]
     fn the_specification_ignores_the_order_of_the_payload_keys() {
@@ -164,8 +199,8 @@ mod tests {
         let second = EnqueueRequest::new(kind, serde_json::json!({"b": 2, "a": 1}));
 
         assert_eq!(
-            canonical_request_spec(&first),
-            canonical_request_spec(&second)
+            canonical_request_spec(&first).unwrap(),
+            canonical_request_spec(&second).unwrap()
         );
     }
 
@@ -176,8 +211,65 @@ mod tests {
         let other = EnqueueRequest::new(kind, serde_json::json!({"a": 2}));
 
         assert_ne!(
-            canonical_request_spec(&base),
-            canonical_request_spec(&other)
+            canonical_request_spec(&base).unwrap(),
+            canonical_request_spec(&other).unwrap()
         );
+    }
+
+    #[test]
+    fn the_availability_of_the_specification_has_six_fractional_digits() {
+        assert_eq!(
+            availability_value(datetime!(2024-01-02 03:04:05.123456 UTC)),
+            Value::String("2024-01-02T03:04:05.123456Z".to_owned())
+        );
+        assert_eq!(
+            availability_value(datetime!(2024-01-02 03:04:05 UTC)),
+            Value::String("2024-01-02T03:04:05.000000Z".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_availability_of_the_specification_truncates_below_the_microsecond() {
+        assert_eq!(
+            availability_value(datetime!(2024-01-02 03:04:05.123456789 UTC)),
+            Value::String("2024-01-02T03:04:05.123456Z".to_owned())
+        );
+        assert_eq!(
+            availability_value(datetime!(2024-01-02 03:04:05.999999999 UTC)),
+            Value::String("2024-01-02T03:04:05.999999Z".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_availability_of_the_specification_is_normalized_to_utc() {
+        assert_eq!(
+            availability_value(datetime!(2024-01-02 03:04:05.123456 +02:00)),
+            Value::String("2024-01-02T01:04:05.123456Z".to_owned())
+        );
+        assert_eq!(
+            availability_value(datetime!(2024-01-02 03:04:05.123456 -05:30)),
+            Value::String("2024-01-02T08:34:05.123456Z".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_availability_of_the_specification_covers_the_end_of_the_supported_range() {
+        assert_eq!(
+            availability_value(datetime!(9999-12-31 23:59:59 UTC)),
+            Value::String("9999-12-31T23:59:59.000000Z".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_availability_outside_the_supported_range_is_refused() {
+        let error = available_at_value(Some(datetime!(9999-12-31 23:59:59 -01:00)))
+            .expect_err("the utc wall clock of the timestamp is out of range");
+        assert!(matches!(
+            error,
+            Error::Validation {
+                field: "available_at",
+                ..
+            }
+        ));
     }
 }

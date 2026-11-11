@@ -864,7 +864,7 @@ mod tests {
             fencing_token: FencingToken::new(),
             status: AttemptStatus::Running,
             lease_expires_at: None,
-            started_at: chrono::DateTime::UNIX_EPOCH,
+            started_at: time::OffsetDateTime::UNIX_EPOCH,
             finished_at: None,
             error: None,
             progress: None,
