@@ -461,6 +461,30 @@ where
 mod tests {
     use super::*;
 
+    fn marker(library: &str, protocol_version: i32) -> schema_ownership::Model {
+        schema_ownership::Model {
+            singleton: true,
+            library: library.to_owned(),
+            protocol_version,
+            instance_uuid: Uuid::new_v4(),
+            installed_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    fn ledger_row(version: i64, checksum_bytes: Vec<u8>, success: bool) -> LedgerRow {
+        LedgerRow {
+            version,
+            checksum: checksum_bytes,
+            success,
+        }
+    }
+
+    fn matching_row(index: usize) -> LedgerRow {
+        let migration = &MIGRATIONS[index];
+        ledger_row(migration.version, checksum(migration.sql).to_vec(), true)
+    }
+
     #[test]
     fn lock_key_is_stable_and_database_specific() {
         assert_eq!(
@@ -470,6 +494,135 @@ mod tests {
         assert_ne!(
             migrate_lock_key("cloudiful_tasks_test"),
             migrate_lock_key("cloudiful_tasks_dev")
+        );
+    }
+
+    #[test]
+    fn a_ledger_of_the_current_migrations_is_accepted() {
+        let rows: Vec<LedgerRow> = (0..MIGRATIONS.len()).map(matching_row).collect();
+
+        let versions = verify_ledger_rows(&rows).expect("the ledger must be accepted");
+
+        assert_eq!(
+            versions,
+            MIGRATIONS
+                .iter()
+                .map(|migration| migration.version)
+                .collect::<Vec<i64>>()
+        );
+    }
+
+    #[test]
+    fn a_dirty_ledger_row_is_refused_before_any_other_check() {
+        let known = matching_row(0);
+        let dirty_known = ledger_row(known.version, known.checksum.clone(), false);
+        let error = verify_ledger_rows(&[dirty_known]).expect_err("a dirty row must be refused");
+        assert!(
+            matches!(error, Error::DirtyMigration { version } if version == known.version),
+            "unexpected error: {error}"
+        );
+
+        let unknown = ledger_row(1, vec![0_u8; 48], false);
+        let error = verify_ledger_rows(&[unknown]).expect_err("a dirty row must be refused");
+        assert!(
+            matches!(error, Error::DirtyMigration { .. }),
+            "a dirty row wins over an unknown version: {error}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_applied_migration_is_refused() {
+        let row = ledger_row(1, vec![0_u8; 48], true);
+
+        let error = verify_ledger_rows(&[row]).expect_err("an unknown version must be refused");
+
+        assert!(
+            matches!(error, Error::UnknownAppliedMigration { version } if version == 1),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_drifted_checksum_is_refused() {
+        let migration = &MIGRATIONS[0];
+        let row = ledger_row(migration.version, vec![0_u8; 48], true);
+
+        let error = verify_ledger_rows(&[row]).expect_err("a drifted checksum must be refused");
+
+        assert!(
+            matches!(
+                error,
+                Error::ChecksumMismatch { version } if version == migration.version
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_foreign_ownership_marker_is_refused() {
+        let error = validate_owner(&marker("other-library", PROTOCOL_VERSION))
+            .expect_err("a foreign marker must be refused");
+
+        assert!(
+            matches!(error, Error::ForeignSchema { .. }),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_newer_protocol_is_refused() {
+        let error = validate_owner(&marker(LIBRARY_ID, PROTOCOL_VERSION + 1))
+            .expect_err("a newer protocol must be refused");
+
+        assert!(
+            matches!(
+                error,
+                Error::UnsupportedSchemaVersion { found, supported }
+                    if found == PROTOCOL_VERSION + 1 && supported == PROTOCOL_VERSION
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn an_older_protocol_is_upgraded_but_not_accepted_for_reads() {
+        let older = marker(LIBRARY_ID, PROTOCOL_VERSION - 1);
+
+        assert!(
+            validate_owner(&older).is_ok(),
+            "a migration accepts an owned older protocol"
+        );
+
+        let error = validate_marker(&older).expect_err("a read refuses an older protocol");
+        assert!(
+            matches!(
+                error,
+                Error::OutdatedSchemaVersion { found, supported }
+                    if found == PROTOCOL_VERSION - 1 && supported == PROTOCOL_VERSION
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn the_current_protocol_is_accepted() {
+        let current = marker(LIBRARY_ID, PROTOCOL_VERSION);
+
+        assert!(validate_owner(&current).is_ok());
+        assert!(validate_marker(&current).is_ok());
+    }
+
+    #[test]
+    fn the_checksum_is_the_sha384_of_the_migration_source() {
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+
+        assert_eq!(
+            hex(&checksum(MIGRATIONS[0].sql)),
+            "d873e6151868b365fc1731d089a706f3f4a8289a2cb852e227555bd76bbb4ad0\
+             dc4303bde49ba5b007a8f4e5e15323ec",
+            "the legacy ledger stores the sha384 digest of the migration source"
         );
     }
 }

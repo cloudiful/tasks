@@ -202,9 +202,19 @@ offline:
 cargo check --locked --offline --all-targets
 ```
 
-The live suites read their fixture URLs from `TASKS_TEST_DATABASE_URL` and
-`TASKS_TEST_SIBLING_DATABASE_URL`. The examples show the library on both sides:
+The examples show the library on both sides:
 `cargo run --example basic` and `cargo run --example transactional`.
+
+The test suite is a set of isolated unit tests inside the source modules. It
+needs no database and runs in milliseconds:
+
+```sh
+cargo test --locked --offline
+```
+
+The unit suite does not validate the behavior of PostgreSQL. The schema, the
+SQL statements, the concurrency, the leases, the fencing and the migration
+ledger are not covered by an automated test.
 
 ## License
 
