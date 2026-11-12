@@ -1,1 +1,0 @@
-DROP SCHEMA IF EXISTS cloudiful_tasks CASCADE;

@@ -225,8 +225,16 @@ mod tests {
     #[test]
     fn the_specification_ignores_the_order_of_the_payload_keys() {
         let kind = TaskKind::new("demo").unwrap();
-        let first = EnqueueRequest::new(kind.clone(), serde_json::json!({"a": 1, "b": 2}));
-        let second = EnqueueRequest::new(kind, serde_json::json!({"b": 2, "a": 1}));
+        let first = EnqueueRequest::new(kind.clone(), serde_json::json!({"a": 1, "b": 2}))
+            .with_priority(3)
+            .with_retry_policy(
+                RetryPolicy::new(2, Duration::from_secs(1), Duration::from_secs(5)).unwrap(),
+            );
+        let second = EnqueueRequest::new(kind, serde_json::json!({"b": 2, "a": 1}))
+            .with_priority(3)
+            .with_retry_policy(
+                RetryPolicy::new(2, Duration::from_secs(1), Duration::from_secs(5)).unwrap(),
+            );
 
         assert_eq!(
             canonical_request_spec(&first).unwrap(),
@@ -238,11 +246,29 @@ mod tests {
     fn the_specification_separates_different_requests() {
         let kind = TaskKind::new("demo").unwrap();
         let base = EnqueueRequest::new(kind.clone(), serde_json::json!({"a": 1}));
-        let other = EnqueueRequest::new(kind, serde_json::json!({"a": 2}));
+        let other_payload = EnqueueRequest::new(kind.clone(), serde_json::json!({"a": 2}));
+        let other_priority =
+            EnqueueRequest::new(kind.clone(), serde_json::json!({"a": 1})).with_priority(1);
+        let other_retry = EnqueueRequest::new(kind, serde_json::json!({"a": 1})).with_retry_policy(
+            RetryPolicy::new(2, Duration::from_secs(1), Duration::from_secs(5)).unwrap(),
+        );
 
-        assert_ne!(
-            canonical_request_spec(&base).unwrap(),
-            canonical_request_spec(&other).unwrap()
+        let base_spec = canonical_request_spec(&base).unwrap();
+        assert_ne!(base_spec, canonical_request_spec(&other_payload).unwrap());
+        assert_ne!(base_spec, canonical_request_spec(&other_priority).unwrap());
+        assert_ne!(base_spec, canonical_request_spec(&other_retry).unwrap());
+    }
+
+    #[test]
+    fn the_specification_ignores_the_enqueue_time() {
+        let kind = TaskKind::new("demo").unwrap();
+        let request = EnqueueRequest::new(kind, serde_json::json!({"a": 1}));
+
+        assert!(
+            canonical_request_spec(&request)
+                .unwrap()
+                .contains("\"available_at\":null"),
+            "the specification carries no enqueue time"
         );
     }
 

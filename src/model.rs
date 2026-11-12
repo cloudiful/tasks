@@ -1209,49 +1209,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_spec_ignores_key_order_and_enqueue_time() {
-        let kind = TaskKind::new("demo").unwrap();
-        let first = EnqueueRequest::new(kind.clone(), serde_json::json!({"b": 2, "a": 1}))
-            .with_priority(3)
-            .with_retry_policy(
-                RetryPolicy::new(2, Duration::from_secs(1), Duration::from_secs(5)).unwrap(),
-            );
-        let second = EnqueueRequest::new(kind, serde_json::json!({"a": 1, "b": 2}))
-            .with_priority(3)
-            .with_retry_policy(
-                RetryPolicy::new(2, Duration::from_secs(1), Duration::from_secs(5)).unwrap(),
-            );
-
-        assert_eq!(
-            canonical_request_spec(&first).unwrap(),
-            canonical_request_spec(&second).unwrap()
-        );
-        assert!(
-            canonical_request_spec(&first)
-                .unwrap()
-                .contains("\"available_at\":null")
-        );
-    }
-
-    #[test]
-    fn canonical_spec_separates_different_requests() {
-        let kind = TaskKind::new("demo").unwrap();
-        let base = EnqueueRequest::new(kind.clone(), serde_json::json!({"a": 1}));
-        let other_payload = EnqueueRequest::new(kind.clone(), serde_json::json!({"a": 2}));
-        let other_priority =
-            EnqueueRequest::new(kind, serde_json::json!({"a": 1})).with_priority(1);
-
-        assert_ne!(
-            canonical_request_spec(&base).unwrap(),
-            canonical_request_spec(&other_payload).unwrap()
-        );
-        assert_ne!(
-            canonical_request_spec(&base).unwrap(),
-            canonical_request_spec(&other_priority).unwrap()
-        );
-    }
-
-    #[test]
     fn idempotency_key_is_validated() {
         let request = EnqueueRequest::new(TaskKind::new("demo").unwrap(), Value::Null);
         assert!(request.clone().with_idempotency_key("").is_err());

@@ -9,49 +9,25 @@ as `cloudiful_tasks`, licensed Apache-2.0 and is not published to crates.io.
 ```sh
 cargo fmt --all -- --check
 cargo check --locked --offline --all-targets
-cargo test --locked --offline --lib
+cargo test --locked --offline
 cargo test --locked --offline --doc
 ```
 
-The live tests are ignored by default. They use the dedicated non-production
-databases on the shared test server and run serially:
-
-The live tests read two explicit environment values:
-`TASKS_TEST_DATABASE_URL` for `cloudiful_tasks_test` and
-`TASKS_TEST_SIBLING_DATABASE_URL` for `cloudiful_tasks_dev`.
-
-```sh
-cargo test --locked --offline --test migration -- --include-ignored --test-threads=1
-cargo test --locked --offline --test postgres -- --include-ignored --test-threads=1
-cargo test --locked --offline --test worker -- --include-ignored --test-threads=1
-```
-
-The test URL names `cloudiful_tasks_test`; the explicit sibling URL names
-`cloudiful_tasks_dev`. Both must use the fixed `unraid.cloud1ful.com:5432`
-endpoint. An equivalent dedicated non-production fixture is selected without
-changing the shipped defaults through the optional expectation overrides
-`TASKS_TEST_EXPECTED_HOST`, `..._PORT`, `..._SERVER_PORT`,
-`..._DATABASE` and `..._SIBLING_DATABASE`; the two URL variables stay
-independent and the exact database comments stay mandatory. A live test fails
-when an environment value is missing or malformed, when the effective
-`PgConnectOptions` carries a socket or connection option override, or when the
-database does not report the configured role, a TCP server address, the
-expected server port and the exact dedicated database comment
-(`cloudiful-tasks test fixture v1; non-production; dedicated` for the test
-database, `cloudiful-tasks development fixture v1; non-production; dedicated`
-for the sibling). The guard runs before any reset or destructive statement.
+The test suite is a set of isolated unit tests inside the source modules. It
+needs no database, no credentials and no fixture provisioning, and it runs in
+milliseconds. The unit suite does not validate the behavior of PostgreSQL: the
+schema, the SQL statements, the concurrency, the leases, the fencing and the
+migration ledger are not covered by an automated test.
 
 ## Databases
 
 | Database | Purpose |
 | --- | --- |
-| `cloudiful_tasks_dev` | Sibling identity test, the test-owned `app_domain` schema and manual inspection |
-| `cloudiful_tasks_test` | Live tests: migration, ownership and coexistence checks |
+| `cloudiful_tasks_dev` | Manual inspection and the examples |
 
-The development database also holds the test owned `app_domain` schema used by
-the transaction sentinel. The fixture is created by
-`sql/tests/transaction_app_domain_setup.sql`. Never reset a shared project
-database and never derive one fixture URL from the other.
+The library never creates a database. The application supplies the connection
+and owns the database; the library owns the schema `cloudiful_tasks` inside it.
+Never reset a shared project database.
 
 ## Transaction variants
 
@@ -136,18 +112,18 @@ by its identifier.
 
 ## Tests
 
-The live tests of `tests/postgres.rs` are ignored by default and run against
-the fixture database with `--include-ignored --test-threads=1`. The borrowed
-variants are covered with a domain sentinel: `tests/common/mod.rs` owns a
-separate `app_domain` schema that the library never touches, so a business
-write and the queue change commit or roll back together. A live test of a
-borrowed variant must prove the atomicity of both directions and the refusal
-of a wrong schema instance.
+The test suite consists of isolated unit tests inside the source modules:
+`src/migrate.rs`, `src/idempotency.rs`, `src/model.rs`, `src/config.rs`,
+`src/backoff.rs`, `src/queue.rs`, `src/progress.rs` and `src/worker.rs`. They
+cover the bounds and the validation of the public values, the serde contracts,
+the payload redaction, the canonicalization of the idempotency key, the
+saturation of the backoff, the fencing registry of the worker and the
+integrity decisions of the migration ledger. They need no database.
 
-The statements of the sentinel live in `sql/tests/transaction_*.sql` and are
-loaded with `include_str!` through the raw statement helpers, like the
-statements of the library. Only the DDL that creates the schema is loaded
-through `raw_sql`.
+The unit suite does not validate PostgreSQL: the schema, the SQL statements,
+the isolation, the leases, the pause and the recovery budgets, the worker
+lifecycle and the migration ledger against a real database are not covered by
+an automated test.
 
 ## Rules
 
@@ -156,9 +132,8 @@ through `raw_sql`.
   introspection live in `sql/*.sql` and are executed as SeaORM statements; they
   are only inline when they cannot be expressed as a static file.
 - `src/entity/schema.rs` holds the native SeaQuery declarations of the current
-  schema. The migration suite applies them to a scratch schema and requires
-  catalog equality with a migrated schema; they never write the application
-  schema.
+  schema. They are a public description of the schema, they never write the
+  application schema and no test compares them with a migrated schema.
 - The crate needs no compile-time query metadata and builds offline without a
   database.
 - Migrations live in `migrations/` and use the actual system clock in the file

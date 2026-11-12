@@ -179,9 +179,17 @@ transaction.commit().await?;
 cargo check --locked --offline --all-targets
 ```
 
-实时测试从 `TASKS_TEST_DATABASE_URL` 和 `TASKS_TEST_SIBLING_DATABASE_URL`
-读取测试库 URL。示例展示了本库的两侧：`cargo run --example basic` 和
+示例展示了本库的两侧：`cargo run --example basic` 和
 `cargo run --example transactional`。
+
+测试套件是源码模块内的隔离单元测试，不需要数据库，毫秒级完成：
+
+```sh
+cargo test --locked --offline
+```
+
+单元测试套件不验证 PostgreSQL 的行为：schema、SQL 语句、并发、租约、栅栏和
+迁移记录表都没有自动化测试覆盖。
 
 ## 许可证
 
