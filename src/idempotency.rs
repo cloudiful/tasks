@@ -6,13 +6,18 @@
 //! deterministic request specification, not the order of the keys of the
 //! payload.
 
+use sea_orm::sea_query::OnConflict;
+use sea_orm::{
+    ActiveValue::{NotSet, Set},
+    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter,
+};
 use serde_json::Value;
-use sqlx::PgConnection;
 use std::time::Duration;
 use time::format_description::StaticFormatDescription;
 use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
 
+use crate::entity::task as task_entity;
 use crate::error::{Error, Result};
 use crate::model::{EnqueueOutcome, EnqueueRequest, Namespace, QueueName, RetryPolicy, TaskId};
 use crate::store;
@@ -57,8 +62,8 @@ pub fn canonical_request_spec(request: &EnqueueRequest) -> Result<String> {
 /// The insert and the wake up notification belong to the transaction of the
 /// caller, so the notification is only delivered when that transaction
 /// commits.
-pub(crate) async fn enqueue_task(
-    connection: &mut PgConnection,
+pub(crate) async fn enqueue_task<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     request: &EnqueueRequest,
@@ -69,62 +74,87 @@ pub(crate) async fn enqueue_task(
         reason: format!("the request specification is not valid json: {error}"),
     })?;
     let task_id = TaskId::new();
-    let inserted = sqlx::query_file!(
-        "sql/store_enqueue.sql",
-        task_id.as_uuid(),
-        namespace.as_str(),
-        queue.as_str(),
-        request.kind().as_str(),
-        request.payload().clone(),
-        request.priority(),
-        request.available_at(),
-        request.idempotency_key().map(str::to_owned),
+    let mut insert = task_entity::Entity::insert(active_task(
+        task_id,
+        namespace,
+        queue,
+        request,
         spec_value.clone(),
-        i32::try_from(request.retry_policy().max_attempts()).unwrap_or(i32::MAX),
-        duration_nanos(request.retry_policy().initial_delay()),
-        duration_nanos(request.retry_policy().max_delay()),
-    )
-    .fetch_optional(&mut *connection)
-    .await?;
-
-    if let Some(row) = inserted {
-        let task = store::task_by_id(connection, namespace, queue, TaskId::from_uuid(row.id))
-            .await?
-            .ok_or(Error::NotFound)?;
-        store::notify_ready(connection).await?;
-        return Ok(EnqueueOutcome::Created(task));
+    ));
+    if request.idempotency_key().is_some() {
+        insert = insert.on_conflict(
+            OnConflict::columns([
+                task_entity::Column::Namespace,
+                task_entity::Column::Queue,
+                task_entity::Column::IdempotencyKey,
+            ])
+            .target_cond_where(task_entity::Column::IdempotencyKey.is_not_null())
+            .do_nothing()
+            .to_owned(),
+        );
     }
 
-    let key = request
-        .idempotency_key()
-        .ok_or(Error::NotFound)
-        .map(str::to_owned)?;
-    let existing = sqlx::query_file_as!(
-        IdempotencyMatch,
-        "sql/store_idempotency_match.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        key.clone(),
-        spec_value,
-    )
-    .fetch_optional(&mut *connection)
-    .await?
-    .ok_or(Error::NotFound)?;
+    match insert.exec_with_returning(connection).await {
+        Ok(task) => {
+            let task = store::task_from_model(task)?;
+            store::notify_ready(connection).await?;
+            return Ok(EnqueueOutcome::Created(task));
+        }
+        Err(DbErr::RecordNotFound(_) | DbErr::RecordNotInserted) => {}
+        Err(error) => return Err(error.into()),
+    }
 
-    if !existing.spec_matches.unwrap_or(false) {
+    let key = request.idempotency_key().ok_or(Error::NotFound)?.to_owned();
+    let existing = task_entity::Entity::find()
+        .filter(task_entity::Column::Namespace.eq(namespace.as_str()))
+        .filter(task_entity::Column::Queue.eq(queue.as_str()))
+        .filter(task_entity::Column::IdempotencyKey.eq(key.as_str()))
+        .one(connection)
+        .await?
+        .ok_or(Error::NotFound)?;
+
+    if existing.request_spec != spec_value {
         return Err(Error::IdempotencyConflict { key });
     }
 
-    let task = store::task_by_id(connection, namespace, queue, TaskId::from_uuid(existing.id))
-        .await?
-        .ok_or(Error::NotFound)?;
-    Ok(EnqueueOutcome::Existing(task))
+    Ok(EnqueueOutcome::Existing(store::task_from_model(existing)?))
 }
 
-#[derive(sqlx::FromRow)]
-struct IdempotencyMatch {
-    id: uuid::Uuid,
-    spec_matches: Option<bool>,
+fn active_task(
+    task_id: TaskId,
+    namespace: &Namespace,
+    queue: &QueueName,
+    request: &EnqueueRequest,
+    spec: Value,
+) -> task_entity::ActiveModel {
+    task_entity::ActiveModel {
+        id: Set(task_id.as_uuid()),
+        namespace: Set(namespace.as_str().to_owned()),
+        queue: Set(queue.as_str().to_owned()),
+        kind: Set(request.kind().as_str().to_owned()),
+        payload: Set(request.payload().clone()),
+        result: Set(None),
+        status: Set("queued".to_owned()),
+        priority: Set(request.priority()),
+        available_at: match request.available_at() {
+            Some(available_at) => Set(available_at),
+            None => NotSet,
+        },
+        created_at: NotSet,
+        updated_at: NotSet,
+        idempotency_key: Set(request.idempotency_key().map(str::to_owned)),
+        request_spec: Set(spec),
+        attempt_count: NotSet,
+        max_attempts: Set(i32::try_from(request.retry_policy().max_attempts()).unwrap_or(i32::MAX)),
+        retry_initial_delay_ns: Set(duration_nanos(request.retry_policy().initial_delay())),
+        retry_max_delay_ns: Set(duration_nanos(request.retry_policy().max_delay())),
+        cancel_requested_at: NotSet,
+        finished_at: NotSet,
+        terminal_reason: NotSet,
+        pause_state: NotSet,
+        pause_generation: NotSet,
+        paused_attempts: NotSet,
+    }
 }
 
 fn available_at_value(available_at: Option<OffsetDateTime>) -> Result<Value> {

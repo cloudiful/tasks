@@ -7,12 +7,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::PgPool;
-use sqlx::postgres::PgListener;
+use sea_orm::DatabaseConnection;
+use sea_orm::sqlx::postgres::PgListener;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// The channel that wakes the workers.
 pub const WAKE_CHANNEL: &str = "cloudiful_tasks_ready";
@@ -48,13 +48,13 @@ impl Wakeup {
 /// The listener reconnects when its session breaks. A lost notification only
 /// delays the next claim, the polling of the queue covers the gap.
 pub struct WakeListener {
-    pool: PgPool,
+    db: DatabaseConnection,
 }
 
 impl WakeListener {
-    /// Builds a listener over a pool.
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    /// Builds a listener over a database connection.
+    pub fn new(db: DatabaseConnection) -> Self {
+        Self { db }
     }
 
     /// Listens until the shutdown is requested.
@@ -74,16 +74,27 @@ impl WakeListener {
     }
 
     async fn listen_once(&self, wakeup: &Wakeup, shutdown: &CancellationToken) -> Result<()> {
-        let mut listener = PgListener::connect_with(&self.pool).await?;
-        listener.listen(WAKE_CHANNEL).await?;
+        let mut listener = PgListener::connect_with(self.db.get_postgres_connection_pool())
+            .await
+            .map_err(listener_error)?;
+        listener
+            .listen(WAKE_CHANNEL)
+            .await
+            .map_err(listener_error)?;
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
                 notification = listener.recv() => {
-                    notification?;
+                    notification.map_err(listener_error)?;
                     wakeup.wake();
                 }
             }
         }
     }
+}
+
+fn listener_error(error: sea_orm::sqlx::Error) -> Error {
+    Error::Database(sea_orm::DbErr::Conn(sea_orm::RuntimeErr::SqlxError(
+        std::sync::Arc::new(error),
+    )))
 }

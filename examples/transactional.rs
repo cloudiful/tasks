@@ -10,36 +10,37 @@
 //! ```
 
 use cloudiful_tasks::{EnqueueRequest, Queue, TaskKind, WorkerConfig, check_schema};
+use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement, TransactionTrait};
 use serde_json::json;
-use sqlx::postgres::PgPoolOptions;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("DATABASE_URL")?;
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
-        .await?;
+    let mut options = ConnectOptions::new(database_url);
+    options.max_connections(5);
+    let db = Database::connect(options).await?;
 
-    let schema = check_schema(&pool).await?;
+    let schema = check_schema(&db).await?;
     println!("schema instance {}", schema.instance_uuid());
 
     // The table of the application, the library never writes to it.
-    sqlx::raw_sql(
+    db.execute_unprepared(
         "CREATE TABLE IF NOT EXISTS public.example_orders (id uuid PRIMARY KEY, state text NOT NULL)",
     )
-    .execute(&pool)
     .await?;
 
-    let queue = Queue::open(pool.clone(), "stock", "k8s", &WorkerConfig::default()).await?;
+    let queue = Queue::open(db.clone(), "stock", "k8s", &WorkerConfig::default()).await?;
 
     // The business write and the task are committed together. When the
     // transaction rolls back, neither of them is durable.
     let order_id = uuid::Uuid::new_v4();
-    let mut transaction = pool.begin().await?;
-    sqlx::query("INSERT INTO public.example_orders (id, state) VALUES ($1, 'new')")
-        .bind(order_id)
-        .execute(&mut *transaction)
+    let mut transaction = db.begin().await?;
+    transaction
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO public.example_orders (id, state) VALUES ($1, 'new')",
+            [order_id.into()],
+        ))
         .await?;
     queue
         .enqueue_in(

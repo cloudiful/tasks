@@ -11,7 +11,6 @@ cargo fmt --all -- --check
 cargo check --locked --offline --all-targets
 cargo test --locked --offline --lib
 cargo test --locked --offline --doc
-SQLX_OFFLINE=true cargo check --locked --offline --all-targets
 ```
 
 The live tests are ignored by default. They use the dedicated non-production
@@ -46,25 +45,18 @@ for the sibling). The guard runs before any reset or destructive statement.
 
 | Database | Purpose |
 | --- | --- |
-| `cloudiful_tasks_dev` | Query metadata for `cargo sqlx prepare`, the compile time check of the query macros, and the sibling identity test |
+| `cloudiful_tasks_dev` | Sibling identity test, the test-owned `app_domain` schema and manual inspection |
 | `cloudiful_tasks_test` | Live tests: migration, ownership and coexistence checks |
 
-Only the development database is used to regenerate the query metadata:
-
-```sh
-DATABASE_URL="$TASKS_TEST_SIBLING_DATABASE_URL" \
-  cargo sqlx prepare -- --all-targets
-```
-
-The development database also holds the test owned `app_domain` schema, so the
-query macros of the test statements can be described. The fixture is created by
+The development database also holds the test owned `app_domain` schema used by
+the transaction sentinel. The fixture is created by
 `sql/tests/transaction_app_domain_setup.sql`. Never reset a shared project
 database and never derive one fixture URL from the other.
 
 ## Transaction variants
 
 Every mutating queue operation has a variant that takes
-`&mut sqlx::Transaction<'_, sqlx::Postgres>`: `enqueue_in`, `claim_in`,
+`&mut sea_orm::DatabaseTransaction`: `enqueue_in`, `claim_in`,
 `renew_in`, `report_progress_in`, `complete_in`, `fail_in`,
 `request_cancel_in`, `request_pause_in`, `resume_in`, `park_paused_in`,
 `retry_failed_in` and `recover_expired_in`.
@@ -75,8 +67,8 @@ Every mutating queue operation has a variant that takes
   the commit and the rollback, so a refused operation must roll the transaction
   back.
 - A variant shares its implementation with its self-committing counterpart
-  through a private `*_on(&mut PgConnection, ...)` helper in `src/queue.rs`, so
-  the two cannot diverge in result, error or bounds.
+  through a private `*_on<C: ConnectionTrait>(&self, &C, ...)` helper in
+  `src/queue.rs`, so the two cannot diverge in result, error or bounds.
 - The result of a variant is valid before the commit of the caller but not
   durable until it.
 
@@ -153,17 +145,22 @@ borrowed variant must prove the atomicity of both directions and the refusal
 of a wrong schema instance.
 
 The statements of the sentinel live in `sql/tests/transaction_*.sql` and are
-loaded with `query_file!` and `query_file_scalar!`, so they are checked like
-the statements of the library. Only the DDL that creates the schema is loaded
+loaded with `include_str!` through the raw statement helpers, like the
+statements of the library. Only the DDL that creates the schema is loaded
 through `raw_sql`.
 
 ## Rules
 
-- Every statement of the library lives in `sql/*.sql` and is loaded with
-  `query_file!` or `query_file_as!`. Inline SQL is only allowed for statements
-  that cannot be expressed as a static file.
-- The query metadata in `.sqlx` is committed, so the crate builds with
-  `SQLX_OFFLINE=true` and without `DATABASE_URL`.
+- Ordinary persistence uses the private SeaORM entities in `src/entity/`.
+  Concurrency-critical statements, guarded transitions, migrations and
+  introspection live in `sql/*.sql` and are executed as SeaORM statements; they
+  are only inline when they cannot be expressed as a static file.
+- `src/entity/schema.rs` holds the native SeaQuery declarations of the current
+  schema. The migration suite applies them to a scratch schema and requires
+  catalog equality with a migrated schema; they never write the application
+  schema.
+- The crate needs no compile-time query metadata and builds offline without a
+  database.
 - Migrations live in `migrations/` and use the actual system clock in the file
   name, `YYYYMMDDHHMMSS_lower_snake_case.sql`. An applied migration is never
   edited or renamed; a change is a new migration.
@@ -174,6 +171,8 @@ through `raw_sql`.
   worker never touches the schema.
 - A schema without the ownership marker of the library is refused, never
   adopted.
+- A ledger row with `success = false` is dirty and is refused before any
+  pending migration; an unsuccessful migration is never retried.
 - The payload of a task is opaque data of the caller. The library never
   interprets it and never logs it.
 - The worker runs only when `run` is called. Nothing starts in the background

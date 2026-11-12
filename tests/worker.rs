@@ -15,12 +15,13 @@ use cloudiful_tasks::{
     ProgressUpdate, Queue, TaskContext, TaskHandler, TaskKind, TaskPauseState, TaskStatus, Worker,
     WorkerConfig,
 };
+use sea_orm::{ConnectionTrait, DatabaseConnection, TransactionTrait};
 use serde_json::json;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use common::{attempt_count, connect, open_queue, reset, task_count};
+use common::{attempt_count, connect, fetch_scalar, open_queue, reset, statement, task_count};
 
 const NAMESPACE: &str = "ns";
 const QUEUE: &str = "q";
@@ -365,7 +366,7 @@ impl TaskHandler for ExternalCancellation {
 
 /// A handler that reports an external terminal while a newer attempt is sealed.
 struct NewerTerminal {
-    pool: sqlx::PgPool,
+    pool: DatabaseConnection,
     recorder: Recorder,
 }
 
@@ -373,20 +374,20 @@ struct NewerTerminal {
 impl TaskHandler for NewerTerminal {
     async fn handle(&self, context: TaskContext) -> Result<Outcome, HandlerError> {
         self.recorder.handled(context.task_id().as_uuid());
-        sqlx::query(
-            "INSERT INTO cloudiful_tasks.attempts (
-                 id, task_id, attempt_number, worker_id, fencing_token,
-                 status, lease_expires_at, started_at, finished_at
-             )
-             VALUES (
-                 gen_random_uuid(), $1, 2, 'newer-worker', gen_random_uuid(),
-                 'succeeded', NULL, now(), now()
-             )",
-        )
-        .bind(context.task_id().as_uuid())
-        .execute(&self.pool)
-        .await
-        .map_err(|error| HandlerError::new(error.to_string()))?;
+        self.pool
+            .execute_raw(statement(
+                "INSERT INTO cloudiful_tasks.attempts (
+                     id, task_id, attempt_number, worker_id, fencing_token,
+                     status, lease_expires_at, started_at, finished_at
+                 )
+                 VALUES (
+                     gen_random_uuid(), $1, 2, 'newer-worker', gen_random_uuid(),
+                     'succeeded', NULL, now(), now()
+                 )",
+                vec![context.task_id().as_uuid().into()],
+            ))
+            .await
+            .map_err(|error| HandlerError::new(error.to_string()))?;
         Ok(Outcome::ExternallyCompleted)
     }
 }
@@ -434,7 +435,7 @@ impl TaskHandler for SealedContinuation {
             _ => {
                 let mut tx = self
                     .queue
-                    .pool()
+                    .connection()
                     .begin()
                     .await
                     .map_err(|e| HandlerError::new(e.to_string()))?;
@@ -788,11 +789,13 @@ async fn the_heartbeat_keeps_the_lease_during_long_work() {
     let (shutdown, handle) = start(worker);
 
     recorder.wait_for_handled(1).await;
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let stored = wait_for_task(&queue, task.task().id(), |task| {
+        task.status() == TaskStatus::Succeeded
+    })
+    .await;
     shutdown.cancel();
     handle.await.unwrap().unwrap();
 
-    let stored = queue.get(task.task().id()).await.unwrap().unwrap();
     assert_eq!(
         stored.status(),
         TaskStatus::Succeeded,
@@ -816,11 +819,7 @@ async fn repeated_renewal_failures_revoke_the_authority_of_the_attempt() {
     let recorder = Recorder::default();
 
     // The worker uses its own pool, so that the test can break it.
-    let worker_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect_with(common::test_database_options())
-        .await
-        .unwrap();
+    let worker_pool = common::connect_worker_with(4).await;
     let config = WorkerConfig {
         lease_ttl: Duration::from_secs(10),
         heartbeat_interval: Duration::from_millis(50),
@@ -845,7 +844,7 @@ async fn repeated_renewal_failures_revoke_the_authority_of_the_attempt() {
 
     recorder.wait_for_handled(1).await;
     // The database of the worker breaks, its renewals fail.
-    worker_pool.close().await;
+    let _ = worker_pool.close().await;
     // The worker gives up its authority and drops the handler.
     recorder.wait_for_dropped().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -943,17 +942,21 @@ async fn a_locked_attempt_bounds_the_renewal_and_drops_the_handler() {
 
     // Another transaction holds the lock of the attempt, the renewal of the
     // worker waits for it.
-    let attempt_id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM cloudiful_tasks.attempts WHERE task_id = $1 ORDER BY attempt_number DESC",
+    let attempt_id = fetch_scalar::<Uuid>(
+        &pool,
+        statement(
+            "SELECT id FROM cloudiful_tasks.attempts WHERE task_id = $1 ORDER BY attempt_number DESC",
+            vec![task.task().id().as_uuid().into()],
+        ),
     )
-    .bind(task.task().id().as_uuid())
-    .fetch_one(&pool)
     .await
     .unwrap();
-    let mut blocker = pool.begin().await.unwrap();
-    sqlx::query("SELECT id FROM cloudiful_tasks.attempts WHERE id = $1 FOR UPDATE")
-        .bind(attempt_id)
-        .fetch_one(&mut *blocker)
+    let blocker = pool.begin().await.unwrap();
+    blocker
+        .execute_raw(statement(
+            "SELECT id FROM cloudiful_tasks.attempts WHERE id = $1 FOR UPDATE",
+            vec![attempt_id.into()],
+        ))
         .await
         .unwrap();
 
@@ -983,11 +986,7 @@ async fn a_busy_pool_bounds_the_renewal_and_drops_the_handler() {
     let recorder = Recorder::default();
 
     // The worker uses its own pool, so that the test can starve it.
-    let worker_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect_with(common::test_database_options())
-        .await
-        .unwrap();
+    let worker_pool = common::connect_worker_with(4).await;
     let config = WorkerConfig {
         lease_ttl: Duration::from_millis(400),
         heartbeat_interval: Duration::from_millis(50),
@@ -1015,7 +1014,7 @@ async fn a_busy_pool_bounds_the_renewal_and_drops_the_handler() {
     // The connections of the worker are busy, its renewal waits for one.
     let mut busy = Vec::new();
     while let Ok(Ok(connection)) =
-        tokio::time::timeout(Duration::from_millis(200), worker_pool.acquire()).await
+        tokio::time::timeout(Duration::from_millis(200), worker_pool.begin()).await
     {
         busy.push(connection);
     }
@@ -1361,11 +1360,7 @@ async fn the_deadline_of_an_attempt_is_enforced_while_another_renewal_is_blocked
 
     // The worker uses its own pool, so that the test can hold the locks of the
     // attempts without starving it.
-    let worker_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(6)
-        .connect_with(common::test_database_options())
-        .await
-        .unwrap();
+    let worker_pool = common::connect_worker_with(6).await;
     let config = WorkerConfig {
         concurrency: 2,
         lease_ttl: Duration::from_millis(1000),
@@ -1401,18 +1396,22 @@ async fn the_deadline_of_an_attempt_is_enforced_while_another_renewal_is_blocked
 
     // Both attempts wait for a lock, the renewal of an attempt does not renew
     // the other one.
-    let mut blocker = pool.begin().await.unwrap();
+    let blocker = pool.begin().await.unwrap();
     for task_id in [first.task().id(), second.task().id()] {
-        let attempt_id: Uuid = sqlx::query_scalar(
-            "SELECT id FROM cloudiful_tasks.attempts WHERE task_id = $1 ORDER BY attempt_number DESC LIMIT 1",
+        let attempt_id: Uuid = fetch_scalar(
+            &pool,
+            statement(
+                "SELECT id FROM cloudiful_tasks.attempts WHERE task_id = $1 ORDER BY attempt_number DESC LIMIT 1",
+                vec![task_id.as_uuid().into()],
+            ),
         )
-        .bind(task_id.as_uuid())
-        .fetch_one(&pool)
         .await
         .unwrap();
-        sqlx::query("SELECT id FROM cloudiful_tasks.attempts WHERE id = $1 FOR UPDATE")
-            .bind(attempt_id)
-            .fetch_one(&mut *blocker)
+        blocker
+            .execute_raw(statement(
+                "SELECT id FROM cloudiful_tasks.attempts WHERE id = $1 FOR UPDATE",
+                vec![attempt_id.into()],
+            ))
             .await
             .expect("the attempt must be lockable");
     }
@@ -1487,11 +1486,7 @@ async fn a_pending_claim_does_not_defer_the_shutdown() {
 
     // The worker uses its own pool, the test holds every connection of it, so
     // that the claim of the worker waits for a connection.
-    let worker_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect_with(common::test_database_options())
-        .await
-        .unwrap();
+    let worker_pool = common::connect_worker_with(2).await;
     let config = WorkerConfig {
         concurrency: 1,
         lease_ttl: Duration::from_secs(10),
@@ -1507,7 +1502,7 @@ async fn a_pending_claim_does_not_defer_the_shutdown() {
         .unwrap();
     let mut busy = Vec::new();
     for _ in 0..2 {
-        busy.push(worker_pool.acquire().await.unwrap());
+        busy.push(worker_pool.begin().await.unwrap());
     }
     let worker = Worker::builder(worker_queue, config)
         .handler(
@@ -1562,11 +1557,7 @@ async fn the_shutdown_signals_the_running_handlers_while_the_pool_is_busy() {
 
     // The worker uses its own pool, the test holds its connections, so that
     // the claim of the worker waits for a connection.
-    let worker_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect_with(common::test_database_options())
-        .await
-        .unwrap();
+    let worker_pool = common::connect_worker_with(4).await;
     let config = WorkerConfig {
         concurrency: 1,
         lease_ttl: Duration::from_secs(10),
@@ -1599,7 +1590,7 @@ async fn the_shutdown_signals_the_running_handlers_while_the_pool_is_busy() {
     // The connections of the worker are busy, its claim waits for one.
     let mut busy = Vec::new();
     while let Ok(Ok(connection)) =
-        tokio::time::timeout(Duration::from_millis(200), worker_pool.acquire()).await
+        tokio::time::timeout(Duration::from_millis(200), worker_pool.begin()).await
     {
         busy.push(connection);
     }
@@ -1850,31 +1841,39 @@ async fn external_paused_seal_is_accepted_by_worker() {
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].status(), AttemptStatus::Paused);
     let attempt = &attempts[0];
-    let sealed = sqlx::query_file_scalar!(
-        "sql/store_attempt_sealed.sql",
-        NAMESPACE,
-        QUEUE,
-        attempt.task_id().as_uuid(),
-        attempt.id().as_uuid(),
-        attempt.fencing_token().as_uuid()
+    let sealed = fetch_scalar::<bool>(
+        &pool,
+        statement(
+            include_str!("../sql/store_attempt_sealed.sql"),
+            vec![
+                NAMESPACE.into(),
+                QUEUE.into(),
+                attempt.task_id().as_uuid().into(),
+                attempt.id().as_uuid().into(),
+                attempt.fencing_token().as_uuid().into(),
+            ],
+        ),
     )
-    .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(sealed, Some(true));
+    assert!(sealed);
     let wrong_token = uuid::Uuid::new_v4();
-    let other = sqlx::query_file_scalar!(
-        "sql/store_attempt_sealed.sql",
-        NAMESPACE,
-        QUEUE,
-        attempt.task_id().as_uuid(),
-        attempt.id().as_uuid(),
-        wrong_token
+    let other = fetch_scalar::<bool>(
+        &pool,
+        statement(
+            include_str!("../sql/store_attempt_sealed.sql"),
+            vec![
+                NAMESPACE.into(),
+                QUEUE.into(),
+                attempt.task_id().as_uuid().into(),
+                attempt.id().as_uuid().into(),
+                wrong_token.into(),
+            ],
+        ),
     )
-    .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(other, Some(false));
+    assert!(!other);
     let second = queue.enqueue(request()).await.unwrap();
     recorder.wait_for_handled(2).await;
     let second_parked = wait_for_task(&queue, second.task().id(), |task| {

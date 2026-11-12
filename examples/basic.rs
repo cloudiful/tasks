@@ -16,8 +16,8 @@ use cloudiful_tasks::{
     CancellationToken, HandlerError, Outcome, ProgressUpdate, Queue, TaskContext, TaskHandler,
     TaskKind, Worker, WorkerConfig,
 };
+use sea_orm::{ConnectOptions, Database};
 use serde_json::json;
-use sqlx::postgres::PgPoolOptions;
 
 /// The handler of the kind `sync`.
 struct Sync;
@@ -47,13 +47,12 @@ impl TaskHandler for Sync {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("DATABASE_URL")?;
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&database_url)
-        .await?;
+    let mut options = ConnectOptions::new(database_url);
+    options.max_connections(10);
+    let db = Database::connect(options).await?;
 
     let config = WorkerConfig::default();
-    let queue = Queue::open(pool.clone(), "stock", "k8s", &config).await?;
+    let queue = Queue::open(db.clone(), "stock", "k8s", &config).await?;
     let worker = Worker::builder(queue, config)
         .handler(TaskKind::new("sync")?, Sync)?
         .build()?;

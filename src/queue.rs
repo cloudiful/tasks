@@ -7,8 +7,8 @@
 //! Opening a queue never creates or alters the schema. The schema must be
 //! owned by the library, otherwise the queue refuses to open.
 
+use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, TransactionTrait};
 use serde_json::Value;
-use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use std::time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -78,7 +78,7 @@ impl QueuePolicy {
 /// A queue of one namespace and one queue name.
 #[derive(Debug, Clone)]
 pub struct Queue {
-    pool: PgPool,
+    db: DatabaseConnection,
     namespace: Namespace,
     queue: QueueName,
     lease_ttl: Duration,
@@ -86,13 +86,13 @@ pub struct Queue {
 }
 
 impl Queue {
-    /// Opens a queue over a pool.
+    /// Opens a queue over a database connection.
     ///
-    /// The pool must point at a database whose schema is owned by this
+    /// The connection must point at a database whose schema is owned by this
     /// library. The lease time to live of the claims of this queue is taken
     /// from the validated configuration.
     pub async fn open(
-        pool: PgPool,
+        db: DatabaseConnection,
         namespace: &str,
         queue: &str,
         config: &WorkerConfig,
@@ -100,9 +100,9 @@ impl Queue {
         config.validate()?;
         let namespace = Namespace::new(namespace)?;
         let queue = QueueName::new(queue)?;
-        let info = check_schema(&pool).await?;
+        let info = check_schema(&db).await?;
         Ok(Self {
-            pool,
+            db,
             namespace,
             queue,
             lease_ttl: config.lease_ttl,
@@ -110,9 +110,9 @@ impl Queue {
         })
     }
 
-    /// The pool of the queue.
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
+    /// The database connection of the queue.
+    pub fn connection(&self) -> &DatabaseConnection {
+        &self.db
     }
 
     /// The namespace of the queue.
@@ -135,8 +135,7 @@ impl Queue {
     /// The policy is read from the database on every call. A queue without a
     /// stored policy is unlimited.
     pub async fn policy(&self) -> Result<QueuePolicy> {
-        let mut connection = self.pool.acquire().await?;
-        store::queue_policy(&mut connection, &self.namespace, &self.queue).await
+        store::queue_policy(&self.db, &self.namespace, &self.queue).await
     }
 
     /// Replaces the durable execution policy of the queue.
@@ -147,8 +146,8 @@ impl Queue {
     /// restores the unlimited behavior.
     pub async fn set_policy(&self, policy: QueuePolicy) -> Result<()> {
         policy.validate()?;
-        let mut transaction = self.pool.begin().await?;
-        let outcome = self.set_policy_on(&mut transaction, policy).await;
+        let transaction = self.db.begin().await?;
+        let outcome = self.set_policy_on(&transaction, policy).await;
         match outcome {
             Ok(()) => {
                 transaction.commit().await?;
@@ -165,10 +164,9 @@ impl Queue {
     ///
     /// The task and its wake up notification are committed together.
     pub async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome> {
-        let mut transaction = self.pool.begin().await?;
+        let transaction = self.db.begin().await?;
         let outcome =
-            idempotency::enqueue_task(&mut transaction, &self.namespace, &self.queue, &request)
-                .await;
+            idempotency::enqueue_task(&transaction, &self.namespace, &self.queue, &request).await;
         match outcome {
             Ok(outcome) => {
                 transaction.commit().await?;
@@ -188,7 +186,7 @@ impl Queue {
     /// instance of this queue, otherwise the call is refused.
     pub async fn enqueue_in(
         &self,
-        transaction: &mut Transaction<'_, Postgres>,
+        transaction: &mut DatabaseTransaction,
         request: EnqueueRequest,
     ) -> Result<EnqueueOutcome> {
         self.verify_instance(transaction).await?;
@@ -197,8 +195,7 @@ impl Queue {
 
     /// Reads one task of the queue.
     pub async fn get(&self, task_id: TaskId) -> Result<Option<Task>> {
-        let mut connection = self.pool.acquire().await?;
-        store::task_by_id(&mut connection, &self.namespace, &self.queue, task_id).await
+        store::task_by_id(&self.db, &self.namespace, &self.queue, task_id).await
     }
 
     /// Lists the tasks of the queue, newest first.
@@ -206,22 +203,13 @@ impl Queue {
     /// The listing is bounded and continues after the given cursor.
     pub async fn list(&self, cursor: Option<ListCursor>, limit: u32) -> Result<Vec<Task>> {
         let limit = validate_limit(limit, MAX_LIST_LIMIT, "limit")?;
-        let mut connection = self.pool.acquire().await?;
-        store::list_tasks(&mut connection, &self.namespace, &self.queue, cursor, limit).await
+        store::list_tasks(&self.db, &self.namespace, &self.queue, cursor, limit).await
     }
 
     /// Lists the attempts of a task, newest first.
     pub async fn attempts(&self, task_id: TaskId, limit: u32) -> Result<Vec<Attempt>> {
         let limit = validate_limit(limit, MAX_ATTEMPT_LIMIT, "limit")?;
-        let mut connection = self.pool.acquire().await?;
-        store::list_attempts(
-            &mut connection,
-            &self.namespace,
-            &self.queue,
-            task_id,
-            limit,
-        )
-        .await
+        store::list_attempts(&self.db, &self.namespace, &self.queue, task_id, limit).await
     }
 
     /// Claims the next ready task of the queue.
@@ -230,8 +218,8 @@ impl Queue {
     /// the fencing token of the new attempt.
     pub async fn claim(&self, worker_id: &str) -> Result<Option<Claim>> {
         let worker_id = validate_worker_id(worker_id)?;
-        let mut transaction = self.pool.begin().await?;
-        let outcome = self.claim_on(&mut transaction, worker_id, None).await;
+        let transaction = self.db.begin().await?;
+        let outcome = self.claim_on(&transaction, worker_id, None).await;
         match outcome {
             Ok(claim) => {
                 transaction.commit().await?;
@@ -254,7 +242,7 @@ impl Queue {
     /// another isolation level is refused before the policy is read.
     pub async fn claim_in(
         &self,
-        transaction: &mut Transaction<'_, Postgres>,
+        transaction: &mut DatabaseTransaction,
         worker_id: &str,
     ) -> Result<Option<Claim>> {
         let worker_id = validate_worker_id(worker_id)?;
@@ -273,10 +261,8 @@ impl Queue {
     /// decision which task is eligible stays with the caller.
     pub async fn claim_by_id(&self, task_id: TaskId, worker_id: &str) -> Result<Option<Claim>> {
         let worker_id = validate_worker_id(worker_id)?;
-        let mut transaction = self.pool.begin().await?;
-        let outcome = self
-            .claim_on(&mut transaction, worker_id, Some(task_id))
-            .await;
+        let transaction = self.db.begin().await?;
+        let outcome = self.claim_on(&transaction, worker_id, Some(task_id)).await;
         match outcome {
             Ok(claim) => {
                 transaction.commit().await?;
@@ -299,7 +285,7 @@ impl Queue {
     /// another isolation level is refused before the policy is read.
     pub async fn claim_by_id_in(
         &self,
-        transaction: &mut Transaction<'_, Postgres>,
+        transaction: &mut DatabaseTransaction,
         task_id: TaskId,
         worker_id: &str,
     ) -> Result<Option<Claim>> {
@@ -314,8 +300,8 @@ impl Queue {
     /// that the lease is checked against the clock of the database after the
     /// lock was taken.
     pub async fn renew(&self, attempt: &Attempt) -> Result<OffsetDateTime> {
-        let mut transaction = self.pool.begin().await?;
-        let outcome = self.renew_on(&mut transaction, attempt).await;
+        let transaction = self.db.begin().await?;
+        let outcome = self.renew_on(&transaction, attempt).await;
         match outcome {
             Ok(expiry) => {
                 transaction.commit().await?;
@@ -338,7 +324,7 @@ impl Queue {
     /// taken.
     pub async fn renew_in(
         &self,
-        transaction: &mut Transaction<'_, Postgres>,
+        transaction: &mut DatabaseTransaction,
         attempt: &Attempt,
     ) -> Result<OffsetDateTime> {
         self.verify_instance(transaction).await?;
@@ -352,10 +338,8 @@ impl Queue {
     /// was taken.
     pub async fn report_progress(&self, attempt: &Attempt, report: &ProgressUpdate) -> Result<()> {
         report.validate()?;
-        let mut transaction = self.pool.begin().await?;
-        let outcome = self
-            .report_progress_on(&mut transaction, attempt, report)
-            .await;
+        let transaction = self.db.begin().await?;
+        let outcome = self.report_progress_on(&transaction, attempt, report).await;
         match outcome {
             Ok(()) => {
                 transaction.commit().await?;
@@ -379,7 +363,7 @@ impl Queue {
     /// taken.
     pub async fn report_progress_in(
         &self,
-        transaction: &mut Transaction<'_, Postgres>,
+        transaction: &mut DatabaseTransaction,
         attempt: &Attempt,
         report: &ProgressUpdate,
     ) -> Result<()> {
@@ -393,15 +377,10 @@ impl Queue {
     /// A task whose cancellation was requested before the completion ends as
     /// cancelled and its result is discarded.
     pub async fn complete(&self, attempt: &Attempt, result: Option<Value>) -> Result<Task> {
-        let mut transaction = self.pool.begin().await?;
-        let outcome = store::complete_attempt(
-            &mut transaction,
-            &self.namespace,
-            &self.queue,
-            attempt,
-            result,
-        )
-        .await;
+        let transaction = self.db.begin().await?;
+        let outcome =
+            store::complete_attempt(&transaction, &self.namespace, &self.queue, attempt, result)
+                .await;
         match outcome {
             Ok(task) => {
                 transaction.commit().await?;
@@ -422,7 +401,7 @@ impl Queue {
     /// attempt that lost its lease.
     pub async fn complete_in(
         &self,
-        transaction: &mut Transaction<'_, Postgres>,
+        transaction: &mut DatabaseTransaction,
         attempt: &Attempt,
         result: Option<Value>,
     ) -> Result<Task> {
@@ -435,9 +414,9 @@ impl Queue {
     /// A retryable failure schedules the task again while the budget of the
     /// task allows it, a permanent failure ends the task.
     pub async fn fail(&self, attempt: &Attempt, failure: &Failure) -> Result<Task> {
-        let mut transaction = self.pool.begin().await?;
+        let transaction = self.db.begin().await?;
         let outcome = self
-            .fail_in_transaction(&mut transaction, attempt, failure)
+            .fail_in_transaction(&transaction, attempt, failure)
             .await;
         match outcome {
             Ok(task) => {
@@ -454,7 +433,7 @@ impl Queue {
     /// Fails an attempt in the transaction of the caller.
     pub async fn fail_in(
         &self,
-        transaction: &mut Transaction<'_, Postgres>,
+        transaction: &mut DatabaseTransaction,
         attempt: &Attempt,
         failure: &Failure,
     ) -> Result<Task> {
@@ -468,8 +447,7 @@ impl Queue {
     /// A queued task is cancelled at once, a running task is marked for
     /// cancellation, and a terminal task is reported unchanged.
     pub async fn request_cancel(&self, task_id: TaskId) -> Result<Task> {
-        let mut connection = self.pool.acquire().await?;
-        self.cancel_on(&mut connection, task_id).await
+        self.cancel_on(&self.db, task_id).await
     }
 
     /// Requests the cancellation of a task in the transaction of the caller.
@@ -479,7 +457,7 @@ impl Queue {
     /// the schema instance of this queue, otherwise the call is refused.
     pub async fn request_cancel_in(
         &self,
-        transaction: &mut Transaction<'_, Postgres>,
+        transaction: &mut DatabaseTransaction,
         task_id: TaskId,
     ) -> Result<Task> {
         self.verify_instance(transaction).await?;
@@ -493,8 +471,7 @@ impl Queue {
     /// a checkpoint. A task that is already pausing or paused keeps its
     /// generation. A terminal task is refused.
     pub async fn request_pause(&self, task_id: TaskId) -> Result<Task> {
-        let mut connection = self.pool.acquire().await?;
-        self.pause_on(&mut connection, task_id).await
+        self.pause_on(&self.db, task_id).await
     }
 
     /// Requests the cooperative pause of a task in the transaction of the
@@ -505,7 +482,7 @@ impl Queue {
     /// schema instance of this queue, otherwise the call is refused.
     pub async fn request_pause_in(
         &self,
-        transaction: &mut Transaction<'_, Postgres>,
+        transaction: &mut DatabaseTransaction,
         task_id: TaskId,
     ) -> Result<Task> {
         self.verify_instance(transaction).await?;
@@ -518,8 +495,7 @@ impl Queue {
     /// task is queued again with its available time and attempt history
     /// unchanged. A resume of an unpaused task is an idempotent no-op.
     pub async fn resume(&self, task_id: TaskId) -> Result<Task> {
-        let mut connection = self.pool.acquire().await?;
-        self.resume_on(&mut connection, task_id).await
+        self.resume_on(&self.db, task_id).await
     }
 
     /// Resumes a task in the transaction of the caller.
@@ -529,7 +505,7 @@ impl Queue {
     /// schema instance of this queue, otherwise the call is refused.
     pub async fn resume_in(
         &self,
-        transaction: &mut Transaction<'_, Postgres>,
+        transaction: &mut DatabaseTransaction,
         task_id: TaskId,
     ) -> Result<Task> {
         self.verify_instance(transaction).await?;
@@ -543,8 +519,8 @@ impl Queue {
     /// A park that races a resume leaves the task claimable, a cancellation
     /// that was requested before the park wins.
     pub async fn park_paused(&self, attempt: &Attempt) -> Result<Task> {
-        let mut transaction = self.pool.begin().await?;
-        let outcome = self.park_on(&mut transaction, attempt).await;
+        let transaction = self.db.begin().await?;
+        let outcome = self.park_on(&transaction, attempt).await;
         match outcome {
             Ok(task) => {
                 transaction.commit().await?;
@@ -565,7 +541,7 @@ impl Queue {
     /// lost its lease.
     pub async fn park_paused_in(
         &self,
-        transaction: &mut Transaction<'_, Postgres>,
+        transaction: &mut DatabaseTransaction,
         attempt: &Attempt,
     ) -> Result<Task> {
         self.verify_instance(transaction).await?;
@@ -582,8 +558,7 @@ impl Queue {
     /// that is not failed is not retried.
     pub async fn retry_failed(&self, task_id: TaskId, additional_attempts: u32) -> Result<Task> {
         let additional_attempts = validate_additional_attempts(additional_attempts)?;
-        let mut connection = self.pool.acquire().await?;
-        self.retry_failed_on(&mut connection, task_id, additional_attempts)
+        self.retry_failed_on(&self.db, task_id, additional_attempts)
             .await
     }
 
@@ -595,7 +570,7 @@ impl Queue {
     /// schema instance of this queue, otherwise the call is refused.
     pub async fn retry_failed_in(
         &self,
-        transaction: &mut Transaction<'_, Postgres>,
+        transaction: &mut DatabaseTransaction,
         task_id: TaskId,
         additional_attempts: u32,
     ) -> Result<Task> {
@@ -612,8 +587,7 @@ impl Queue {
     /// remaining budget ends as failed.
     pub async fn recover_expired(&self, limit: u32) -> Result<Vec<Task>> {
         let limit = validate_limit(limit, MAX_RECOVERY_LIMIT, "limit")?;
-        let mut connection = self.pool.acquire().await?;
-        self.recover_expired_on(&mut connection, limit).await
+        self.recover_expired_on(&self.db, limit).await
     }
 
     /// Seals the attempts whose lease expired and schedules their tasks again
@@ -624,7 +598,7 @@ impl Queue {
     /// schema instance of this queue, otherwise the call is refused.
     pub async fn recover_expired_in(
         &self,
-        transaction: &mut Transaction<'_, Postgres>,
+        transaction: &mut DatabaseTransaction,
         limit: u32,
     ) -> Result<Vec<Task>> {
         let limit = validate_limit(limit, MAX_RECOVERY_LIMIT, "limit")?;
@@ -632,9 +606,9 @@ impl Queue {
         self.recover_expired_on(transaction, limit).await
     }
 
-    async fn set_policy_on(
+    async fn set_policy_on<C: ConnectionTrait>(
         &self,
-        connection: &mut PgConnection,
+        connection: &C,
         policy: QueuePolicy,
     ) -> Result<()> {
         store::lock_queue(connection, &self.namespace, &self.queue).await?;
@@ -655,13 +629,12 @@ impl Queue {
     /// The check is scoped to the namespace, the queue, the task, the attempt
     /// and its fencing token, so a terminal of another attempt never matches.
     pub(crate) async fn attempt_is_sealed(&self, attempt: &Attempt) -> Result<bool> {
-        let mut connection = self.pool.acquire().await?;
-        store::attempt_is_sealed(&mut connection, &self.namespace, &self.queue, attempt).await
+        store::attempt_is_sealed(&self.db, &self.namespace, &self.queue, attempt).await
     }
 
-    async fn claim_on(
+    async fn claim_on<C: ConnectionTrait>(
         &self,
-        connection: &mut PgConnection,
+        connection: &C,
         worker_id: &str,
         target: Option<TaskId>,
     ) -> Result<Option<Claim>> {
@@ -676,9 +649,9 @@ impl Queue {
         .await
     }
 
-    async fn renew_on(
+    async fn renew_on<C: ConnectionTrait>(
         &self,
-        connection: &mut PgConnection,
+        connection: &C,
         attempt: &Attempt,
     ) -> Result<OffsetDateTime> {
         store::renew_attempt(
@@ -691,9 +664,9 @@ impl Queue {
         .await
     }
 
-    async fn report_progress_on(
+    async fn report_progress_on<C: ConnectionTrait>(
         &self,
-        connection: &mut PgConnection,
+        connection: &C,
         attempt: &Attempt,
         report: &ProgressUpdate,
     ) -> Result<()> {
@@ -701,27 +674,27 @@ impl Queue {
         progress::report_progress(connection, &self.namespace, &self.queue, attempt, report).await
     }
 
-    async fn cancel_on(&self, connection: &mut PgConnection, task_id: TaskId) -> Result<Task> {
+    async fn cancel_on<C: ConnectionTrait>(&self, connection: &C, task_id: TaskId) -> Result<Task> {
         store::cancel_task(connection, &self.namespace, &self.queue, task_id).await
     }
 
-    async fn pause_on(&self, connection: &mut PgConnection, task_id: TaskId) -> Result<Task> {
+    async fn pause_on<C: ConnectionTrait>(&self, connection: &C, task_id: TaskId) -> Result<Task> {
         store::lock_queue(connection, &self.namespace, &self.queue).await?;
         store::pause_task(connection, &self.namespace, &self.queue, task_id).await
     }
 
-    async fn resume_on(&self, connection: &mut PgConnection, task_id: TaskId) -> Result<Task> {
+    async fn resume_on<C: ConnectionTrait>(&self, connection: &C, task_id: TaskId) -> Result<Task> {
         store::lock_queue(connection, &self.namespace, &self.queue).await?;
         store::resume_task(connection, &self.namespace, &self.queue, task_id).await
     }
 
-    async fn park_on(&self, connection: &mut PgConnection, attempt: &Attempt) -> Result<Task> {
+    async fn park_on<C: ConnectionTrait>(&self, connection: &C, attempt: &Attempt) -> Result<Task> {
         store::park_paused(connection, &self.namespace, &self.queue, attempt).await
     }
 
-    async fn retry_failed_on(
+    async fn retry_failed_on<C: ConnectionTrait>(
         &self,
-        connection: &mut PgConnection,
+        connection: &C,
         task_id: TaskId,
         additional_attempts: u32,
     ) -> Result<Task> {
@@ -735,21 +708,21 @@ impl Queue {
         .await
     }
 
-    async fn recover_expired_on(
+    async fn recover_expired_on<C: ConnectionTrait>(
         &self,
-        connection: &mut PgConnection,
+        connection: &C,
         limit: u32,
     ) -> Result<Vec<Task>> {
         store::recover_expired_tasks(connection, &self.namespace, &self.queue, limit).await
     }
 
-    async fn fail_in_transaction(
+    async fn fail_in_transaction<C: ConnectionTrait>(
         &self,
-        transaction: &mut Transaction<'_, Postgres>,
+        connection: &C,
         attempt: &Attempt,
         failure: &Failure,
     ) -> Result<Task> {
-        let task = store::task_by_id(transaction, &self.namespace, &self.queue, attempt.task_id())
+        let task = store::task_by_id(connection, &self.namespace, &self.queue, attempt.task_id())
             .await?
             .ok_or(Error::NotFound)?;
         let delay = backoff::delay_for(
@@ -758,7 +731,7 @@ impl Queue {
             attempt.attempt_number(),
         );
         store::fail_attempt(
-            transaction,
+            connection,
             &self.namespace,
             &self.queue,
             attempt,
@@ -768,7 +741,7 @@ impl Queue {
         .await
     }
 
-    async fn verify_instance(&self, connection: &mut PgConnection) -> Result<()> {
+    async fn verify_instance<C: ConnectionTrait>(&self, connection: &C) -> Result<()> {
         store::verify_instance(connection, self.instance).await
     }
 }
@@ -787,7 +760,7 @@ fn validate_worker_id(worker_id: &str) -> Result<&str> {
     if worker_id.is_empty() || worker_id.len() > MAX_WORKER_ID_LENGTH {
         return Err(Error::Validation {
             field: "worker_id",
-            reason: format!("must be between 1 and {MAX_WORKER_ID_LENGTH} bytes"),
+            reason: format!("must be between 1 and {} bytes", MAX_WORKER_ID_LENGTH),
         });
     }
     Ok(worker_id)
