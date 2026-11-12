@@ -3,33 +3,38 @@
 //! A progress report belongs to the attempt that wrote it. A new attempt
 //! starts without progress, a sealed attempt keeps its last report.
 
+use sea_orm::ConnectionTrait;
 use serde_json::Value;
-use sqlx::PgConnection;
 
 use crate::error::Result;
 use crate::model::{Attempt, Namespace, ProgressUpdate, QueueName};
+use crate::sql;
 use crate::store;
 
+const REPORT_PROGRESS: &str = include_str!("../sql/store_report_progress.sql");
+
 /// Writes the progress report of a running attempt.
-pub(crate) async fn report_progress(
-    connection: &mut PgConnection,
+pub(crate) async fn report_progress<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     attempt: &Attempt,
     progress: &ProgressUpdate,
 ) -> Result<()> {
     let payload = progress_payload(progress);
-    let row = sqlx::query_file!(
-        "sql/store_report_progress.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        attempt.task_id().as_uuid(),
-        attempt.id().as_uuid(),
-        attempt.fencing_token().as_uuid(),
-        payload,
-    )
-    .fetch_optional(&mut *connection)
-    .await?;
+    let row = connection
+        .query_one_raw(sql::statement(
+            REPORT_PROGRESS,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                attempt.task_id().as_uuid().into(),
+                attempt.id().as_uuid().into(),
+                attempt.fencing_token().as_uuid().into(),
+                payload.into(),
+            ],
+        ))
+        .await?;
     if row.is_some() {
         return Ok(());
     }

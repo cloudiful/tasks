@@ -390,7 +390,7 @@ impl Worker {
 
         let wakeup = context.wakeup.clone();
         let listener = tokio::spawn(
-            WakeListener::new(context.queue.pool().clone()).run(wakeup, shutdown.clone()),
+            WakeListener::new(context.queue.connection().clone()).run(wakeup, shutdown.clone()),
         );
         let heartbeat = tokio::spawn(heartbeat_loop(context.clone()));
         let recovery = tokio::spawn(recovery_loop(context.clone()));

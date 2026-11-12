@@ -5,12 +5,18 @@
 //! that exists without the ownership marker of this library is refused instead
 //! of being adopted.
 
-use sqlx::migrate::Migrator;
-use sqlx::{PgConnection, PgPool};
+use std::time::Instant;
+
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection, EntityTrait, QueryResult, Statement, TransactionTrait,
+};
+use sha2::{Digest, Sha384};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::entity::schema_ownership;
 use crate::error::{Error, Result};
+use crate::sql;
 
 /// Schema owned by this library.
 pub const SCHEMA_NAME: &str = "cloudiful_tasks";
@@ -27,7 +33,44 @@ const OWNERSHIP_TABLE: &str = "schema_ownership";
 /// Table holding the migration ledger of this library.
 const LEDGER_TABLE: &str = "_sqlx_migrations";
 
-static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+const SCHEMA_EXISTS: &str = include_str!("../sql/migration_schema_exists.sql");
+const SCHEMA_RELATIONS: &str = include_str!("../sql/migration_schema_relations.sql");
+const LEDGER: &str = include_str!("../sql/migration_ledger.sql");
+const CURRENT_DATABASE: &str = include_str!("../sql/migration_current_database.sql");
+const ADVISORY_XACT_LOCK: &str = include_str!("../sql/migration_advisory_xact_lock.sql");
+const RECORD_MIGRATION: &str = include_str!("../sql/migration_record.sql");
+const CREATE_LEDGER: &str = include_str!("../sql/migration_create_ledger.sql");
+const CREATE_SCHEMA: &str = include_str!("../sql/migration_create_schema.sql");
+
+/// One immutable migration of the library.
+struct Migration {
+    version: i64,
+    description: &'static str,
+    sql: &'static str,
+}
+
+/// The migrations of the library, in application order.
+///
+/// The descriptors mirror the files in `migrations/`; their SQL is embedded so
+/// that the checksums of the legacy ledger can be verified without the SQLx
+/// migration engine.
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 20261021032949,
+        description: "init_schema",
+        sql: include_str!("../migrations/20261021032949_init_schema.sql"),
+    },
+    Migration {
+        version: 20261023175252,
+        description: "queue_policies",
+        sql: include_str!("../migrations/20261023175252_queue_policies.sql"),
+    },
+    Migration {
+        version: 20261106211859,
+        description: "task_pause",
+        sql: include_str!("../migrations/20261106211859_task_pause.sql"),
+    },
+];
 
 /// Information about a schema that is owned by this library.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,16 +153,18 @@ impl MigrationOutcome {
 ///
 /// Returns [`Error::ForeignSchema`] for a schema that this library does not
 /// own, [`Error::UnsupportedSchemaVersion`] for a schema of a newer protocol
-/// version and [`Error::Migration`] when the migration engine fails.
-pub async fn migrate(pool: &PgPool) -> Result<MigrationOutcome> {
-    let mut connection = pool.acquire().await?;
-    let result = migrate_on_connection(&mut connection).await;
-    match result {
-        Ok(outcome) => Ok(outcome),
+/// version and [`Error::Migration`] when the migration engine fails. A dirty
+/// migration ledger is refused before any pending migration is applied.
+pub async fn migrate(db: &DatabaseConnection) -> Result<MigrationOutcome> {
+    let transaction = db.begin().await?;
+    let outcome = migrate_locked(&transaction).await;
+    match outcome {
+        Ok(outcome) => {
+            transaction.commit().await?;
+            Ok(outcome)
+        }
         Err(error) => {
-            // The session may hold an advisory lock. Closing it keeps the lock
-            // out of the pool instead of leaking it to the next user.
-            connection.close().await.ok();
+            transaction.rollback().await.ok();
             Err(error)
         }
     }
@@ -135,49 +180,69 @@ pub async fn migrate(pool: &PgPool) -> Result<MigrationOutcome> {
 /// # Errors
 ///
 /// Returns [`Error::SchemaMissing`], [`Error::ForeignSchema`],
-/// [`Error::UnsupportedSchemaVersion`], [`Error::OutdatedSchemaVersion`] or
-/// [`Error::ChecksumMismatch`] when the database is not ready for use.
-pub async fn check_schema(pool: &PgPool) -> Result<SchemaInfo> {
-    let mut connection = pool.acquire().await?;
-    check_schema_on_connection(&mut connection).await
-}
-
-async fn migrate_on_connection(connection: &mut PgConnection) -> Result<MigrationOutcome> {
-    let database = current_database(connection).await?;
-    let lock_key = migrate_lock_key(&database);
-    advisory_lock(connection, lock_key).await?;
-    let outcome = migrate_locked(connection).await;
-    advisory_unlock(connection, lock_key).await;
-    outcome
-}
-
-async fn migrate_locked(connection: &mut PgConnection) -> Result<MigrationOutcome> {
-    ensure_ownership(connection).await?;
-    let before = applied_versions(connection).await?;
-    MIGRATOR
-        .run(&mut *connection)
-        .await
-        .map_err(Error::Migration)?;
-    let info = read_schema_info(connection).await?;
-    Ok(MigrationOutcome {
-        applied: info.applied_versions().len() > before.len(),
-        info,
-    })
-}
-
-async fn check_schema_on_connection(connection: &mut PgConnection) -> Result<SchemaInfo> {
-    if !schema_exists(connection).await? {
+/// [`Error::UnsupportedSchemaVersion`], [`Error::OutdatedSchemaVersion`],
+/// [`Error::DirtyMigration`] or [`Error::ChecksumMismatch`] when the database
+/// is not ready for use.
+pub async fn check_schema(db: &DatabaseConnection) -> Result<SchemaInfo> {
+    if !schema_exists(db).await? {
         return Err(Error::SchemaMissing {
             schema: SCHEMA_NAME.to_owned(),
         });
     }
-    let relations = schema_relations(connection).await?;
+    let relations = schema_relations(db).await?;
     if !relations.iter().any(|name| name == OWNERSHIP_TABLE) {
         return Err(Error::ForeignSchema {
             schema: SCHEMA_NAME.to_owned(),
         });
     }
-    read_schema_info(connection).await
+    read_schema_info(db).await
+}
+
+async fn migrate_locked(db: &impl ConnectionTrait) -> Result<MigrationOutcome> {
+    let database = current_database(db).await?;
+    let lock_key = migrate_lock_key(&database);
+    db.query_one_raw(sql::statement(ADVISORY_XACT_LOCK, vec![lock_key.into()]))
+        .await?;
+
+    ensure_ownership(db).await?;
+    let rows = existing_ledger_rows(db).await?;
+    let before = rows.len();
+    let applied = verify_ledger_rows(&rows).map_err(migration_integrity)?;
+    if !schema_exists(db).await? {
+        db.execute_unprepared(CREATE_SCHEMA).await?;
+    }
+    db.execute_unprepared(CREATE_LEDGER).await?;
+
+    let mut changed = false;
+    for migration in MIGRATIONS {
+        if applied.contains(&migration.version) {
+            continue;
+        }
+        let checksum = checksum(migration.sql);
+        let started = Instant::now();
+        db.execute_unprepared(migration.sql)
+            .await
+            .map_err(|error| Error::Migration(error.to_string()))?;
+        let execution_time = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        db.execute_raw(sql::statement(
+            RECORD_MIGRATION,
+            vec![
+                migration.version.into(),
+                migration.description.into(),
+                checksum.to_vec().into(),
+                execution_time.into(),
+            ],
+        ))
+        .await
+        .map_err(|error| Error::Migration(error.to_string()))?;
+        changed = true;
+    }
+
+    let info = read_schema_info(db).await?;
+    Ok(MigrationOutcome {
+        applied: changed || info.applied_versions().len() > before,
+        info,
+    })
 }
 
 /// Refuses a schema that this library does not own.
@@ -186,32 +251,33 @@ async fn check_schema_on_connection(connection: &mut PgConnection) -> Result<Sch
 /// A schema that exists belongs to this library only when it carries the
 /// ownership marker, an empty schema and a schema that holds the migration
 /// ledger alone are foreign schemas.
-async fn ensure_ownership(connection: &mut PgConnection) -> Result<()> {
-    if !schema_exists(connection).await? {
+async fn ensure_ownership(db: &impl ConnectionTrait) -> Result<()> {
+    if !schema_exists(db).await? {
         return Ok(());
     }
-    let relations = schema_relations(connection).await?;
+    let relations = schema_relations(db).await?;
     if !relations.iter().any(|name| name == OWNERSHIP_TABLE) {
         return Err(Error::ForeignSchema {
             schema: SCHEMA_NAME.to_owned(),
         });
     }
-    let marker = read_ownership(connection)
-        .await?
-        .ok_or(Error::ForeignSchema {
-            schema: SCHEMA_NAME.to_owned(),
-        })?;
+    let marker = read_ownership(db).await?.ok_or(Error::ForeignSchema {
+        schema: SCHEMA_NAME.to_owned(),
+    })?;
     validate_owner(&marker)
 }
 
-async fn read_schema_info(connection: &mut PgConnection) -> Result<SchemaInfo> {
-    let marker = read_ownership(connection)
-        .await?
-        .ok_or(Error::ForeignSchema {
+async fn read_schema_info(db: &impl ConnectionTrait) -> Result<SchemaInfo> {
+    let marker = read_ownership(db).await?.ok_or(Error::ForeignSchema {
+        schema: SCHEMA_NAME.to_owned(),
+    })?;
+    if marker.library != LIBRARY_ID {
+        return Err(Error::ForeignSchema {
             schema: SCHEMA_NAME.to_owned(),
-        })?;
+        });
+    }
+    let applied_versions = verify_ledger(db).await?;
     validate_marker(&marker)?;
-    let applied_versions = verify_ledger(connection).await?;
     Ok(SchemaInfo {
         protocol_version: marker.protocol_version,
         instance_uuid: marker.instance_uuid,
@@ -225,7 +291,7 @@ async fn read_schema_info(connection: &mut PgConnection) -> Result<SchemaInfo> {
 /// Callers that migrate accept an owned older protocol version, because the
 /// migrations upgrade it to the current version. Callers that read accept only
 /// the exact supported version.
-fn validate_owner(marker: &OwnershipRow) -> Result<()> {
+fn validate_owner(marker: &schema_ownership::Model) -> Result<()> {
     if marker.library != LIBRARY_ID {
         return Err(Error::ForeignSchema {
             schema: SCHEMA_NAME.to_owned(),
@@ -240,7 +306,7 @@ fn validate_owner(marker: &OwnershipRow) -> Result<()> {
     Ok(())
 }
 
-fn validate_marker(marker: &OwnershipRow) -> Result<()> {
+fn validate_marker(marker: &schema_ownership::Model) -> Result<()> {
     validate_owner(marker)?;
     if marker.protocol_version < PROTOCOL_VERSION {
         return Err(Error::OutdatedSchemaVersion {
@@ -251,56 +317,75 @@ fn validate_marker(marker: &OwnershipRow) -> Result<()> {
     Ok(())
 }
 
-async fn schema_exists(connection: &mut PgConnection) -> Result<bool> {
-    let row = sqlx::query_file!("sql/migration_schema_exists.sql", SCHEMA_NAME)
-        .fetch_one(&mut *connection)
-        .await?;
-    Ok(row.schema_exists.unwrap_or(false))
-}
-
-async fn schema_relations(connection: &mut PgConnection) -> Result<Vec<String>> {
-    let rows = sqlx::query_file_as!(
-        RelationRow,
-        "sql/migration_schema_relations.sql",
-        SCHEMA_NAME
-    )
-    .fetch_all(&mut *connection)
-    .await?;
-    Ok(rows.into_iter().map(|row| row.relation_name).collect())
-}
-
-async fn read_ownership(connection: &mut PgConnection) -> Result<Option<OwnershipRow>> {
+async fn schema_exists(db: &impl ConnectionTrait) -> Result<bool> {
     Ok(
-        sqlx::query_file_as!(OwnershipRow, "sql/migration_ownership.sql")
-            .fetch_optional(&mut *connection)
-            .await?,
+        fetch_scalar::<bool>(db, sql::statement(SCHEMA_EXISTS, vec![SCHEMA_NAME.into()]))
+            .await?
+            .unwrap_or(false),
     )
 }
 
-async fn applied_versions(connection: &mut PgConnection) -> Result<Vec<i64>> {
-    let relations = schema_relations(connection).await?;
+async fn schema_relations(db: &impl ConnectionTrait) -> Result<Vec<String>> {
+    let rows = db
+        .query_all_raw(sql::statement(SCHEMA_RELATIONS, vec![SCHEMA_NAME.into()]))
+        .await?;
+    rows.into_iter()
+        .map(|row| row.try_get_by::<String, usize>(0).map_err(Error::from))
+        .collect()
+}
+
+async fn read_ownership(db: &impl ConnectionTrait) -> Result<Option<schema_ownership::Model>> {
+    Ok(schema_ownership::Entity::find().one(db).await?)
+}
+
+async fn existing_ledger_rows(db: &impl ConnectionTrait) -> Result<Vec<LedgerRow>> {
+    let relations = schema_relations(db).await?;
     if !relations.iter().any(|name| name == LEDGER_TABLE) {
         return Ok(Vec::new());
     }
-    let rows = sqlx::query_file_as!(LedgerRow, "sql/migration_ledger.sql")
-        .fetch_all(&mut *connection)
-        .await?;
-    Ok(rows.into_iter().map(|row| row.version).collect())
+    ledger_rows(db).await
 }
 
-async fn verify_ledger(connection: &mut PgConnection) -> Result<Vec<i64>> {
-    let rows = sqlx::query_file_as!(LedgerRow, "sql/migration_ledger.sql")
-        .fetch_all(&mut *connection)
-        .await?;
+fn migration_integrity(error: Error) -> Error {
+    match error {
+        Error::ChecksumMismatch { version } => Error::Migration(format!(
+            "applied migration {version} does not match the migration source"
+        )),
+        Error::UnknownAppliedMigration { version } => Error::Migration(format!(
+            "schema contains unknown applied migration {version}"
+        )),
+        Error::DirtyMigration { version } => {
+            Error::Migration(format!("schema contains dirty migration {version}"))
+        }
+        other => other,
+    }
+}
+
+async fn ledger_rows(db: &impl ConnectionTrait) -> Result<Vec<LedgerRow>> {
+    let rows = db.query_all_raw(sql::statement(LEDGER, vec![])).await?;
+    rows.into_iter().map(LedgerRow::from_row).collect()
+}
+
+async fn verify_ledger(db: &impl ConnectionTrait) -> Result<Vec<i64>> {
+    let rows = ledger_rows(db).await?;
+    verify_ledger_rows(&rows)
+}
+
+fn verify_ledger_rows(rows: &[LedgerRow]) -> Result<Vec<i64>> {
+    if let Some(row) = rows.iter().find(|row| !row.success) {
+        return Err(Error::DirtyMigration {
+            version: row.version,
+        });
+    }
     let mut versions = Vec::with_capacity(rows.len());
     for row in rows {
-        let migration = MIGRATOR
+        let migration = MIGRATIONS
             .iter()
             .find(|migration| migration.version == row.version)
             .ok_or(Error::UnknownAppliedMigration {
                 version: row.version,
             })?;
-        if migration.checksum.as_ref() != row.checksum.as_slice() {
+        if checksum(migration.sql).as_slice() != row.checksum.as_slice() {
             return Err(Error::ChecksumMismatch {
                 version: row.version,
             });
@@ -310,27 +395,13 @@ async fn verify_ledger(connection: &mut PgConnection) -> Result<Vec<i64>> {
     Ok(versions)
 }
 
-async fn current_database(connection: &mut PgConnection) -> Result<String> {
-    let row = sqlx::query_file!("sql/migration_current_database.sql")
-        .fetch_one(&mut *connection)
-        .await?;
-    row.database_name.ok_or(Error::Validation {
-        field: "database",
-        reason: "the database did not report its name".to_owned(),
-    })
-}
-
-async fn advisory_lock(connection: &mut PgConnection, key: i64) -> Result<()> {
-    sqlx::query_file!("sql/migration_advisory_lock.sql", key)
-        .fetch_one(&mut *connection)
-        .await?;
-    Ok(())
-}
-
-async fn advisory_unlock(connection: &mut PgConnection, key: i64) {
-    let _ = sqlx::query_file!("sql/migration_advisory_unlock.sql", key)
-        .fetch_one(&mut *connection)
-        .await;
+async fn current_database(db: &impl ConnectionTrait) -> Result<String> {
+    fetch_scalar::<String>(db, sql::statement(CURRENT_DATABASE, vec![]))
+        .await?
+        .ok_or(Error::Validation {
+            field: "database",
+            reason: "the database did not report its name".to_owned(),
+        })
 }
 
 /// Derives the advisory lock key of a database.
@@ -350,23 +421,40 @@ fn migrate_lock_key(database: &str) -> i64 {
     hash as i64
 }
 
-#[derive(sqlx::FromRow)]
-struct RelationRow {
-    relation_name: String,
+fn checksum(sql: &str) -> [u8; 48] {
+    let digest = Sha384::digest(sql.as_bytes());
+    let mut checksum = [0_u8; 48];
+    checksum.copy_from_slice(&digest[..]);
+    checksum
 }
 
-#[derive(sqlx::FromRow)]
-pub(crate) struct OwnershipRow {
-    pub(crate) library: String,
-    pub(crate) protocol_version: i32,
-    pub(crate) instance_uuid: Uuid,
-    pub(crate) installed_at: OffsetDateTime,
-}
-
-#[derive(sqlx::FromRow)]
 struct LedgerRow {
     version: i64,
     checksum: Vec<u8>,
+    success: bool,
+}
+
+impl LedgerRow {
+    fn from_row(row: QueryResult) -> Result<Self> {
+        Ok(Self {
+            version: row.try_get_by::<i64, usize>(0)?,
+            checksum: row.try_get_by::<Vec<u8>, usize>(1)?,
+            success: row.try_get_by::<bool, usize>(2)?,
+        })
+    }
+}
+
+async fn fetch_scalar<T>(
+    connection: &impl ConnectionTrait,
+    statement: Statement,
+) -> Result<Option<T>>
+where
+    T: sea_orm::TryGetable,
+{
+    match connection.query_one_raw(statement).await? {
+        Some(row) => Ok(Some(row.try_get_by::<T, usize>(0)?)),
+        None => Ok(None),
+    }
 }
 
 #[cfg(test)]

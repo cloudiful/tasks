@@ -13,8 +13,11 @@ use cloudiful_tasks::{
     AttemptStatus, EnqueueRequest, Error, Failure, ListCursor, ProgressUpdate, QueuePolicy,
     RetryPolicy, TaskId, TaskKind, TaskPauseState, TaskStatus,
 };
+use sea_orm::sqlx::postgres::PgListener;
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection, DatabaseTransaction, IsolationLevel, TransactionTrait,
+};
 use serde_json::json;
-use sqlx::postgres::PgListener;
 use time::Duration as TimeDuration;
 use time::OffsetDateTime;
 use time::UtcOffset;
@@ -22,8 +25,9 @@ use time::macros::datetime;
 use tokio::sync::Barrier;
 
 use common::{
-    app_domain_count, attempt_count, connect, connect_to_sibling_database, open_queue,
-    open_queue_with_short_lease, prepare_app_domain, reset, task_count, write_app_domain,
+    app_domain_count, attempt_count, connect, connect_to_sibling_database, fetch_scalar,
+    open_queue, open_queue_with_short_lease, prepare_app_domain, reset, statement, task_count,
+    write_app_domain,
 };
 
 const NAMESPACE: &str = "ns";
@@ -37,32 +41,26 @@ fn request() -> EnqueueRequest {
     EnqueueRequest::new(TaskKind::new("demo").unwrap(), json!({"a": 1}))
 }
 
-async fn running_attempts(pool: &sqlx::PgPool, namespace: &str, queue: &str) -> i64 {
-    sqlx::query_file_scalar!("sql/store_queue_policy_count.sql", namespace, queue)
-        .fetch_one(pool)
-        .await
-        .expect("the running attempts must be countable")
-        .unwrap_or_default()
+async fn running_attempts(db: &DatabaseConnection, namespace: &str, queue: &str) -> i64 {
+    fetch_scalar::<i64>(
+        db,
+        statement(
+            include_str!("../sql/store_queue_policy_count.sql"),
+            vec![namespace.into(), queue.into()],
+        ),
+    )
+    .await
+    .expect("the running attempts must be countable")
 }
 
-async fn isolation_transaction<'a>(
-    pool: &'a sqlx::PgPool,
-    level: &str,
-) -> sqlx::Transaction<'a, sqlx::Postgres> {
-    let mut transaction = pool.begin().await.unwrap();
-    let statement = match level {
-        "REPEATABLE READ" => "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
-        "SERIALIZABLE" => "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+async fn isolation_transaction(db: &DatabaseConnection, level: &str) -> DatabaseTransaction {
+    let isolation = match level {
+        "REPEATABLE READ" => IsolationLevel::RepeatableRead,
+        "SERIALIZABLE" => IsolationLevel::Serializable,
         other => panic!("unsupported isolation level {other}"),
     };
-    sqlx::query(statement)
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
-    sqlx::query("SELECT 1")
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
+    let transaction = db.begin_with_config(Some(isolation), None).await.unwrap();
+    transaction.execute_unprepared("SELECT 1").await.unwrap();
     transaction
 }
 
@@ -103,8 +101,7 @@ async fn a_legacy_request_spec_is_still_the_same_request() {
     reset(&pool).await;
     let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
 
-    sqlx::raw_sql(LEGACY_TASK_SQL)
-        .execute(&pool)
+    pool.execute_unprepared(LEGACY_TASK_SQL)
         .await
         .expect("the task of the older build must be insertable");
 
@@ -433,7 +430,10 @@ async fn a_retryable_failure_schedules_the_task_again() {
         .await
         .unwrap();
     assert_eq!(failed.status(), TaskStatus::Queued);
-    assert!(failed.available_at() > OffsetDateTime::now_utc());
+    assert!(
+        failed.available_at() > failed.updated_at(),
+        "the retry must be scheduled in the future of the database clock"
+    );
 
     let attempts = queue.attempts(task.task().id(), 10).await.unwrap();
     assert_eq!(attempts.len(), 1);
@@ -717,7 +717,9 @@ async fn an_enqueue_wakes_the_workers_after_the_commit() {
     reset(&pool).await;
     let queue = open_queue(&pool, NAMESPACE, QUEUE).await;
 
-    let mut listener = PgListener::connect_with(&pool).await.unwrap();
+    let mut listener = PgListener::connect_with(pool.get_postgres_connection_pool())
+        .await
+        .unwrap();
     listener.listen("cloudiful_tasks_ready").await.unwrap();
 
     let mut transaction = pool.begin().await.unwrap();
@@ -799,10 +801,12 @@ async fn a_lock_wait_that_crosses_the_expiry_refuses_the_write() {
     let claim = queue.claim("worker").await.unwrap().unwrap();
 
     // Another transaction holds the lock of the attempt.
-    let mut blocker = pool.begin().await.unwrap();
-    sqlx::query("SELECT id FROM cloudiful_tasks.attempts WHERE id = $1 FOR UPDATE")
-        .bind(claim.attempt().id().as_uuid())
-        .fetch_one(&mut *blocker)
+    let blocker = pool.begin().await.unwrap();
+    blocker
+        .execute_raw(statement(
+            "SELECT id FROM cloudiful_tasks.attempts WHERE id = $1 FOR UPDATE",
+            vec![claim.attempt().id().as_uuid().into()],
+        ))
         .await
         .expect("the attempt must be lockable");
 
@@ -841,10 +845,12 @@ async fn a_lock_wait_that_crosses_the_expiry_refuses_the_renewal() {
     let claim = queue.claim("worker").await.unwrap().unwrap();
 
     // Another transaction holds the lock of the attempt.
-    let mut blocker = pool.begin().await.unwrap();
-    sqlx::query("SELECT id FROM cloudiful_tasks.attempts WHERE id = $1 FOR UPDATE")
-        .bind(claim.attempt().id().as_uuid())
-        .fetch_one(&mut *blocker)
+    let blocker = pool.begin().await.unwrap();
+    blocker
+        .execute_raw(statement(
+            "SELECT id FROM cloudiful_tasks.attempts WHERE id = $1 FOR UPDATE",
+            vec![claim.attempt().id().as_uuid().into()],
+        ))
         .await
         .expect("the attempt must be lockable");
 
@@ -878,10 +884,12 @@ async fn a_lock_wait_that_crosses_the_expiry_refuses_the_progress_report() {
     let claim = queue.claim("worker").await.unwrap().unwrap();
 
     // Another transaction holds the lock of the attempt.
-    let mut blocker = pool.begin().await.unwrap();
-    sqlx::query("SELECT id FROM cloudiful_tasks.attempts WHERE id = $1 FOR UPDATE")
-        .bind(claim.attempt().id().as_uuid())
-        .fetch_one(&mut *blocker)
+    let blocker = pool.begin().await.unwrap();
+    blocker
+        .execute_raw(statement(
+            "SELECT id FROM cloudiful_tasks.attempts WHERE id = $1 FOR UPDATE",
+            vec![claim.attempt().id().as_uuid().into()],
+        ))
         .await
         .expect("the attempt must be lockable");
 
@@ -921,12 +929,15 @@ async fn a_manual_retry_grants_only_the_requested_attempts() {
         .enqueue(request().with_retry_policy(policy))
         .await
         .unwrap();
-    let spec: serde_json::Value =
-        sqlx::query_scalar("SELECT request_spec FROM cloudiful_tasks.tasks WHERE id = $1")
-            .bind(task.task().id().as_uuid())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let spec: serde_json::Value = fetch_scalar::<serde_json::Value>(
+        &pool,
+        statement(
+            "SELECT request_spec FROM cloudiful_tasks.tasks WHERE id = $1",
+            vec![task.task().id().as_uuid().into()],
+        ),
+    )
+    .await
+    .unwrap();
 
     let claim = queue.claim("worker").await.unwrap().unwrap();
     let failed = queue
@@ -961,12 +972,15 @@ async fn a_manual_retry_grants_only_the_requested_attempts() {
     assert_eq!(retried.attempt_count(), 1);
 
     // The request of the task and its history stay untouched.
-    let stored_spec: serde_json::Value =
-        sqlx::query_scalar("SELECT request_spec FROM cloudiful_tasks.tasks WHERE id = $1")
-            .bind(id.as_uuid())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let stored_spec: serde_json::Value = fetch_scalar::<serde_json::Value>(
+        &pool,
+        statement(
+            "SELECT request_spec FROM cloudiful_tasks.tasks WHERE id = $1",
+            vec![id.as_uuid().into()],
+        ),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         stored_spec, spec,
         "the request of the task must stay untouched"
@@ -1488,14 +1502,14 @@ async fn a_lock_wait_that_crosses_the_expiry_refuses_the_borrowed_renewal() {
     let claim = queue.claim("worker").await.unwrap().unwrap();
 
     // Another transaction holds the lock of the attempt.
-    let mut blocker = pool.begin().await.unwrap();
-    sqlx::query_file!(
-        "sql/tests/transaction_lock_attempt.sql",
-        claim.attempt().id().as_uuid()
-    )
-    .fetch_one(&mut *blocker)
-    .await
-    .expect("the attempt must be lockable");
+    let blocker = pool.begin().await.unwrap();
+    blocker
+        .execute_raw(statement(
+            include_str!("../sql/tests/transaction_lock_attempt.sql"),
+            vec![claim.attempt().id().as_uuid().into()],
+        ))
+        .await
+        .expect("the attempt must be lockable");
 
     // The borrowed renewal waits for the lock and outlives the lease.
     let waiting_queue = queue.clone();
@@ -1649,14 +1663,14 @@ async fn an_addressed_claim_of_a_locked_task_is_refused() {
     let task = queue.enqueue(request()).await.unwrap();
 
     // Another transaction holds the lock of the task.
-    let mut blocker = pool.begin().await.unwrap();
-    sqlx::query_file!(
-        "sql/tests/addressed_lock_task.sql",
-        task.task().id().as_uuid()
-    )
-    .fetch_one(&mut *blocker)
-    .await
-    .expect("the task must be lockable");
+    let blocker = pool.begin().await.unwrap();
+    blocker
+        .execute_raw(statement(
+            include_str!("../sql/tests/addressed_lock_task.sql"),
+            vec![task.task().id().as_uuid().into()],
+        ))
+        .await
+        .expect("the task must be lockable");
 
     assert!(
         queue
@@ -2043,9 +2057,8 @@ async fn a_policy_protected_claim_requires_read_committed() {
         .unwrap();
     let task = queue.enqueue(request()).await.unwrap();
 
-    let mut transaction = pool.begin().await.unwrap();
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-        .execute(&mut *transaction)
+    let mut transaction = pool
+        .begin_with_config(Some(IsolationLevel::RepeatableRead), None)
         .await
         .unwrap();
     let error = queue
@@ -2181,16 +2194,15 @@ async fn a_waiting_policy_claim_uses_a_fresh_snapshot_after_the_queue_lock() {
     let second = queue.enqueue(request()).await.unwrap();
     let claim = queue.claim("worker-1").await.unwrap().unwrap();
 
-    let mut holder = pool.begin().await.unwrap();
-    sqlx::query(
-        "SELECT pg_advisory_xact_lock(hashtext('cloudiful_tasks.queue'), \
-         hashtext($1 || E'\\x1f' || $2))",
-    )
-    .bind(NAMESPACE)
-    .bind(QUEUE)
-    .fetch_one(&mut *holder)
-    .await
-    .unwrap();
+    let holder = pool.begin().await.unwrap();
+    holder
+        .execute_raw(statement(
+            "SELECT pg_advisory_xact_lock(hashtext('cloudiful_tasks.queue'), \
+             hashtext($1 || E'\\x1f' || $2))",
+            vec![NAMESPACE.into(), QUEUE.into()],
+        ))
+        .await
+        .unwrap();
 
     let waiting_queue = queue.clone();
     let waiting = tokio::spawn(async move { waiting_queue.claim("worker-2").await });

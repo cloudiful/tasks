@@ -1,96 +1,72 @@
 //! The durable store of tasks and attempts.
 //!
-//! Every statement of the store lives in `sql/store_*.sql` and is loaded with
-//! `query_file!` or `query_file_as!`. The store never creates or alters the
-//! schema and never writes outside the schema of the library.
+//! Ordinary reads use the native entities of [`crate::entity`]. The guarded
+//! state transitions, advisory locks and the PostgreSQL introspection keep the
+//! statements in `sql/`, which are executed as raw statements with positional
+//! values. The store never creates or alters the schema and never writes
+//! outside the schema of the library.
 
-use serde_json::Value;
-use sqlx::PgConnection;
 use std::time::Duration;
+
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
+    QueryResult, QuerySelect, Statement, TryGetable,
+};
+use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::entity::{
+    attempt as attempt_entity, queue_policy as policy_entity, schema_ownership, task as task_entity,
+};
 use crate::error::{Error, Result};
-use crate::migrate::{OwnershipRow, SCHEMA_NAME};
+use crate::migrate::SCHEMA_NAME;
 use crate::model::{
     Attempt, AttemptId, AttemptStatus, Failure, FencingToken, ListCursor, Namespace,
     ProgressUpdate, QueueName, Task, TaskId, TaskKind, TaskPauseState, TaskStatus,
 };
 use crate::queue::QueuePolicy;
+use crate::sql;
 
-#[derive(sqlx::FromRow)]
-pub(crate) struct TaskRow {
-    id: Uuid,
-    namespace: String,
-    queue: String,
-    kind: String,
-    payload: Value,
-    result: Option<Value>,
-    status: String,
-    priority: i32,
-    available_at: OffsetDateTime,
-    created_at: OffsetDateTime,
-    updated_at: OffsetDateTime,
-    idempotency_key: Option<String>,
-    // The specification is part of the row, the store never reads it.
-    #[allow(dead_code)]
-    request_spec: Value,
-    attempt_count: i32,
-    max_attempts: i32,
-    retry_initial_delay_ns: i64,
-    retry_max_delay_ns: i64,
-    cancel_requested_at: Option<OffsetDateTime>,
-    finished_at: Option<OffsetDateTime>,
-    terminal_reason: Option<String>,
-    pause_state: String,
-    pause_generation: i64,
-    paused_attempts: i32,
-}
-
-#[derive(sqlx::FromRow)]
-struct LockRow {
-    task_found: Option<i64>,
-    attempt_found: Option<i64>,
-}
-
-#[derive(sqlx::FromRow)]
-struct QueuePolicyRow {
-    max_concurrent_attempts: i32,
-}
-
-#[derive(sqlx::FromRow)]
-pub(crate) struct AttemptRow {
-    id: Uuid,
-    task_id: Uuid,
-    attempt_number: i32,
-    worker_id: String,
-    fencing_token: Uuid,
-    status: String,
-    lease_expires_at: Option<OffsetDateTime>,
-    started_at: OffsetDateTime,
-    finished_at: Option<OffsetDateTime>,
-    error: Option<Value>,
-    progress: Option<Value>,
-    progress_updated_at: Option<OffsetDateTime>,
-    pause_generation: i64,
-    paused_at: Option<OffsetDateTime>,
-}
+const MARKER_PRESENT: &str = include_str!("../sql/store_marker_present.sql");
+const LOCK_QUEUE: &str = include_str!("../sql/store_lock_queue.sql");
+const QUEUE_POLICY_SET: &str = include_str!("../sql/store_queue_policy_set.sql");
+const QUEUE_POLICY_COUNT: &str = include_str!("../sql/store_queue_policy_count.sql");
+const TRANSACTION_ISOLATION: &str = include_str!("../sql/store_queue_policy_isolation.sql");
+const ATTEMPT_SEALED: &str = include_str!("../sql/store_attempt_sealed.sql");
+const TASK_EXISTS: &str = include_str!("../sql/store_task_exists.sql");
+const LOCK_ATTEMPT: &str = include_str!("../sql/store_lock_attempt.sql");
+const LOCK_TASK_ATTEMPT: &str = include_str!("../sql/store_lock_task_attempt.sql");
+const NOTIFY_READY: &str = include_str!("../sql/store_notify_ready.sql");
+const CLAIM: &str = include_str!("../sql/store_claim.sql");
+const RENEW: &str = include_str!("../sql/store_renew.sql");
+const COMPLETE: &str = include_str!("../sql/store_complete.sql");
+const FAIL: &str = include_str!("../sql/store_fail.sql");
+const CANCEL: &str = include_str!("../sql/store_cancel.sql");
+const RETRY_FAILED: &str = include_str!("../sql/store_retry_failed.sql");
+const PAUSE_TASK: &str = include_str!("../sql/store_pause_task.sql");
+const RESUME_TASK: &str = include_str!("../sql/store_resume_task.sql");
+const PARK_PAUSED: &str = include_str!("../sql/store_park_paused.sql");
+const RECOVER_EXPIRED: &str = include_str!("../sql/store_recover_expired.sql");
 
 /// Checks that a connection belongs to the schema instance of the queue.
 ///
 /// A transaction of another database is refused, also when that database holds
 /// a schema of the library.
-pub(crate) async fn verify_instance(connection: &mut PgConnection, expected: Uuid) -> Result<()> {
-    let present = sqlx::query_file_scalar!("sql/store_marker_present.sql")
-        .fetch_one(&mut *connection)
-        .await?;
-    if !present.unwrap_or(false) {
+pub(crate) async fn verify_instance<C: ConnectionTrait>(
+    connection: &C,
+    expected: Uuid,
+) -> Result<()> {
+    let present = fetch_scalar::<bool>(connection, sql::statement(MARKER_PRESENT, vec![]))
+        .await?
+        .unwrap_or(false);
+    if !present {
         return Err(Error::SchemaMissing {
             schema: SCHEMA_NAME.to_owned(),
         });
     }
-    let marker = sqlx::query_file_as!(OwnershipRow, "sql/migration_ownership.sql")
-        .fetch_optional(&mut *connection)
+    let marker = schema_ownership::Entity::find()
+        .one(connection)
         .await?
         .ok_or(Error::SchemaMissing {
             schema: SCHEMA_NAME.to_owned(),
@@ -109,34 +85,31 @@ pub(crate) async fn verify_instance(connection: &mut PgConnection, expected: Uui
 /// Claims and policy replacement use the same lock, so a policy change and a
 /// count-and-claim cannot interleave. The lock is held until the end of the
 /// transaction of the caller.
-pub(crate) async fn lock_queue(
-    connection: &mut PgConnection,
+pub(crate) async fn lock_queue<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
 ) -> Result<()> {
-    sqlx::query_file!(
-        "sql/store_lock_queue.sql",
-        namespace.as_str(),
-        queue.as_str(),
-    )
-    .fetch_one(&mut *connection)
-    .await?;
+    connection
+        .query_one_raw(sql::statement(
+            LOCK_QUEUE,
+            vec![namespace.as_str().into(), queue.as_str().into()],
+        ))
+        .await?;
     Ok(())
 }
 
 /// Reads the durable execution policy of the queue.
-pub(crate) async fn queue_policy(
-    connection: &mut PgConnection,
+pub(crate) async fn queue_policy<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
 ) -> Result<QueuePolicy> {
-    let row = sqlx::query_file_as!(
-        QueuePolicyRow,
-        "sql/store_queue_policy_get.sql",
-        namespace.as_str(),
-        queue.as_str(),
-    )
-    .fetch_optional(&mut *connection)
+    let row = policy_entity::Entity::find_by_id((
+        namespace.as_str().to_owned(),
+        queue.as_str().to_owned(),
+    ))
+    .one(connection)
     .await?;
     match row {
         Some(row) => {
@@ -156,57 +129,55 @@ pub(crate) async fn queue_policy(
 }
 
 /// Stores the positive concurrency limit of the queue.
-pub(crate) async fn set_queue_policy(
-    connection: &mut PgConnection,
+pub(crate) async fn set_queue_policy<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     max_concurrent_attempts: i32,
 ) -> Result<()> {
-    sqlx::query_file!(
-        "sql/store_queue_policy_set.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        max_concurrent_attempts,
-    )
-    .execute(&mut *connection)
-    .await?;
+    connection
+        .execute_raw(sql::statement(
+            QUEUE_POLICY_SET,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                max_concurrent_attempts.into(),
+            ],
+        ))
+        .await?;
     Ok(())
 }
 
 /// Removes the stored policy of the queue and restores the unlimited default.
-pub(crate) async fn clear_queue_policy(
-    connection: &mut PgConnection,
+pub(crate) async fn clear_queue_policy<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
 ) -> Result<()> {
-    sqlx::query_file!(
-        "sql/store_queue_policy_delete.sql",
-        namespace.as_str(),
-        queue.as_str(),
-    )
-    .execute(&mut *connection)
-    .await?;
+    policy_entity::Entity::delete_by_id((namespace.as_str().to_owned(), queue.as_str().to_owned()))
+        .exec(connection)
+        .await?;
     Ok(())
 }
 
-async fn running_attempt_count(
-    connection: &mut PgConnection,
+async fn running_attempt_count<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
 ) -> Result<i64> {
-    Ok(sqlx::query_file_scalar!(
-        "sql/store_queue_policy_count.sql",
-        namespace.as_str(),
-        queue.as_str(),
+    Ok(fetch_scalar::<i64>(
+        connection,
+        sql::statement(
+            QUEUE_POLICY_COUNT,
+            vec![namespace.as_str().into(), queue.as_str().into()],
+        ),
     )
-    .fetch_one(&mut *connection)
     .await?
     .unwrap_or_default())
 }
 
-async fn transaction_isolation(connection: &mut PgConnection) -> Result<String> {
-    sqlx::query_file_scalar!("sql/store_queue_policy_isolation.sql")
-        .fetch_one(&mut *connection)
+async fn transaction_isolation<C: ConnectionTrait>(connection: &C) -> Result<String> {
+    fetch_scalar::<String>(connection, sql::statement(TRANSACTION_ISOLATION, vec![]))
         .await?
         .ok_or(Error::Validation {
             field: "transaction_isolation",
@@ -215,21 +186,25 @@ async fn transaction_isolation(connection: &mut PgConnection) -> Result<String> 
 }
 
 /// Whether the captured attempt already holds a terminal seal.
-pub(crate) async fn attempt_is_sealed(
-    connection: &mut PgConnection,
+pub(crate) async fn attempt_is_sealed<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     attempt: &Attempt,
 ) -> Result<bool> {
-    Ok(sqlx::query_file_scalar!(
-        "sql/store_attempt_sealed.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        attempt.task_id().as_uuid(),
-        attempt.id().as_uuid(),
-        attempt.fencing_token().as_uuid(),
+    Ok(fetch_scalar::<bool>(
+        connection,
+        sql::statement(
+            ATTEMPT_SEALED,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                attempt.task_id().as_uuid().into(),
+                attempt.id().as_uuid().into(),
+                attempt.fencing_token().as_uuid().into(),
+            ],
+        ),
     )
-    .fetch_one(&mut *connection)
     .await?
     .unwrap_or(false))
 }
@@ -242,19 +217,23 @@ pub(crate) async fn attempt_is_sealed(
 pub(crate) const MAX_ADDITIONAL_ATTEMPTS: u32 = i32::MAX as u32;
 
 /// The error of an operation whose lease guard did not match.
-pub(crate) async fn lease_failure(
-    connection: &mut PgConnection,
+pub(crate) async fn lease_failure<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     task_id: TaskId,
 ) -> Error {
-    let exists = sqlx::query_file_scalar!(
-        "sql/store_task_exists.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        task_id.as_uuid(),
+    let exists = fetch_scalar::<bool>(
+        connection,
+        sql::statement(
+            TASK_EXISTS,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                task_id.as_uuid().into(),
+            ],
+        ),
     )
-    .fetch_one(&mut *connection)
     .await
     .unwrap_or(None)
     .unwrap_or(false);
@@ -272,33 +251,28 @@ pub(crate) async fn lease_failure(
 /// The lock is taken before the lease of the attempt is checked, so that the
 /// check uses the clock of the database after a lock wait. The caller keeps
 /// the lock until the end of its transaction.
-pub(crate) async fn lock_attempt(
-    connection: &mut PgConnection,
+pub(crate) async fn lock_attempt<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     attempt: &Attempt,
 ) -> Result<()> {
-    let row = sqlx::query_file_as!(
-        LockRow,
-        "sql/store_lock_attempt.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        attempt.task_id().as_uuid(),
-        attempt.id().as_uuid(),
-        attempt.fencing_token().as_uuid(),
-    )
-    .fetch_one(&mut *connection)
-    .await?;
-    match (
-        row.task_found.unwrap_or_default(),
-        row.attempt_found.unwrap_or_default(),
-    ) {
-        (0, _) => Err(Error::NotFound),
-        (_, 0) => Err(Error::LeaseLost {
+    let row = connection
+        .query_one_raw(sql::statement(
+            LOCK_ATTEMPT,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                attempt.task_id().as_uuid().into(),
+                attempt.id().as_uuid().into(),
+                attempt.fencing_token().as_uuid().into(),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| Error::LeaseLost {
             task_id: attempt.task_id().as_uuid(),
-        }),
-        _ => Ok(()),
-    }
+        })?;
+    lock_outcome(&row, attempt)
 }
 
 /// Locks the task and the attempt of a lease guarded operation.
@@ -306,27 +280,34 @@ pub(crate) async fn lock_attempt(
 /// The task is locked before the attempt, so that all operations of a task
 /// take its locks in the same order. The caller keeps the locks until the end
 /// of its transaction.
-pub(crate) async fn lock_task_attempt(
-    connection: &mut PgConnection,
+pub(crate) async fn lock_task_attempt<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     attempt: &Attempt,
 ) -> Result<()> {
-    let row = sqlx::query_file_as!(
-        LockRow,
-        "sql/store_lock_task_attempt.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        attempt.task_id().as_uuid(),
-        attempt.id().as_uuid(),
-        attempt.fencing_token().as_uuid(),
-    )
-    .fetch_one(&mut *connection)
-    .await?;
-    match (
-        row.task_found.unwrap_or_default(),
-        row.attempt_found.unwrap_or_default(),
-    ) {
+    let row = connection
+        .query_one_raw(sql::statement(
+            LOCK_TASK_ATTEMPT,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                attempt.task_id().as_uuid().into(),
+                attempt.id().as_uuid().into(),
+                attempt.fencing_token().as_uuid().into(),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| Error::LeaseLost {
+            task_id: attempt.task_id().as_uuid(),
+        })?;
+    lock_outcome(&row, attempt)
+}
+
+fn lock_outcome(row: &QueryResult, attempt: &Attempt) -> Result<()> {
+    let task_found = row.try_get_by::<Option<i64>, usize>(0)?.unwrap_or_default();
+    let attempt_found = row.try_get_by::<Option<i64>, usize>(1)?.unwrap_or_default();
+    match (task_found, attempt_found) {
         (0, _) => Err(Error::NotFound),
         (_, 0) => Err(Error::LeaseLost {
             task_id: attempt.task_id().as_uuid(),
@@ -336,77 +317,85 @@ pub(crate) async fn lock_task_attempt(
 }
 
 /// Notifies the workers that a task is ready.
-pub(crate) async fn notify_ready(connection: &mut PgConnection) -> Result<()> {
-    sqlx::query_file!("sql/store_notify_ready.sql")
-        .fetch_one(&mut *connection)
+pub(crate) async fn notify_ready<C: ConnectionTrait>(connection: &C) -> Result<()> {
+    connection
+        .query_one_raw(sql::statement(NOTIFY_READY, vec![]))
         .await?;
     Ok(())
 }
 
 /// Reads one task of the queue.
-pub(crate) async fn task_by_id(
-    connection: &mut PgConnection,
+pub(crate) async fn task_by_id<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     task_id: TaskId,
 ) -> Result<Option<Task>> {
-    let row = sqlx::query_file_as!(
-        TaskRow,
-        "sql/store_task_by_id.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        task_id.as_uuid(),
-    )
-    .fetch_optional(&mut *connection)
-    .await?;
-    row.map(task_from_row).transpose()
+    let row = task_entity::Entity::find_by_id(task_id.as_uuid())
+        .filter(task_entity::Column::Namespace.eq(namespace.as_str()))
+        .filter(task_entity::Column::Queue.eq(queue.as_str()))
+        .one(connection)
+        .await?;
+    row.map(task_from_model).transpose()
 }
 
 /// Lists the tasks of the queue, newest first.
-pub(crate) async fn list_tasks(
-    connection: &mut PgConnection,
+pub(crate) async fn list_tasks<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     cursor: Option<ListCursor>,
     limit: u32,
 ) -> Result<Vec<Task>> {
+    let mut query = task_entity::Entity::find()
+        .filter(task_entity::Column::Namespace.eq(namespace.as_str()))
+        .filter(task_entity::Column::Queue.eq(queue.as_str()));
     let (created_at, id) = match cursor {
         Some(cursor) => (cursor.utc_created_at()?, cursor.id().as_uuid()),
         None => first_page_cursor(),
     };
-    let rows = sqlx::query_file_as!(
-        TaskRow,
-        "sql/store_list_tasks.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        created_at,
-        id,
-        i64::from(limit),
-    )
-    .fetch_all(&mut *connection)
-    .await?;
-    rows.into_iter().map(task_from_row).collect()
+    query = query.filter(
+        Condition::any()
+            .add(task_entity::Column::CreatedAt.lt(created_at))
+            .add(
+                Condition::all()
+                    .add(task_entity::Column::CreatedAt.eq(created_at))
+                    .add(task_entity::Column::Id.lt(id)),
+            ),
+    );
+    let rows = query
+        .order_by_desc(task_entity::Column::CreatedAt)
+        .order_by_desc(task_entity::Column::Id)
+        .limit(u64::from(limit))
+        .all(connection)
+        .await?;
+    rows.into_iter().map(task_from_model).collect()
 }
 
 /// Lists the attempts of a task, newest first.
-pub(crate) async fn list_attempts(
-    connection: &mut PgConnection,
+pub(crate) async fn list_attempts<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     task_id: TaskId,
     limit: u32,
 ) -> Result<Vec<Attempt>> {
-    let rows = sqlx::query_file_as!(
-        AttemptRow,
-        "sql/store_list_attempts.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        task_id.as_uuid(),
-        i64::from(limit),
-    )
-    .fetch_all(&mut *connection)
-    .await?;
-    rows.into_iter().map(attempt_from_row).collect()
+    let scoped = task_entity::Entity::find_by_id(task_id.as_uuid())
+        .filter(task_entity::Column::Namespace.eq(namespace.as_str()))
+        .filter(task_entity::Column::Queue.eq(queue.as_str()))
+        .one(connection)
+        .await?
+        .is_some();
+    if !scoped {
+        return Ok(Vec::new());
+    }
+    let rows = attempt_entity::Entity::find()
+        .filter(attempt_entity::Column::TaskId.eq(task_id.as_uuid()))
+        .order_by_desc(attempt_entity::Column::AttemptNumber)
+        .limit(u64::from(limit))
+        .all(connection)
+        .await?;
+    rows.into_iter().map(attempt_from_model).collect()
 }
 
 /// Claims the next ready task of the queue.
@@ -414,8 +403,8 @@ pub(crate) async fn list_attempts(
 /// A target restricts the claim to one task of the queue. The claim is `None`
 /// when the target is not ready, not of this queue or locked by another
 /// transaction, never another task of the queue.
-pub(crate) async fn claim_task(
-    connection: &mut PgConnection,
+pub(crate) async fn claim_task<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     worker_id: &str,
@@ -445,21 +434,22 @@ pub(crate) async fn claim_task(
         }
     }
 
-    let row = sqlx::query_file_as!(
-        AttemptRow,
-        "sql/store_claim.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        worker_id,
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-        duration_millis(lease_ttl),
-        target.map(|task_id| task_id.as_uuid()),
-    )
-    .fetch_optional(&mut *connection)
-    .await?;
+    let row = connection
+        .query_one_raw(sql::statement(
+            CLAIM,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                worker_id.into(),
+                Uuid::new_v4().into(),
+                Uuid::new_v4().into(),
+                duration_millis(lease_ttl).into(),
+                target.map(|task_id| task_id.as_uuid()).into(),
+            ],
+        ))
+        .await?;
     let attempt = match row {
-        Some(row) => attempt_from_row(row)?,
+        Some(row) => attempt_from_model(attempt_entity::Model::from_query_result(&row, "")?)?,
         None => return Ok(None),
     };
     let task = task_by_id(connection, namespace, queue, attempt.task_id())
@@ -469,29 +459,33 @@ pub(crate) async fn claim_task(
 }
 
 /// Renews the lease of an attempt.
-pub(crate) async fn renew_attempt(
-    connection: &mut PgConnection,
+pub(crate) async fn renew_attempt<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     attempt: &Attempt,
     lease_ttl: Duration,
 ) -> Result<OffsetDateTime> {
     lock_attempt(connection, namespace, queue, attempt).await?;
-    let row = sqlx::query_file!(
-        "sql/store_renew.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        attempt.task_id().as_uuid(),
-        attempt.id().as_uuid(),
-        attempt.fencing_token().as_uuid(),
-        duration_millis(lease_ttl),
-    )
-    .fetch_optional(&mut *connection)
-    .await?;
+    let row = connection
+        .query_one_raw(sql::statement(
+            RENEW,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                attempt.task_id().as_uuid().into(),
+                attempt.id().as_uuid().into(),
+                attempt.fencing_token().as_uuid().into(),
+                duration_millis(lease_ttl).into(),
+            ],
+        ))
+        .await?;
     match row {
-        Some(row) => row.lease_expires_at.ok_or(Error::LeaseLost {
-            task_id: attempt.task_id().as_uuid(),
-        }),
+        Some(row) => row
+            .try_get_by::<Option<OffsetDateTime>, usize>(0)?
+            .ok_or(Error::LeaseLost {
+                task_id: attempt.task_id().as_uuid(),
+            }),
         None => Err(Error::LeaseLost {
             task_id: attempt.task_id().as_uuid(),
         }),
@@ -499,28 +493,29 @@ pub(crate) async fn renew_attempt(
 }
 
 /// Completes an attempt and the task it belongs to.
-pub(crate) async fn complete_attempt(
-    connection: &mut PgConnection,
+pub(crate) async fn complete_attempt<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     attempt: &Attempt,
     result: Option<Value>,
 ) -> Result<Task> {
     lock_task_attempt(connection, namespace, queue, attempt).await?;
-    let row = sqlx::query_file_as!(
-        TaskRow,
-        "sql/store_complete.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        attempt.task_id().as_uuid(),
-        attempt.id().as_uuid(),
-        attempt.fencing_token().as_uuid(),
-        result,
-    )
-    .fetch_optional(&mut *connection)
-    .await?;
+    let row = connection
+        .query_one_raw(sql::statement(
+            COMPLETE,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                attempt.task_id().as_uuid().into(),
+                attempt.id().as_uuid().into(),
+                attempt.fencing_token().as_uuid().into(),
+                result.into(),
+            ],
+        ))
+        .await?;
     match row {
-        Some(row) => task_from_row(row),
+        Some(row) => task_from_model(task_entity::Model::from_query_result(&row, "")?),
         None => Err(Error::LeaseLost {
             task_id: attempt.task_id().as_uuid(),
         }),
@@ -529,8 +524,8 @@ pub(crate) async fn complete_attempt(
 
 /// Fails an attempt. A retryable failure requeues the task while its budget
 /// allows it.
-pub(crate) async fn fail_attempt(
-    connection: &mut PgConnection,
+pub(crate) async fn fail_attempt<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     attempt: &Attempt,
@@ -538,22 +533,23 @@ pub(crate) async fn fail_attempt(
     retry_delay: Duration,
 ) -> Result<Task> {
     lock_task_attempt(connection, namespace, queue, attempt).await?;
-    let row = sqlx::query_file_as!(
-        TaskRow,
-        "sql/store_fail.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        attempt.task_id().as_uuid(),
-        attempt.id().as_uuid(),
-        attempt.fencing_token().as_uuid(),
-        failure.error().cloned(),
-        failure.is_retryable(),
-        duration_micros(retry_delay),
-    )
-    .fetch_optional(&mut *connection)
-    .await?;
+    let row = connection
+        .query_one_raw(sql::statement(
+            FAIL,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                attempt.task_id().as_uuid().into(),
+                attempt.id().as_uuid().into(),
+                attempt.fencing_token().as_uuid().into(),
+                failure.error().cloned().into(),
+                failure.is_retryable().into(),
+                duration_micros(retry_delay).into(),
+            ],
+        ))
+        .await?;
     match row {
-        Some(row) => task_from_row(row),
+        Some(row) => task_from_model(task_entity::Model::from_query_result(&row, "")?),
         None => Err(Error::LeaseLost {
             task_id: attempt.task_id().as_uuid(),
         }),
@@ -564,23 +560,24 @@ pub(crate) async fn fail_attempt(
 ///
 /// A queued task is cancelled at once, a running task is marked for
 /// cancellation and a terminal task is reported unchanged.
-pub(crate) async fn cancel_task(
-    connection: &mut PgConnection,
+pub(crate) async fn cancel_task<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     task_id: TaskId,
 ) -> Result<Task> {
-    let row = sqlx::query_file_as!(
-        TaskRow,
-        "sql/store_cancel.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        task_id.as_uuid(),
-    )
-    .fetch_optional(&mut *connection)
-    .await?;
+    let row = connection
+        .query_one_raw(sql::statement(
+            CANCEL,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                task_id.as_uuid().into(),
+            ],
+        ))
+        .await?;
     if let Some(row) = row {
-        return task_from_row(row);
+        return task_from_model(task_entity::Model::from_query_result(&row, "")?);
     }
     match task_by_id(connection, namespace, queue, task_id).await? {
         Some(task) => Ok(task),
@@ -589,8 +586,8 @@ pub(crate) async fn cancel_task(
 }
 
 /// Schedules a failed task again with a larger budget.
-pub(crate) async fn retry_failed_task(
-    connection: &mut PgConnection,
+pub(crate) async fn retry_failed_task<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     task_id: TaskId,
@@ -600,19 +597,20 @@ pub(crate) async fn retry_failed_task(
         field: "additional_attempts",
         reason: format!("must not exceed {MAX_ADDITIONAL_ATTEMPTS}"),
     })?;
-    let row = sqlx::query_file_as!(
-        TaskRow,
-        "sql/store_retry_failed.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        task_id.as_uuid(),
-        i64::from(additional),
-        i64::from(i32::MAX),
-    )
-    .fetch_optional(&mut *connection)
-    .await?;
+    let row = connection
+        .query_one_raw(sql::statement(
+            RETRY_FAILED,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                task_id.as_uuid().into(),
+                i64::from(additional).into(),
+                i64::from(i32::MAX).into(),
+            ],
+        ))
+        .await?;
     if let Some(row) = row {
-        return task_from_row(row);
+        return task_from_model(task_entity::Model::from_query_result(&row, "")?);
     }
     match task_by_id(connection, namespace, queue, task_id).await? {
         Some(task) => Err(Error::InvalidTaskState {
@@ -625,23 +623,24 @@ pub(crate) async fn retry_failed_task(
 }
 
 /// Requests the cooperative pause of one task.
-pub(crate) async fn pause_task(
-    connection: &mut PgConnection,
+pub(crate) async fn pause_task<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     task_id: TaskId,
 ) -> Result<Task> {
-    let row = sqlx::query_file_as!(
-        TaskRow,
-        "sql/store_pause_task.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        task_id.as_uuid(),
-    )
-    .fetch_optional(&mut *connection)
-    .await?;
+    let row = connection
+        .query_one_raw(sql::statement(
+            PAUSE_TASK,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                task_id.as_uuid().into(),
+            ],
+        ))
+        .await?;
     if let Some(row) = row {
-        return task_from_row(row);
+        return task_from_model(task_entity::Model::from_query_result(&row, "")?);
     }
     match task_by_id(connection, namespace, queue, task_id).await? {
         Some(task) if matches!(task.status(), TaskStatus::Queued | TaskStatus::Running) => Ok(task),
@@ -655,23 +654,24 @@ pub(crate) async fn pause_task(
 }
 
 /// Resumes a pausing or paused task.
-pub(crate) async fn resume_task(
-    connection: &mut PgConnection,
+pub(crate) async fn resume_task<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     task_id: TaskId,
 ) -> Result<Task> {
-    let row = sqlx::query_file_as!(
-        TaskRow,
-        "sql/store_resume_task.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        task_id.as_uuid(),
-    )
-    .fetch_optional(&mut *connection)
-    .await?;
+    let row = connection
+        .query_one_raw(sql::statement(
+            RESUME_TASK,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                task_id.as_uuid().into(),
+            ],
+        ))
+        .await?;
     if let Some(row) = row {
-        return task_from_row(row);
+        return task_from_model(task_entity::Model::from_query_result(&row, "")?);
     }
     match task_by_id(connection, namespace, queue, task_id).await? {
         Some(task) if matches!(task.status(), TaskStatus::Queued | TaskStatus::Running) => Ok(task),
@@ -685,8 +685,8 @@ pub(crate) async fn resume_task(
 }
 
 /// Seals the exact attempt of a task as a parked pause checkpoint.
-pub(crate) async fn park_paused(
-    connection: &mut PgConnection,
+pub(crate) async fn park_paused<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     attempt: &Attempt,
@@ -702,19 +702,20 @@ pub(crate) async fn park_paused(
             found: attempt.pause_generation(),
         });
     }
-    let row = sqlx::query_file_as!(
-        TaskRow,
-        "sql/store_park_paused.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        attempt.task_id().as_uuid(),
-        attempt.id().as_uuid(),
-        attempt.fencing_token().as_uuid(),
-    )
-    .fetch_optional(&mut *connection)
-    .await?;
+    let row = connection
+        .query_one_raw(sql::statement(
+            PARK_PAUSED,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                attempt.task_id().as_uuid().into(),
+                attempt.id().as_uuid().into(),
+                attempt.fencing_token().as_uuid().into(),
+            ],
+        ))
+        .await?;
     match row {
-        Some(row) => task_from_row(row),
+        Some(row) => task_from_model(task_entity::Model::from_query_result(&row, "")?),
         None => Err(Error::LeaseLost {
             task_id: attempt.task_id().as_uuid(),
         }),
@@ -722,25 +723,28 @@ pub(crate) async fn park_paused(
 }
 
 /// Seals the attempts whose lease expired and schedules their tasks again.
-pub(crate) async fn recover_expired_tasks(
-    connection: &mut PgConnection,
+pub(crate) async fn recover_expired_tasks<C: ConnectionTrait>(
+    connection: &C,
     namespace: &Namespace,
     queue: &QueueName,
     limit: u32,
 ) -> Result<Vec<Task>> {
-    let rows = sqlx::query_file_as!(
-        TaskRow,
-        "sql/store_recover_expired.sql",
-        namespace.as_str(),
-        queue.as_str(),
-        i64::from(limit),
-    )
-    .fetch_all(&mut *connection)
-    .await?;
-    rows.into_iter().map(task_from_row).collect()
+    let rows = connection
+        .query_all_raw(sql::statement(
+            RECOVER_EXPIRED,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                i64::from(limit).into(),
+            ],
+        ))
+        .await?;
+    rows.into_iter()
+        .map(|row| task_from_model(task_entity::Model::from_query_result(&row, "")?))
+        .collect()
 }
 
-fn task_from_row(row: TaskRow) -> Result<Task> {
+pub(crate) fn task_from_model(row: task_entity::Model) -> Result<Task> {
     Ok(Task {
         id: TaskId::from_uuid(row.id),
         namespace: Namespace::new(&row.namespace)?,
@@ -767,7 +771,7 @@ fn task_from_row(row: TaskRow) -> Result<Task> {
     })
 }
 
-fn attempt_from_row(row: AttemptRow) -> Result<Attempt> {
+fn attempt_from_model(row: attempt_entity::Model) -> Result<Attempt> {
     Ok(Attempt {
         id: AttemptId::from_uuid(row.id),
         task_id: TaskId::from_uuid(row.task_id),
@@ -808,4 +812,17 @@ pub(crate) fn duration_micros(duration: Duration) -> i64 {
     i64::try_from(duration.as_micros())
         .unwrap_or(i64::MAX)
         .max(1)
+}
+
+async fn fetch_scalar<T>(
+    connection: &impl ConnectionTrait,
+    statement: Statement,
+) -> Result<Option<T>>
+where
+    T: TryGetable,
+{
+    match connection.query_one_raw(statement).await? {
+        Some(row) => Ok(Some(row.try_get_by::<T, usize>(0)?)),
+        None => Ok(None),
+    }
 }

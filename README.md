@@ -37,16 +37,23 @@ commit you verified:
 ```toml
 [dependencies]
 cloudiful-tasks = { git = "https://github.com/cloudiful/tasks", rev = "<COMMIT_SHA>" }
-sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "macros", "migrate", "json", "uuid", "time"] }
+sea-orm = { version = "2.0.4", default-features = false, features = [
+    "macros",
+    "with-json",
+    "with-uuid",
+    "with-time",
+    "sqlx-postgres",
+    "runtime-tokio-rustls",
+] }
 tokio-util = "0.7"
 ```
 
-The public API takes a `sqlx::PgPool`, so the application depends on `sqlx`
-directly. Timestamps are `time::OffsetDateTime` and must be representable in UTC
-within the default `time` year range (-9999 through 9999); PostgreSQL values
-outside that range are not supported. A persisted availability timestamp uses
-UTC with exactly six fractional digits and a `Z` suffix, so the same request
-keeps the same identity across builds.
+The public API takes a `sea_orm::DatabaseConnection`, so the application supplies
+the connection and its pool configuration. Timestamps are `time::OffsetDateTime`
+and must be representable in UTC within the default `time` year range (-9999
+through 9999); PostgreSQL values outside that range are not supported. A
+persisted availability timestamp uses UTC with exactly six fractional digits and
+a `Z` suffix, so the same request keeps the same identity across builds.
 
 ## Usage
 
@@ -57,18 +64,20 @@ creates or alters schema.
 
 ```rust
 use cloudiful_tasks::{check_schema, migrate};
-use sqlx::postgres::PgPoolOptions;
+use sea_orm::Database;
 
-let pool = PgPoolOptions::new().max_connections(5).connect("postgresql://user@localhost/tasks").await?;
-migrate(&pool).await?;
-check_schema(&pool).await?;
+let db = Database::connect("postgresql://user@localhost/tasks").await?;
+migrate(&db).await?;
+check_schema(&db).await?;
 ```
 
 `migrate` is idempotent and serialized per database: it creates a missing schema
 and upgrades a supported older version. `check_schema` only reads and reports
 `SchemaMissing` or `OutdatedSchemaVersion` instead. Both refuse foreign schemas
 (`ForeignSchema`) and newer protocols (`UnsupportedSchemaVersion`); a schema
-that the library does not own is never adopted or overwritten.
+that the library does not own is never adopted or overwritten. A ledger row that
+did not complete successfully is a dirty migration: it is reported as
+`DirtyMigration` and never retried.
 
 ### The queue
 
@@ -78,7 +87,7 @@ A queue addresses the tasks of one namespace and one queue name.
 use cloudiful_tasks::{EnqueueRequest, Queue, TaskKind, WorkerConfig};
 use serde_json::json;
 
-let queue = Queue::open(pool.clone(), "stock", "k8s", &WorkerConfig::default()).await?;
+let queue = Queue::open(db.clone(), "stock", "k8s", &WorkerConfig::default()).await?;
 let request = EnqueueRequest::new(TaskKind::new("sync")?, json!({"cluster": "a"})).with_idempotency_key("sync:cluster-a")?;
 queue.enqueue(request).await?;
 
@@ -122,7 +131,7 @@ impl TaskHandler for Sync {
 }
 
 let config = WorkerConfig::default();
-let queue = Queue::open(pool.clone(), "stock", "k8s", &config).await?;
+let queue = Queue::open(db.clone(), "stock", "k8s", &config).await?;
 let worker = Worker::builder(queue, config).handler(TaskKind::new("sync")?, Sync)?.build()?;
 worker.run(CancellationToken::new()).await?;
 ```
@@ -166,7 +175,9 @@ caller: `enqueue_in`, `claim_in`, `renew_in`, `report_progress_in`,
 `park_paused_in`, `retry_failed_in` and `recover_expired_in`.
 
 ```rust
-let mut transaction = pool.begin().await?;
+use sea_orm::TransactionTrait;
+
+let mut transaction = db.begin().await?;
 queue.enqueue_in(&mut transaction, request).await?;
 write_business_row(&mut transaction).await?;
 transaction.commit().await?;
@@ -181,19 +192,14 @@ committed.
 
 ## Build
 
-All SQL of the library lives in `sql/*.sql` and is loaded through `query_file!`
-and `query_file_as!`. The query metadata in `.sqlx` is committed, so the crate
-builds without a database:
+Persistence runs through SeaORM. Ordinary reads and writes use the private SeaORM
+entities of the library; concurrency-critical statements, migrations and the
+legacy migration ledger live in `sql/*.sql` and are executed as SeaORM
+statements. No compile-time query metadata is needed, so the crate builds
+offline:
 
 ```sh
-SQLX_OFFLINE=true cargo check --locked --offline --all-targets
-```
-
-Regenerate the metadata only against the dedicated development database of the
-shared non-production test server:
-
-```sh
-DATABASE_URL="$TASKS_TEST_SIBLING_DATABASE_URL" cargo sqlx prepare -- --all-targets
+cargo check --locked --offline --all-targets
 ```
 
 The live suites read their fixture URLs from `TASKS_TEST_DATABASE_URL` and

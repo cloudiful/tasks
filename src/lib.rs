@@ -29,6 +29,7 @@
 
 pub mod backoff;
 pub mod config;
+mod entity;
 pub mod error;
 pub mod handler;
 pub mod idempotency;
@@ -36,6 +37,16 @@ pub mod migrate;
 pub mod model;
 pub mod progress;
 pub mod queue;
+mod sql;
+
+/// Native SeaQuery declarations of the schema produced by [`migrate`].
+///
+/// The immutable migrations remain the only writer. The declarations describe
+/// the resulting tables, constraints, indexes and foreign key for schema drift
+/// verification.
+pub mod schema {
+    pub use crate::entity::schema::*;
+}
 pub mod store;
 pub mod wake;
 pub mod worker;

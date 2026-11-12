@@ -31,12 +31,19 @@ schema 中。本库不会自行执行任务：worker 运行时由应用显式启
 ```toml
 [dependencies]
 cloudiful-tasks = { git = "https://github.com/cloudiful/tasks", rev = "<COMMIT_SHA>" }
-sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "macros", "migrate", "json", "uuid", "time"] }
+sea-orm = { version = "2.0.4", default-features = false, features = [
+    "macros",
+    "with-json",
+    "with-uuid",
+    "with-time",
+    "sqlx-postgres",
+    "runtime-tokio-rustls",
+] }
 tokio-util = "0.7"
 ```
 
-公开 API 接收 `sqlx::PgPool`，因此应用需要直接依赖 `sqlx`。时间戳使用
-`time::OffsetDateTime`，必须能以 UTC 表示在 `time` 默认的年份范围内
+公开 API 接收 `sea_orm::DatabaseConnection`，因此应用负责提供连接及其连接池配置。
+时间戳使用 `time::OffsetDateTime`，必须能以 UTC 表示在 `time` 默认的年份范围内
 （-9999 至 9999）；不支持超出该范围的 PostgreSQL 值。持久化的可用时间使用
 UTC、固定六位小数及 `Z` 后缀，因此同一个请求在不同构建之间保持同一身份。
 
@@ -48,17 +55,18 @@ schema 必须显式创建。打开队列或启动 worker 都不会创建或修�
 
 ```rust
 use cloudiful_tasks::{check_schema, migrate};
-use sqlx::postgres::PgPoolOptions;
+use sea_orm::Database;
 
-let pool = PgPoolOptions::new().max_connections(5).connect("postgresql://user@localhost/tasks").await?;
-migrate(&pool).await?;
-check_schema(&pool).await?;
+let db = Database::connect("postgresql://user@localhost/tasks").await?;
+migrate(&db).await?;
+check_schema(&db).await?;
 ```
 
 `migrate` 是幂等的，并且按数据库串行化：创建缺失的 schema，升级受支持的旧版本。
 `check_schema` 只读，分别返回 `SchemaMissing` 或 `OutdatedSchemaVersion`。
 两者都拒绝其他库的 schema（`ForeignSchema`）和更新的协议版本
-（`UnsupportedSchemaVersion`），不属于本库的 schema 不会被接管或覆盖。
+（`UnsupportedSchemaVersion`），不属于本库的 schema 不会被接管或覆盖。未成功完成的
+迁移记录属于脏迁移：`check_schema` 返回 `DirtyMigration`，且不会被重试。
 
 ### 队列
 
@@ -68,7 +76,7 @@ check_schema(&pool).await?;
 use cloudiful_tasks::{EnqueueRequest, Queue, TaskKind, WorkerConfig};
 use serde_json::json;
 
-let queue = Queue::open(pool.clone(), "stock", "k8s", &WorkerConfig::default()).await?;
+let queue = Queue::open(db.clone(), "stock", "k8s", &WorkerConfig::default()).await?;
 let request = EnqueueRequest::new(TaskKind::new("sync")?, json!({"cluster": "a"})).with_idempotency_key("sync:cluster-a")?;
 queue.enqueue(request).await?;
 
@@ -109,7 +117,7 @@ impl TaskHandler for Sync {
 }
 
 let config = WorkerConfig::default();
-let queue = Queue::open(pool.clone(), "stock", "k8s", &config).await?;
+let queue = Queue::open(db.clone(), "stock", "k8s", &config).await?;
 let worker = Worker::builder(queue, config).handler(TaskKind::new("sync")?, Sync)?.build()?;
 worker.run(CancellationToken::new()).await?;
 ```
@@ -148,7 +156,9 @@ queue.resume(task_id).await?;
 `retry_failed_in` 和 `recover_expired_in`。
 
 ```rust
-let mut transaction = pool.begin().await?;
+use sea_orm::TransactionTrait;
+
+let mut transaction = db.begin().await?;
 queue.enqueue_in(&mut transaction, request).await?;
 write_business_row(&mut transaction).await?;
 transaction.commit().await?;
@@ -161,17 +171,12 @@ transaction.commit().await?;
 
 ## 构建
 
-本库的所有 SQL 位于 `sql/*.sql`，通过 `query_file!` 和 `query_file_as!` 加载。
-`.sqlx` 中的查询元数据已提交，因此无需数据库即可构建：
+持久化通过 SeaORM 执行。普通的读写使用本库私有的 SeaORM 实体；并发关键语句、
+迁移和旧版迁移记录表位于 `sql/*.sql`，以 SeaORM 语句执行。构建不需要编译期查询
+元数据，可离线完成：
 
 ```sh
-SQLX_OFFLINE=true cargo check --locked --offline --all-targets
-```
-
-仅针对共享非生产测试服务器上的专用开发数据库重新生成元数据：
-
-```sh
-DATABASE_URL="$TASKS_TEST_SIBLING_DATABASE_URL" cargo sqlx prepare -- --all-targets
+cargo check --locked --offline --all-targets
 ```
 
 实时测试从 `TASKS_TEST_DATABASE_URL` 和 `TASKS_TEST_SIBLING_DATABASE_URL`

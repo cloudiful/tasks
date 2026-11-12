@@ -12,8 +12,11 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use cloudiful_tasks::{Queue, WorkerConfig};
-use sqlx::postgres::PgConnectOptions;
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sea_orm::sqlx::postgres::PgConnectOptions;
+use sea_orm::{
+    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DatabaseTransaction, DbBackend,
+    Statement, TryGetable,
+};
 
 /// Environment variable that holds the URL of the dedicated test database.
 pub const TEST_DATABASE_URL_ENV: &str = "TASKS_TEST_DATABASE_URL";
@@ -175,18 +178,12 @@ const INSERT_TASK_SQL: &str = include_str!("../../sql/tests/worker_insert_task.s
 /// state.
 const APP_DOMAIN_SETUP_SQL: &str = include_str!("../../sql/tests/transaction_app_domain_setup.sql");
 
-#[derive(sqlx::FromRow)]
 struct IdentityRow {
     database_name: Option<String>,
     user_name: Option<String>,
     server_address: Option<String>,
     server_port: Option<String>,
     database_comment: Option<String>,
-}
-
-#[derive(sqlx::FromRow)]
-struct RelationRow {
-    relation_name: String,
 }
 
 fn fixture_options(
@@ -284,101 +281,128 @@ fn validate_identity(
     Ok(())
 }
 
-/// The connection options of the dedicated test database.
-pub fn test_database_options() -> PgConnectOptions {
+/// A SQL statement with positional values.
+pub fn statement(sql: &str, values: Vec<sea_orm::Value>) -> Statement {
+    Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
+}
+
+/// A single scalar value from a statement.
+pub async fn fetch_scalar<T: TryGetable>(
+    db: &DatabaseConnection,
+    statement: Statement,
+) -> Option<T> {
+    db.query_one_raw(statement)
+        .await
+        .expect("the scalar statement must run")
+        .map(|row| {
+            row.try_get_by::<T, usize>(0)
+                .expect("the scalar value must decode")
+        })
+}
+
+/// Connects to the test database with a fresh pool and verifies its identity.
+pub async fn connect_worker() -> DatabaseConnection {
+    connect_worker_with(4).await
+}
+
+/// Connects to the test database with a fresh pool of the given size.
+pub async fn connect_worker_with(max_connections: u32) -> DatabaseConnection {
     let profile = target_profile();
-    fixture_options(TEST_DATABASE_URL_ENV, &profile.database, &profile)
+    let options = fixture_options(TEST_DATABASE_URL_ENV, &profile.database, &profile);
+    let url = std::env::var(TEST_DATABASE_URL_ENV).expect("the test database url must be set");
+    let mut connect = ConnectOptions::new(url);
+    connect.max_connections(max_connections);
+    let db = Database::connect(connect)
+        .await
+        .expect("the dedicated worker database must be reachable");
+    verify_identity(&db, &options, &profile, &profile.database).await;
+    db
 }
 
 /// Connects to the test database and verifies that it is the expected fixture.
-pub async fn connect() -> PgPool {
-    let profile = target_profile();
-    let options = fixture_options(TEST_DATABASE_URL_ENV, &profile.database, &profile);
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect_with(options.clone())
-        .await
-        .expect("the dedicated test database must be reachable");
-    verify_identity(&pool, &options, &profile, &profile.database).await;
-    pool
+pub async fn connect() -> DatabaseConnection {
+    connect_worker().await
 }
 
 /// Removes the schema of the library and the task owned fixtures.
-pub async fn cleanup(pool: &PgPool) {
-    sqlx::raw_sql(CLEANUP_SQL)
-        .execute(pool)
+pub async fn cleanup(db: &DatabaseConnection) {
+    db.execute_unprepared(CLEANUP_SQL)
         .await
         .expect("the test fixtures must be removable");
 }
 
 /// Creates a schema that the library does not own.
-pub async fn create_foreign_schema(pool: &PgPool) {
-    sqlx::raw_sql(FOREIGN_SCHEMA_SQL)
-        .execute(pool)
+pub async fn create_foreign_schema(db: &DatabaseConnection) {
+    db.execute_unprepared(FOREIGN_SCHEMA_SQL)
         .await
         .expect("the foreign schema fixture must be creatable");
 }
 
 /// Creates an empty schema that the library does not own.
-pub async fn create_empty_schema(pool: &PgPool) {
-    sqlx::raw_sql(EMPTY_SCHEMA_SQL)
-        .execute(pool)
+pub async fn create_empty_schema(db: &DatabaseConnection) {
+    db.execute_unprepared(EMPTY_SCHEMA_SQL)
         .await
         .expect("the empty schema fixture must be creatable");
 }
 
 /// Creates a schema that holds the migration ledger of the library alone.
-pub async fn create_ledger_only_schema(pool: &PgPool) {
-    sqlx::raw_sql(LEDGER_ONLY_SCHEMA_SQL)
-        .execute(pool)
+pub async fn create_ledger_only_schema(db: &DatabaseConnection) {
+    db.execute_unprepared(LEDGER_ONLY_SCHEMA_SQL)
         .await
         .expect("the ledger only schema fixture must be creatable");
 }
 
 /// Creates the task owned tables in the public schema.
-pub async fn create_public_sentinels(pool: &PgPool) {
-    sqlx::raw_sql(PUBLIC_SENTINEL_SQL)
-        .execute(pool)
+pub async fn create_public_sentinels(db: &DatabaseConnection) {
+    db.execute_unprepared(PUBLIC_SENTINEL_SQL)
         .await
         .expect("the public sentinel fixtures must be creatable");
-    sqlx::raw_sql(SEED_SENTINEL_SQL)
-        .execute(pool)
+    db.execute_unprepared(SEED_SENTINEL_SQL)
         .await
         .expect("the public sentinel fixture must be seedable");
 }
 
 /// The relations of a schema.
-pub async fn relation_names(pool: &PgPool, schema: &str) -> Vec<String> {
-    let rows = sqlx::query_file_as!(RelationRow, "sql/migration_schema_relations.sql", schema)
-        .fetch_all(pool)
+pub async fn relation_names(db: &DatabaseConnection, schema: &str) -> Vec<String> {
+    let rows = db
+        .query_all_raw(statement(
+            include_str!("../../sql/migration_schema_relations.sql"),
+            vec![schema.into()],
+        ))
         .await
         .expect("the relations of the schema must be readable");
-    rows.into_iter().map(|row| row.relation_name).collect()
+    rows.into_iter()
+        .map(|row| {
+            row.try_get_by::<String, usize>(0)
+                .expect("the relation name must decode")
+        })
+        .collect()
 }
 
 /// Whether a schema exists.
-pub async fn schema_exists(pool: &PgPool, schema: &str) -> bool {
-    let row = sqlx::query_file!("sql/migration_schema_exists.sql", schema)
-        .fetch_one(pool)
-        .await
-        .expect("the schema catalog must be readable");
-    row.schema_exists.unwrap_or(false)
+pub async fn schema_exists(db: &DatabaseConnection, schema: &str) -> bool {
+    fetch_scalar::<bool>(
+        db,
+        statement(
+            include_str!("../../sql/migration_schema_exists.sql"),
+            vec![schema.into()],
+        ),
+    )
+    .await
+    .unwrap_or(false)
 }
 
 /// The number of advisory locks that are held in the database.
-pub async fn advisory_lock_count(pool: &PgPool) -> i64 {
-    let row = sqlx::raw_sql(ADVISORY_LOCKS_SQL)
-        .fetch_one(pool)
+pub async fn advisory_lock_count(db: &DatabaseConnection) -> i64 {
+    fetch_scalar::<i64>(db, statement(ADVISORY_LOCKS_SQL, Vec::new()))
         .await
-        .expect("the lock catalog must be readable");
-    row.try_get::<i64, _>("lock_count")
         .expect("the lock count must be a number")
 }
 
 /// Drops the schema of the library and creates it again.
-pub async fn reset(pool: &PgPool) {
-    cleanup(pool).await;
-    cloudiful_tasks::migrate(pool)
+pub async fn reset(db: &DatabaseConnection) {
+    cleanup(db).await;
+    cloudiful_tasks::migrate(db)
         .await
         .expect("the schema of the library must be migratable");
 }
@@ -413,27 +437,31 @@ pub fn test_config() -> WorkerConfig {
 }
 
 /// Opens a queue over the test database.
-pub async fn open_queue(pool: &PgPool, namespace: &str, queue: &str) -> Queue {
-    Queue::open(pool.clone(), namespace, queue, &test_config())
+pub async fn open_queue(db: &DatabaseConnection, namespace: &str, queue: &str) -> Queue {
+    Queue::open(db.clone(), namespace, queue, &test_config())
         .await
         .expect("the queue must be openable")
 }
 
 /// Opens a queue whose leases expire quickly.
-pub async fn open_queue_with_short_lease(pool: &PgPool, namespace: &str, queue: &str) -> Queue {
-    Queue::open(pool.clone(), namespace, queue, &short_lease_config())
+pub async fn open_queue_with_short_lease(
+    db: &DatabaseConnection,
+    namespace: &str,
+    queue: &str,
+) -> Queue {
+    Queue::open(db.clone(), namespace, queue, &short_lease_config())
         .await
         .expect("the queue must be openable")
 }
 
 /// Opens a queue with the configuration of a worker.
 pub async fn open_queue_with_config(
-    pool: &PgPool,
+    db: &DatabaseConnection,
     namespace: &str,
     queue: &str,
     config: &WorkerConfig,
 ) -> Queue {
-    Queue::open(pool.clone(), namespace, queue, config)
+    Queue::open(db.clone(), namespace, queue, config)
         .await
         .expect("the queue must be openable")
 }
@@ -443,41 +471,47 @@ pub async fn open_queue_with_config(
 /// The sibling database holds a schema of the library too, so it proves that a
 /// transaction of another database is refused. The tests only read from it and
 /// roll their transactions back.
-pub async fn connect_to_sibling_database() -> PgPool {
+pub async fn connect_to_sibling_database() -> DatabaseConnection {
     let profile = target_profile();
     let options = fixture_options(
         SIBLING_DATABASE_URL_ENV,
         &profile.sibling_database,
         &profile,
     );
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect_with(options.clone())
+    let url =
+        std::env::var(SIBLING_DATABASE_URL_ENV).expect("the sibling database url must be set");
+    let mut connect = ConnectOptions::new(url);
+    connect.max_connections(2);
+    let db = Database::connect(connect)
         .await
         .expect("the dedicated sibling database must be reachable");
-    verify_identity(&pool, &options, &profile, &profile.sibling_database).await;
-    pool
+    verify_identity(&db, &options, &profile, &profile.sibling_database).await;
+    db
 }
 
 /// Inserts a task without the wake up notification of the queue.
 ///
 /// The worker must find the task with its polling, not with the notification.
-pub async fn insert_task_without_notification(pool: &PgPool) {
-    sqlx::raw_sql(INSERT_TASK_SQL)
-        .execute(pool)
+pub async fn insert_task_without_notification(db: &DatabaseConnection) {
+    db.execute_unprepared(INSERT_TASK_SQL)
         .await
         .expect("the task must be insertable");
 }
 
 /// The backend that listens for the wake up channel.
-pub async fn listening_backend(pool: &PgPool) -> i32 {
+pub async fn listening_backend(db: &DatabaseConnection) -> i32 {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let row = sqlx::query_file_scalar!("sql/tests/worker_listening_backend.sql")
-            .fetch_optional(pool)
-            .await
-            .expect("the sessions of the database must be readable");
-        if let Some(Some(pid)) = row {
+        let value = fetch_scalar::<Option<i32>>(
+            db,
+            statement(
+                include_str!("../../sql/tests/worker_listening_backend.sql"),
+                Vec::new(),
+            ),
+        )
+        .await
+        .flatten();
+        if let Some(pid) = value {
             return pid;
         }
         assert!(
@@ -489,31 +523,43 @@ pub async fn listening_backend(pool: &PgPool) -> i32 {
 }
 
 /// Breaks the session of a backend of the test database.
-pub async fn terminate_backend(pool: &PgPool, pid: i32) {
-    let terminated = sqlx::query_file_scalar!("sql/tests/worker_terminate_backend.sql", pid)
-        .fetch_one(pool)
-        .await
-        .expect("the session must be breakable")
-        .unwrap_or(false);
-    assert!(terminated, "the session must be broken");
+pub async fn terminate_backend(db: &DatabaseConnection, pid: i32) {
+    let terminated = fetch_scalar::<Option<bool>>(
+        db,
+        statement(
+            include_str!("../../sql/tests/worker_terminate_backend.sql"),
+            vec![pid.into()],
+        ),
+    )
+    .await
+    .flatten();
+    assert_eq!(terminated, Some(true), "the session must be broken");
 }
 
 /// The number of tasks of a namespace and queue.
-pub async fn task_count(pool: &PgPool, namespace: &str, queue: &str) -> i64 {
-    sqlx::query_file_scalar!("sql/tests/store_task_count.sql", namespace, queue)
-        .fetch_one(pool)
-        .await
-        .expect("the tasks must be countable")
-        .unwrap_or_default()
+pub async fn task_count(db: &DatabaseConnection, namespace: &str, queue: &str) -> i64 {
+    fetch_scalar::<i64>(
+        db,
+        statement(
+            include_str!("../../sql/tests/store_task_count.sql"),
+            vec![namespace.into(), queue.into()],
+        ),
+    )
+    .await
+    .unwrap_or_default()
 }
 
 /// The number of attempts of a task.
-pub async fn attempt_count(pool: &PgPool, task_id: uuid::Uuid) -> i64 {
-    sqlx::query_file_scalar!("sql/tests/store_attempt_count.sql", task_id)
-        .fetch_one(pool)
-        .await
-        .expect("the attempts must be countable")
-        .unwrap_or_default()
+pub async fn attempt_count(db: &DatabaseConnection, task_id: uuid::Uuid) -> i64 {
+    fetch_scalar::<i64>(
+        db,
+        statement(
+            include_str!("../../sql/tests/store_attempt_count.sql"),
+            vec![task_id.into()],
+        ),
+    )
+    .await
+    .unwrap_or_default()
 }
 
 /// Creates the domain state of the application and empties it.
@@ -522,9 +568,8 @@ pub async fn attempt_count(pool: &PgPool, task_id: uuid::Uuid) -> i64 {
 /// library never writes to it, the tests write to it inside the transaction
 /// of the caller to prove that a domain write and a queue change share one
 /// commit.
-pub async fn prepare_app_domain(pool: &PgPool) {
-    sqlx::raw_sql(APP_DOMAIN_SETUP_SQL)
-        .execute(pool)
+pub async fn prepare_app_domain(db: &DatabaseConnection) {
+    db.execute_unprepared(APP_DOMAIN_SETUP_SQL)
         .await
         .expect("the domain state of the application must be creatable");
 }
@@ -533,32 +578,50 @@ pub async fn prepare_app_domain(pool: &PgPool) {
 ///
 /// The write runs in the transaction of the caller, so it becomes durable
 /// together with the queue change of that transaction.
-pub async fn write_app_domain(transaction: &mut Transaction<'_, Postgres>, note: &str) {
-    sqlx::query_file!("sql/tests/transaction_app_domain_insert.sql", note)
-        .execute(&mut **transaction)
+pub async fn write_app_domain(transaction: &mut DatabaseTransaction, note: &str) {
+    transaction
+        .execute_raw(statement(
+            include_str!("../../sql/tests/transaction_app_domain_insert.sql"),
+            vec![note.into()],
+        ))
         .await
         .expect("the domain state of the application must be writable");
 }
 
 /// The number of rows of the domain state of the application.
-pub async fn app_domain_count(pool: &PgPool) -> i64 {
-    sqlx::query_file_scalar!("sql/tests/transaction_app_domain_count.sql")
-        .fetch_one(pool)
-        .await
-        .expect("the domain state of the application must be countable")
-        .unwrap_or_default()
+pub async fn app_domain_count(db: &DatabaseConnection) -> i64 {
+    fetch_scalar::<i64>(
+        db,
+        statement(
+            include_str!("../../sql/tests/transaction_app_domain_count.sql"),
+            Vec::new(),
+        ),
+    )
+    .await
+    .unwrap_or_default()
 }
 
 async fn verify_identity(
-    pool: &PgPool,
+    db: &DatabaseConnection,
     options: &PgConnectOptions,
     profile: &TargetProfile,
     expected_database: &str,
 ) {
-    let row = sqlx::query_file_as!(IdentityRow, "sql/tests/migration_test_identity.sql")
-        .fetch_one(pool)
+    let row = db
+        .query_one_raw(statement(
+            include_str!("../../sql/tests/migration_test_identity.sql"),
+            Vec::new(),
+        ))
         .await
+        .expect("the dedicated database must report its identity")
         .expect("the dedicated database must report its identity");
+    let row = IdentityRow {
+        database_name: row.try_get_by::<Option<String>, usize>(0).unwrap(),
+        user_name: row.try_get_by::<Option<String>, usize>(1).unwrap(),
+        server_address: row.try_get_by::<Option<String>, usize>(2).unwrap(),
+        server_port: row.try_get_by::<Option<String>, usize>(3).unwrap(),
+        database_comment: row.try_get_by::<Option<String>, usize>(4).unwrap(),
+    };
     if let Err(reason) = validate_identity(&row, options, profile, expected_database) {
         panic!("the {expected_database} fixture is invalid: {reason}");
     }

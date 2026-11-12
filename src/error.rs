@@ -20,11 +20,11 @@ pub enum Error {
 
     /// The database rejected or failed a statement.
     #[error("database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(#[from] sea_orm::DbErr),
 
     /// The migration engine failed to apply the library migrations.
     #[error("migration failed: {0}")]
-    Migration(#[from] sqlx::migrate::MigrateError),
+    Migration(String),
 
     /// The schema exists but is not owned by this library.
     #[error("schema `{schema}` is not owned by cloudiful-tasks")]
@@ -75,6 +75,13 @@ pub enum Error {
     #[error("applied migration {version} does not match the migration source")]
     ChecksumMismatch {
         /// Version of the diverging migration.
+        version: i64,
+    },
+
+    /// A previous migration attempt did not complete successfully.
+    #[error("migration {version} is dirty; its previous run did not succeed")]
+    DirtyMigration {
+        /// Version of the unsuccessful migration.
         version: i64,
     },
 
