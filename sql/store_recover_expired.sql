@@ -15,6 +15,7 @@ WITH expired AS (
         AND a.status = 'running'
         AND a.lease_expires_at <= clock_timestamp()
     WHERE t.namespace = $1 AND t.queue = $2
+      AND ($4::uuid IS NULL OR t.id = $4)
     ORDER BY a.lease_expires_at, a.id
     FOR UPDATE OF t, a SKIP LOCKED
     LIMIT $3

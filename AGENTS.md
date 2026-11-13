@@ -31,11 +31,14 @@ Never reset a shared project database.
 
 ## Transaction variants
 
-Every mutating queue operation has a variant that takes
-`&mut sea_orm::DatabaseTransaction`: `enqueue_in`, `claim_in`,
-`renew_in`, `report_progress_in`, `complete_in`, `fail_in`,
-`request_cancel_in`, `request_pause_in`, `resume_in`, `park_paused_in`,
-`retry_failed_in` and `recover_expired_in`.
+Every mutating queue operation has a variant that takes the transaction of the
+caller: `enqueue_in`, `claim_in`, `renew_in`, `report_progress_in`,
+`complete_in`, `fail_in`, `request_cancel_in`, `request_pause_in`, `resume_in`,
+`park_paused_in`, `retry_failed_in`, `recover_expired_in` and
+`recover_expired_by_id_in`.
+
+The variant takes a `&mut sea_orm::DatabaseTransaction` or a
+`&mut sea_orm::sqlx::Transaction<'_, Postgres>`.
 
 - A variant verifies the schema instance of the queue before it writes and
   refuses a transaction of another database or of another schema instance.
@@ -47,6 +50,31 @@ Every mutating queue operation has a variant that takes
   `src/queue.rs`, so the two cannot diverge in result, error or bounds.
 - The result of a variant is valid before the commit of the caller but not
   durable until it.
+- A borrowed transaction runs on the connection of the caller. The library
+  checks no connection out of a pool on that path, so a caller that holds its
+  only connection keeps its atomicity. `TaskTransaction` is the closed handle
+  of that path: it is created from a SeaORM transaction or from a native SQLx
+  transaction and exposes no task statement to the caller.
+
+## Scoped reads and batch locks
+
+`get_in`, `get_many_in` and `attempts_in` read in the transaction of the caller
+without a row lock. `lock_task_in` locks one task row for update and reports
+`Error::NotFound` for an absent or out-of-scope task. `has_live_attempts_in`
+locks every distinct task of its batch for share in identifier order, requires
+every candidate to be present and then reports whether a running attempt has an
+unexpired lease; an unknown task is refused, never reported as `false`.
+
+`MAX_TASK_BATCH_SIZE` (512) bounds the identifiers of one batch before any
+database work. Duplicate identifiers are accepted and read or locked once, and
+results are ordered by task id. The shared and update locks last until the
+caller ends its transaction, so they block claim, recovery and terminal writers
+of those tasks.
+
+`recover_expired_by_id` and `recover_expired_by_id_in` reuse
+`sql/store_recover_expired.sql` with one optional target identifier. The
+ordinary recovery binds `None`; the addressed form binds one target with a limit
+of one and never falls back to another task.
 
 ## Cooperative pause
 
@@ -110,15 +138,44 @@ by its identifier.
   queue. The decision which task is eligible stays with the caller, together
   with the locks that guard that decision.
 
+## Activity read
+
+`active_tasks_in` and `active_task_in` read the active tasks of one kind in the
+transaction of the caller.
+
+- A task is active when its status is `queued`, `running` or
+  `cancel_requested`, or when it holds a running attempt whose
+  `lease_expires_at` is later than `now() - lease_grace`. The lease is compared
+  against the transaction clock, exactly like the predicate of
+  `has_live_attempts_in`. The grace must be positive and at most
+  `MAX_ACTIVITY_LEASE_GRACE` (one hour).
+- The read is scoped to the namespace and the queue of the queue handle and to
+  the given kind. The payload stays opaque and the result is ordered by task
+  id. `active_task_in` reports an absent or out-of-scope task as
+  `Error::NotFound` and a task of the scope that is not active as `None`.
+- The read is complete or it fails. More than `MAX_TASK_BATCH_SIZE` (512)
+  matching tasks are refused with `Error::Validation` instead of truncated, so
+  a caller never treats a partial result as an absence of activity. An empty
+  result is a complete result.
+- The read takes no row lock. It is a snapshot and not a guard: it blocks no
+  claim, recovery or terminal writer and it does not prevent a task of the
+  kind from appearing between the read and a later write. A caller that needs
+  that exclusion must lock the business identities of the task itself, in a
+  consistent order, and must not use this read as a substitute.
+- The statements live in `sql/store_active_tasks_of_kind.sql` and
+  `sql/store_active_task_of_kind.sql` and run on the connection of the caller
+  through the private adapter of `src/transaction.rs`.
+
 ## Tests
 
 The test suite consists of isolated unit tests inside the source modules:
 `src/migrate.rs`, `src/idempotency.rs`, `src/model.rs`, `src/config.rs`,
-`src/backoff.rs`, `src/queue.rs`, `src/progress.rs` and `src/worker.rs`. They
-cover the bounds and the validation of the public values, the serde contracts,
-the payload redaction, the canonicalization of the idempotency key, the
-saturation of the backoff, the fencing registry of the worker and the
-integrity decisions of the migration ledger. They need no database.
+`src/backoff.rs`, `src/queue.rs`, `src/transaction.rs`, `src/progress.rs` and
+`src/worker.rs`. They cover the bounds and the validation of the public values,
+the serde contracts, the payload redaction, the canonicalization of the
+idempotency key, the saturation of the backoff, the creation of the borrowed
+transaction handle, the fencing registry of the worker and the integrity
+decisions of the migration ledger. They need no database.
 
 The unit suite does not validate PostgreSQL: the schema, the SQL statements,
 the isolation, the leases, the pause and the recovery budgets, the worker
@@ -131,6 +188,10 @@ an automated test.
   Concurrency-critical statements, guarded transitions, migrations and
   introspection live in `sql/*.sql` and are executed as SeaORM statements; they
   are only inline when they cannot be expressed as a static file.
+- The borrowed transaction path runs the same statement files and the same
+  store helpers on the connection of the caller, through the private adapter in
+  `src/transaction.rs`. It never begins, commits or rolls back a transaction
+  and never checks a connection out of a pool.
 - `src/entity/schema.rs` holds the native SeaQuery declarations of the current
   schema. They are a public description of the schema, they never write the
   application schema and no test compares them with a migrated schema.

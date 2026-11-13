@@ -10,15 +10,23 @@
 //! ```
 
 use cloudiful_tasks::{EnqueueRequest, Queue, TaskKind, WorkerConfig, check_schema};
-use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement, TransactionTrait};
+use sea_orm::sqlx;
+use sea_orm::sqlx::postgres::PgPoolOptions;
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
 use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("DATABASE_URL")?;
-    let mut options = ConnectOptions::new(database_url);
-    options.max_connections(5);
-    let db = Database::connect(options).await?;
+
+    // The caller owns one pool. The connection of the library reuses that
+    // pool, so the borrowed transaction below runs on a connection of the same
+    // pool and the connection budget of the caller stays unchanged.
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await?;
+    let db: DatabaseConnection = pool.clone().into();
 
     let schema = check_schema(&db).await?;
     println!("schema instance {}", schema.instance_uuid());
@@ -49,6 +57,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
     transaction.commit().await?;
+
+    // The same borrowed transaction works with a native SQLx transaction of the
+    // caller. The library writes its statements on the connection of the
+    // caller, so the business write and the task write stay atomic and the
+    // library never checks a connection out of a pool.
+    let sqlx_order_id = uuid::Uuid::new_v4();
+    let mut sqlx_transaction = pool.begin().await?;
+    sqlx::query("INSERT INTO public.example_orders (id, state) VALUES ($1, 'new')")
+        .bind(sqlx_order_id)
+        .execute(&mut *sqlx_transaction)
+        .await?;
+    queue
+        .enqueue_in(
+            &mut sqlx_transaction,
+            EnqueueRequest::new(TaskKind::new("sync")?, json!({"order": sqlx_order_id})),
+        )
+        .await?;
+    sqlx_transaction.commit().await?;
+
+    // A refused or failed business write rolls the task back as well. The
+    // caller owns the rollback, the library never rolls back for the caller.
+    let rolled_back_order_id = uuid::Uuid::new_v4();
+    let mut sqlx_transaction = pool.begin().await?;
+    sqlx::query("INSERT INTO public.example_orders (id, state) VALUES ($1, 'new')")
+        .bind(rolled_back_order_id)
+        .execute(&mut *sqlx_transaction)
+        .await?;
+    queue
+        .enqueue_in(
+            &mut sqlx_transaction,
+            EnqueueRequest::new(
+                TaskKind::new("sync")?,
+                json!({"order": rolled_back_order_id}),
+            ),
+        )
+        .await?;
+    sqlx_transaction.rollback().await?;
 
     // The worker of the library completes the attempt in its own transaction.
     // An application that writes its own state in the same transaction as the

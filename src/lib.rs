@@ -38,6 +38,7 @@ pub mod model;
 pub mod progress;
 pub mod queue;
 mod sql;
+mod transaction;
 
 /// Native SeaQuery declarations of the schema produced by [`migrate`].
 ///
@@ -61,7 +62,11 @@ pub use crate::model::{
     FencingToken, ListCursor, Namespace, ProgressUpdate, QueueName, RetryPolicy, Task, TaskId,
     TaskKind, TaskPauseState, TaskStatus,
 };
-pub use crate::queue::{MAX_ATTEMPT_LIMIT, MAX_LIST_LIMIT, MAX_RECOVERY_LIMIT, Queue, QueuePolicy};
+pub use crate::queue::{
+    MAX_ACTIVITY_LEASE_GRACE, MAX_ATTEMPT_LIMIT, MAX_LIST_LIMIT, MAX_RECOVERY_LIMIT,
+    MAX_TASK_BATCH_SIZE, Queue, QueuePolicy,
+};
+pub use crate::transaction::TaskTransaction;
 pub use crate::wake::{WAKE_CHANNEL, WakeListener, Wakeup};
 pub use crate::worker::{Worker, WorkerBuilder};
 pub use tokio_util::sync::CancellationToken;

@@ -53,7 +53,7 @@ fn validate_name(field: &'static str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_idempotency_key(key: &str) -> Result<()> {
+pub(crate) fn validate_idempotency_key(key: &str) -> Result<()> {
     if key.is_empty() {
         return Err(Error::Validation {
             field: "idempotency_key",
@@ -1213,6 +1213,19 @@ mod tests {
         let request = EnqueueRequest::new(TaskKind::new("demo").unwrap(), Value::Null);
         assert!(request.clone().with_idempotency_key("").is_err());
         assert!(request.clone().with_idempotency_key("a\nb").is_err());
+        assert!(request.clone().with_idempotency_key("a\u{7f}b").is_err());
+        assert!(
+            request
+                .clone()
+                .with_idempotency_key("k".repeat(MAX_IDEMPOTENCY_KEY_LENGTH + 1))
+                .is_err()
+        );
+        assert!(
+            request
+                .with_idempotency_key("k".repeat(MAX_IDEMPOTENCY_KEY_LENGTH))
+                .is_ok()
+        );
+        let request = EnqueueRequest::new(TaskKind::new("demo").unwrap(), Value::Null);
         assert!(request.with_idempotency_key("key-1").is_ok());
     }
 
