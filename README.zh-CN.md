@@ -191,6 +191,8 @@ transaction.commit().await?;
 批量读取最多接受 `MAX_TASK_BATCH_SIZE`（512）个标识，重复标识只读取一次，结果按
 任务标识排序。不存在或不在本队列范围内的任务会被 `get_many_in` 省略，
 `has_live_attempts_in` 则会拒绝，而不会误报为没有运行中的尝试。
+`get_by_idempotency_key_in` 在调用方事务中按精确的幂等键读取一个任务。该键遵循
+入队时的键校验；不存在或属于其他命名空间、其他队列的键会返回 `None`。
 
 `recover_expired_by_id` 和 `recover_expired_by_id_in` 只恢复指定的任务。它们按
 `recover_expired` 的相同规则封存该任务已过期的运行中尝试，绝不回退到其他任务，

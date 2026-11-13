@@ -218,6 +218,10 @@ unexpired lease. The batch reads accept at most `MAX_TASK_BATCH_SIZE` (512)
 identifiers, read duplicate identifiers once and order their result by task id.
 An absent or out-of-scope task is omitted by `get_many_in` and refused by
 `has_live_attempts_in` rather than reported as without a live attempt.
+`get_by_idempotency_key_in` reads one task by its exact idempotency key in the
+transaction of the caller. The key follows the validation of an enqueue key; a
+key that is absent or belongs to another namespace or queue is reported as
+`None`.
 
 `recover_expired_by_id` and `recover_expired_by_id_in` recover only the named
 task. They seal its expired running attempt with the same rules as

@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::migrate::check_schema;
 use crate::model::{
     Attempt, Claim, EnqueueOutcome, EnqueueRequest, Failure, ListCursor, Namespace, ProgressUpdate,
-    QueueName, Task, TaskId, TaskKind,
+    QueueName, Task, TaskId, TaskKind, validate_idempotency_key,
 };
 use crate::transaction::TaskTransaction;
 use crate::{idempotency, progress, store};
@@ -239,6 +239,33 @@ impl Queue {
             &self.namespace,
             &self.queue,
             task_id,
+        )
+        .await
+    }
+
+    /// Reads one task of the queue by its idempotency key in the transaction of
+    /// the caller.
+    ///
+    /// The key follows the validation of an enqueue key. The read is scoped to
+    /// the namespace and the queue of this handle and matches the exact key, so
+    /// a key that is absent or belongs to another namespace or queue is
+    /// reported as `None`. The read takes no row lock, the payload of the task
+    /// stays opaque and the transaction of the caller is never committed or
+    /// rolled back. The transaction must belong to the schema instance of this
+    /// queue, otherwise the call is refused.
+    pub async fn get_by_idempotency_key_in(
+        &self,
+        transaction: impl Into<TaskTransaction<'_>>,
+        idempotency_key: &str,
+    ) -> Result<Option<Task>> {
+        validate_idempotency_key(idempotency_key)?;
+        let transaction = transaction.into();
+        self.verify_instance(transaction.connection()).await?;
+        store::task_by_idempotency_key(
+            transaction.connection(),
+            &self.namespace,
+            &self.queue,
+            idempotency_key,
         )
         .await
     }

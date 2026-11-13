@@ -346,6 +346,25 @@ pub(crate) async fn task_by_id<C: ConnectionTrait>(
     row.map(task_from_model).transpose()
 }
 
+/// Reads one task of the queue by its idempotency key.
+///
+/// The read is scoped to the namespace and the queue of the caller. A missing
+/// key, or a key of another namespace or queue, yields `None`.
+pub(crate) async fn task_by_idempotency_key<C: ConnectionTrait>(
+    connection: &C,
+    namespace: &Namespace,
+    queue: &QueueName,
+    idempotency_key: &str,
+) -> Result<Option<Task>> {
+    let row = task_entity::Entity::find()
+        .filter(task_entity::Column::Namespace.eq(namespace.as_str()))
+        .filter(task_entity::Column::Queue.eq(queue.as_str()))
+        .filter(task_entity::Column::IdempotencyKey.eq(idempotency_key))
+        .one(connection)
+        .await?;
+    row.map(task_from_model).transpose()
+}
+
 /// Locks one task of the queue for update.
 pub(crate) async fn lock_task<C: ConnectionTrait>(
     connection: &C,
