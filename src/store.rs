@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use sea_orm::sea_query::{ArrayType, Value as SeaValue};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
     QueryResult, QuerySelect, Statement, TryGetable,
@@ -36,8 +37,14 @@ const TRANSACTION_ISOLATION: &str = include_str!("../sql/store_queue_policy_isol
 const ATTEMPT_SEALED: &str = include_str!("../sql/store_attempt_sealed.sql");
 const TASK_EXISTS: &str = include_str!("../sql/store_task_exists.sql");
 const LOCK_ATTEMPT: &str = include_str!("../sql/store_lock_attempt.sql");
+const LOCK_TASK: &str = include_str!("../sql/store_lock_task.sql");
+const LOCK_TASK_IDS: &str = include_str!("../sql/store_lock_task_ids.sql");
 const LOCK_TASK_ATTEMPT: &str = include_str!("../sql/store_lock_task_attempt.sql");
 const NOTIFY_READY: &str = include_str!("../sql/store_notify_ready.sql");
+const GET_TASKS_BY_IDS: &str = include_str!("../sql/store_get_tasks_by_ids.sql");
+const HAS_LIVE_ATTEMPTS: &str = include_str!("../sql/store_has_live_attempts.sql");
+const ACTIVE_TASKS_OF_KIND: &str = include_str!("../sql/store_active_tasks_of_kind.sql");
+const ACTIVE_TASK_OF_KIND: &str = include_str!("../sql/store_active_task_of_kind.sql");
 const CLAIM: &str = include_str!("../sql/store_claim.sql");
 const RENEW: &str = include_str!("../sql/store_renew.sql");
 const COMPLETE: &str = include_str!("../sql/store_complete.sql");
@@ -337,6 +344,167 @@ pub(crate) async fn task_by_id<C: ConnectionTrait>(
         .one(connection)
         .await?;
     row.map(task_from_model).transpose()
+}
+
+/// Locks one task of the queue for update.
+pub(crate) async fn lock_task<C: ConnectionTrait>(
+    connection: &C,
+    namespace: &Namespace,
+    queue: &QueueName,
+    task_id: TaskId,
+) -> Result<Task> {
+    let row = connection
+        .query_one_raw(sql::statement(
+            LOCK_TASK,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                task_id.as_uuid().into(),
+            ],
+        ))
+        .await?
+        .ok_or(Error::NotFound)?;
+    task_from_model(task_entity::Model::from_query_result(&row, "")?)
+}
+
+/// Reads the present tasks of the queue from a batch of identifiers.
+pub(crate) async fn tasks_by_ids<C: ConnectionTrait>(
+    connection: &C,
+    namespace: &Namespace,
+    queue: &QueueName,
+    task_ids: &[Uuid],
+) -> Result<Vec<Task>> {
+    let rows = connection
+        .query_all_raw(sql::statement(
+            GET_TASKS_BY_IDS,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                uuid_array(task_ids),
+            ],
+        ))
+        .await?;
+    rows.into_iter()
+        .map(|row| task_from_model(task_entity::Model::from_query_result(&row, "")?))
+        .collect()
+}
+
+/// Reports whether any task of a batch holds a running attempt with a live
+/// lease.
+///
+/// Every task of the batch is locked for share before the attempts are read.
+/// A task that is absent or out of scope is refused instead of reported as
+/// without a live attempt.
+pub(crate) async fn has_live_attempts<C: ConnectionTrait>(
+    connection: &C,
+    namespace: &Namespace,
+    queue: &QueueName,
+    task_ids: &[Uuid],
+) -> Result<bool> {
+    let locked = connection
+        .query_all_raw(sql::statement(
+            LOCK_TASK_IDS,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                uuid_array(task_ids),
+            ],
+        ))
+        .await?;
+    if locked.len() != task_ids.len() {
+        return Err(Error::NotFound);
+    }
+    Ok(fetch_scalar::<bool>(
+        connection,
+        sql::statement(
+            HAS_LIVE_ATTEMPTS,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                uuid_array(task_ids),
+            ],
+        ),
+    )
+    .await?
+    .unwrap_or(false))
+}
+
+/// Reads the active tasks of one kind in the transaction of the caller.
+///
+/// A task is active when its status is queued, running or cancel requested, or
+/// when it holds a running attempt whose lease expires within the grace of
+/// the caller. The lease is compared against the transaction clock. The read
+/// takes no row lock.
+///
+/// More than [`crate::queue::MAX_TASK_BATCH_SIZE`] matching tasks are refused
+/// instead of truncated, so a caller never reads a partial activity result.
+pub(crate) async fn active_tasks_of_kind<C: ConnectionTrait>(
+    connection: &C,
+    namespace: &Namespace,
+    queue: &QueueName,
+    kind: &TaskKind,
+    lease_grace: Duration,
+) -> Result<Vec<Task>> {
+    let rows = connection
+        .query_all_raw(sql::statement(
+            ACTIVE_TASKS_OF_KIND,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                kind.as_ref().into(),
+                duration_micros(lease_grace).into(),
+            ],
+        ))
+        .await?;
+    if rows.len() > crate::queue::MAX_TASK_BATCH_SIZE {
+        return Err(Error::Validation {
+            field: "activity",
+            reason: format!(
+                "activity result exceeds the bound of {} tasks",
+                crate::queue::MAX_TASK_BATCH_SIZE
+            ),
+        });
+    }
+    rows.into_iter()
+        .map(|row| task_from_model(task_entity::Model::from_query_result(&row, "")?))
+        .collect()
+}
+
+/// Reads one active task of one kind in the transaction of the caller.
+///
+/// A task that is absent or belongs to another namespace, another queue or
+/// another kind is reported as `NotFound`. A task of the scope that is not
+/// active is reported as `None`. The read takes no row lock.
+pub(crate) async fn active_task_of_kind<C: ConnectionTrait>(
+    connection: &C,
+    namespace: &Namespace,
+    queue: &QueueName,
+    kind: &TaskKind,
+    task_id: TaskId,
+    lease_grace: Duration,
+) -> Result<Option<Task>> {
+    let task = task_by_id(connection, namespace, queue, task_id)
+        .await?
+        .filter(|task| task.kind() == kind)
+        .ok_or(Error::NotFound)?;
+    match task.status() {
+        TaskStatus::Queued | TaskStatus::Running | TaskStatus::CancelRequested => Ok(Some(task)),
+        _ => {
+            let live = fetch_scalar::<bool>(
+                connection,
+                sql::statement(
+                    ACTIVE_TASK_OF_KIND,
+                    vec![
+                        task_id.as_uuid().into(),
+                        duration_micros(lease_grace).into(),
+                    ],
+                ),
+            )
+            .await?
+            .unwrap_or(false);
+            Ok(live.then_some(task))
+        }
+    }
 }
 
 /// Lists the tasks of the queue, newest first.
@@ -736,12 +904,40 @@ pub(crate) async fn recover_expired_tasks<C: ConnectionTrait>(
                 namespace.as_str().into(),
                 queue.as_str().into(),
                 i64::from(limit).into(),
+                Option::<Uuid>::None.into(),
             ],
         ))
         .await?;
     rows.into_iter()
         .map(|row| task_from_model(task_entity::Model::from_query_result(&row, "")?))
         .collect()
+}
+
+/// Seals the expired attempt of one task of the queue and schedules it again.
+///
+/// The recovery never falls back to another task. A target that is absent, out
+/// of scope, not expired or sealed by another transaction yields `None`.
+pub(crate) async fn recover_expired_task<C: ConnectionTrait>(
+    connection: &C,
+    namespace: &Namespace,
+    queue: &QueueName,
+    task_id: TaskId,
+) -> Result<Option<Task>> {
+    let rows = connection
+        .query_all_raw(sql::statement(
+            RECOVER_EXPIRED,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                1i64.into(),
+                task_id.as_uuid().into(),
+            ],
+        ))
+        .await?;
+    rows.into_iter()
+        .next()
+        .map(|row| task_from_model(task_entity::Model::from_query_result(&row, "")?))
+        .transpose()
 }
 
 pub(crate) fn task_from_model(row: task_entity::Model) -> Result<Task> {
@@ -795,6 +991,18 @@ fn progress_from_json(value: Value) -> Result<ProgressUpdate> {
         field: "progress",
         reason: format!("the stored progress report is invalid: {error}"),
     })
+}
+
+fn uuid_array(task_ids: &[Uuid]) -> SeaValue {
+    SeaValue::Array(
+        ArrayType::Uuid,
+        Some(Box::new(
+            task_ids
+                .iter()
+                .map(|task_id| SeaValue::Uuid(Some(*task_id)))
+                .collect(),
+        )),
+    )
 }
 
 fn first_page_cursor() -> (OffsetDateTime, Uuid) {

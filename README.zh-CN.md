@@ -153,7 +153,7 @@ queue.resume(task_id).await?;
 每个写操作都有一个在调用方事务中运行的变体：`enqueue_in`、`claim_in`、
 `renew_in`、`report_progress_in`、`complete_in`、`fail_in`、
 `request_cancel_in`、`request_pause_in`、`resume_in`、`park_paused_in`、
-`retry_failed_in` 和 `recover_expired_in`。
+`retry_failed_in`、`recover_expired_in` 和 `recover_expired_by_id_in`。
 
 ```rust
 use sea_orm::TransactionTrait;
@@ -168,6 +168,60 @@ transaction.commit().await?;
 提交之前并不持久。该事务必须属于队列所在的 schema 实例，否则调用会在写入之前
 被拒绝。被拒绝的操作不能被忽略：请回滚事务，否则已经失去租约的尝试所产生的
 业务副作用会被提交。
+
+变体既接受 SeaORM 事务，也接受调用方原生的 SQLx 事务：
+
+```rust
+use sea_orm::sqlx;
+
+let mut transaction = pool.begin().await?;
+queue.enqueue_in(&mut transaction, request).await?;
+write_business_row(&mut transaction).await?;
+transaction.commit().await?;
+```
+
+本库在调用方的连接上执行自己的语句：它不会开启第二个事务，不会提交或回滚调用方
+的事务，也不会在该路径上从连接池取连接，因此只持有唯一连接的调用方依然保持原子性。
+
+### 作用域读取与定点恢复
+
+`get_in`、`get_many_in` 和 `attempts_in` 在调用方事务中读取队列的任务与尝试，
+不加行锁。`lock_task_in` 对单个任务加更新锁，`has_live_attempts_in` 对一批任务
+中的每个不同任务按标识顺序加共享锁，并报告其中是否存在租约尚未过期的运行中尝试。
+批量读取最多接受 `MAX_TASK_BATCH_SIZE`（512）个标识，重复标识只读取一次，结果按
+任务标识排序。不存在或不在本队列范围内的任务会被 `get_many_in` 省略，
+`has_live_attempts_in` 则会拒绝，而不会误报为没有运行中的尝试。
+
+`recover_expired_by_id` 和 `recover_expired_by_id_in` 只恢复指定的任务。它们按
+`recover_expired` 的相同规则封存该任务已过期的运行中尝试，绝不回退到其他任务，
+也绝不撤销仍然有效的租约。
+
+### 活动读取
+
+`active_tasks_in` 在调用方事务中读取某个 kind 的活动任务，`active_task_in` 读取其中
+一个。任务处于 queued、running 或 cancel_requested 状态，或者持有运行中尝试且其租约
+到期时间晚于“事务时钟减去调用方指定的租约宽限期”时，该任务即为活动；尚未到期的租约
+也包括在内。宽限期必须为正，且不超过一小时。
+
+```rust
+let mut transaction = db.begin().await?;
+let active = queue
+    .active_tasks_in(&mut transaction, &kind, Duration::from_secs(30))
+    .await?;
+transaction.commit().await?;
+```
+
+该读取限定在队列句柄的命名空间与队列以及给定的 kind，任务负载保持不透明，结果按
+任务标识排序。
+
+该读取要么完整，要么失败。活动任务超过 `MAX_TASK_BATCH_SIZE`（512）个时会以
+`Error::Validation` 拒绝，而不是截断，因此调用方不会读到部分结果，也不会把它误认为
+没有活动。空结果就是完整结果。`active_task_in` 对不存在或属于其他命名空间、其他队列、
+其他 kind 的任务报告 `Error::NotFound`，对范围内但不活动的任务报告 `None`。
+
+该读取不加行锁，它是快照而不是守卫：它不会阻塞认领、恢复或终态写入，也不能阻止在
+读取与后续写入之间出现该 kind 的新任务。必须排除这种情况的调用方需要自行以一致的
+顺序锁住任务的业务标识，不能用该读取代替这些锁。
 
 ## 构建
 
