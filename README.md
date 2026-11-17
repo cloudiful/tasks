@@ -23,7 +23,8 @@ the fencing token of the attempt.
   protocol and migration checksum verification,
 - the durable queue store: enqueue with idempotency, claim with a lease,
   renewal, progress, completion, failure, cancellation, manual retry,
-  cooperative per-task pause and resume, and recovery of expired leases,
+  cooperative per-task pause and resume, release of an owned attempt, and
+  recovery of expired leases,
 - durable queue policies with an optional limit on running attempts,
 - the worker runtime: bounded concurrency, lease heartbeat, cooperative
   cancellation, recovery of expired leases, wake up notifications, a
@@ -78,6 +79,13 @@ and upgrades a supported older version. `check_schema` only reads and reports
 that the library does not own is never adopted or overwritten. A ledger row that
 did not complete successfully is a dirty migration: it is reported as
 `DirtyMigration` and never retried.
+
+The schema protocol version 4 adds the release counter of a task and the
+released state of an attempt. The upgrade is additive and keeps every task,
+attempt, payload and lease. A binary of an older version refuses a schema of a
+newer protocol version, so a rollout stops the old writers, migrates with the
+new version and starts the new writers. Mixed protocol versions are not
+supported and a rollback after the new version wrote is not promised.
 
 ### The queue
 
@@ -167,12 +175,47 @@ resume queues the paused task again, keeping its available time, its attempt
 history and its effective failure budget. A pause of one task never stops
 another task.
 
+### Releasing an owned attempt
+
+A dispatcher that stops a worker can hand the task of that worker back to the
+queue instead of waiting for the lease to expire.
+
+```rust
+let claim = queue.claim("worker-1").await?.expect("a task");
+// The work of the attempt is stopped and joined by the caller.
+queue.release(claim.attempt(), "worker-1").await?;
+```
+
+`release` seals the exact attempt as `released` and queues its task again
+immediately, without a backoff. The attempt keeps its place in the attempt
+history, and the release does not consume the failure budget of the task: the
+effective budget of a task is `attempt_count - paused_attempts -
+released_attempts`, so a task with `max_attempts` of 1 can still run once after
+a release.
+
+The second argument is the identity of the caller that stops the work. It is
+supplied by the application and matched against the worker of the attempt
+independently, so the attempt of another worker is never released, also when
+that attempt was read from the queue. The identity is an execution identity of
+the application, not an authentication boundary.
+
+The release needs the attempt, its fencing token, an unexpired lease and the
+owning identity. A wrong owner, a stale token, an expired lease and an attempt
+that a newer attempt replaced are refused with `LeaseLost` and change nothing.
+A release that was already applied by the same owner is a read only replay: it
+returns the current task and changes nothing, also when the task runs a newer
+attempt by then. A cancellation that was requested before the release wins and
+ends the task as cancelled; a task that waits for a cooperative pause stays
+paused and unclaimable. A genuine release notifies the workers, also when the
+task stays paused; a replay never notifies. The library never releases an
+attempt of a running worker: the caller must stop and join the work first.
+
 ### The transaction API
 
 Every mutating operation has a variant that runs inside the transaction of the
 caller: `enqueue_in`, `claim_in`, `renew_in`, `report_progress_in`,
 `complete_in`, `fail_in`, `request_cancel_in`, `request_pause_in`, `resume_in`,
-`park_paused_in`, `retry_failed_in`, `recover_expired_in` and
+`park_paused_in`, `release_in`, `retry_failed_in`, `recover_expired_in` and
 `recover_expired_by_id_in`.
 
 ```rust

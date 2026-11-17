@@ -818,6 +818,67 @@ impl Queue {
         self.park_on(transaction.connection(), attempt).await
     }
 
+    /// Releases the exact attempt of a task without spending its budget.
+    ///
+    /// The release hands the task of a stopped worker back to the queue. The
+    /// attempt must be the one of the caller: it must still run, its lease
+    /// must not have expired and its fencing token must be the current one.
+    /// The task becomes queued and immediately claimable, without a backoff,
+    /// and the failure budget of the task does not change. The attempt keeps
+    /// its place in the history of the task.
+    ///
+    /// `worker_id` is the identity of the caller that stops the work. It is
+    /// supplied by the application and matched against the worker of the
+    /// attempt independently, so the attempt of another worker is never
+    /// released, also when the attempt was read from the queue. The identity
+    /// is an execution identity of the application, not an authentication
+    /// boundary.
+    ///
+    /// A cancellation that was requested before the release wins, a task that
+    /// waits for a cooperative pause stays paused and unclaimable. A release
+    /// that was already applied by the same owner is a read only replay, it
+    /// returns the current task of the task and changes nothing.
+    ///
+    /// The caller must stop the work of the attempt before it releases it.
+    /// The library never releases an attempt of a running worker.
+    pub async fn release(&self, attempt: &Attempt, worker_id: &str) -> Result<Task> {
+        let worker_id = validate_worker_id(worker_id)?;
+        let transaction = self.db.begin().await?;
+        let outcome = self.release_on(&transaction, attempt, worker_id).await;
+        match outcome {
+            Ok(task) => {
+                transaction.commit().await?;
+                Ok(task)
+            }
+            Err(error) => {
+                transaction.rollback().await.ok();
+                Err(error)
+            }
+        }
+    }
+
+    /// Releases an attempt in the transaction of the caller.
+    ///
+    /// The release and the business write of the caller are only durable when
+    /// the caller commits the transaction. The transaction must belong to the
+    /// schema instance of this queue, otherwise the call is refused. A refused
+    /// release must not be ignored, otherwise the caller commits business side
+    /// effects of an attempt that lost its lease.
+    ///
+    /// The identity of the caller is matched like in [`Queue::release`].
+    pub async fn release_in(
+        &self,
+        transaction: impl Into<TaskTransaction<'_>>,
+        attempt: &Attempt,
+        worker_id: &str,
+    ) -> Result<Task> {
+        let worker_id = validate_worker_id(worker_id)?;
+        let transaction = transaction.into();
+        self.verify_instance(transaction.connection()).await?;
+        self.release_on(transaction.connection(), attempt, worker_id)
+            .await
+    }
+
     /// Schedules a failed task again with a larger budget.
     ///
     /// The new budget of the task is the number of the attempts that ran plus
@@ -1005,6 +1066,21 @@ impl Queue {
 
     async fn park_on<C: ConnectionTrait>(&self, connection: &C, attempt: &Attempt) -> Result<Task> {
         store::park_paused(connection, &self.namespace, &self.queue, attempt).await
+    }
+
+    async fn release_on<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+        attempt: &Attempt,
+        worker_id: &str,
+    ) -> Result<Task> {
+        let outcome =
+            store::release_attempt(connection, &self.namespace, &self.queue, attempt, worker_id)
+                .await?;
+        if outcome.requeued {
+            store::notify_ready(connection).await?;
+        }
+        Ok(outcome.task)
     }
 
     async fn retry_failed_on<C: ConnectionTrait>(

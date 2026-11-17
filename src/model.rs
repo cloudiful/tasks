@@ -264,6 +264,11 @@ pub enum AttemptStatus {
     Interrupted,
     /// The attempt parked at a cooperative pause checkpoint.
     Paused,
+    /// The attempt was released by its owner before it finished.
+    ///
+    /// A released attempt keeps its place in the history of the task and does
+    /// not consume the failure budget of the task.
+    Released,
 }
 
 impl AttemptStatus {
@@ -276,6 +281,7 @@ impl AttemptStatus {
             Self::Cancelled => "cancelled",
             Self::Interrupted => "interrupted",
             Self::Paused => "paused",
+            Self::Released => "released",
         }
     }
 
@@ -288,6 +294,7 @@ impl AttemptStatus {
             "cancelled" => Ok(Self::Cancelled),
             "interrupted" => Ok(Self::Interrupted),
             "paused" => Ok(Self::Paused),
+            "released" => Ok(Self::Released),
             other => Err(Error::Validation {
                 field: "status",
                 reason: format!("unknown attempt status `{other}`"),
@@ -717,6 +724,7 @@ pub struct Task {
     pub(crate) pause_state: TaskPauseState,
     pub(crate) pause_generation: i64,
     pub(crate) paused_attempts: u32,
+    pub(crate) released_attempts: u32,
 }
 
 impl Task {
@@ -836,6 +844,25 @@ impl Task {
         self.paused_attempts
     }
 
+    /// The number of attempts that were released by their owner.
+    ///
+    /// A released attempt is not a failed attempt: the effective failure
+    /// budget of the task is `attempt_count - paused_attempts -
+    /// released_attempts`.
+    pub fn released_attempts(&self) -> u32 {
+        self.released_attempts
+    }
+
+    /// The number of attempts that consumed the failure budget of the task.
+    ///
+    /// The effective budget excludes the attempts that parked at a cooperative
+    /// pause checkpoint and the attempts that their owner released.
+    pub fn effective_attempts(&self) -> u32 {
+        self.attempt_count
+            .saturating_sub(self.paused_attempts)
+            .saturating_sub(self.released_attempts)
+    }
+
     /// Whether the task reached a terminal state.
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
@@ -873,6 +900,7 @@ impl fmt::Debug for Task {
             .field("pause_state", &self.pause_state)
             .field("pause_generation", &self.pause_generation)
             .field("paused_attempts", &self.paused_attempts)
+            .field("released_attempts", &self.released_attempts)
             .finish()
     }
 }
@@ -968,6 +996,15 @@ impl Attempt {
     /// The time at which the attempt parked at a pause checkpoint, if it did.
     pub fn paused_at(&self) -> Option<OffsetDateTime> {
         self.paused_at
+    }
+
+    /// Whether the attempt belongs to the given worker.
+    ///
+    /// The ownership of an attempt is the identity of the worker that claimed
+    /// it. A caller that acts for another worker owns no attempt, also when it
+    /// holds a readable copy of the attempt.
+    pub(crate) fn is_owned_by(&self, worker_id: &str) -> bool {
+        self.worker_id == worker_id
     }
 }
 
@@ -1193,6 +1230,23 @@ mod tests {
     }
 
     #[test]
+    fn the_released_attempt_seal_round_trips() {
+        assert_eq!(
+            AttemptStatus::from_db(AttemptStatus::Released.as_str()).unwrap(),
+            AttemptStatus::Released
+        );
+        assert!(AttemptStatus::Released.is_sealed());
+        assert_eq!(
+            serde_json::to_string(&AttemptStatus::Released).unwrap(),
+            "\"released\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AttemptStatus>("\"released\"").unwrap(),
+            AttemptStatus::Released
+        );
+    }
+
+    #[test]
     fn retry_policy_validates_bounds() {
         assert!(RetryPolicy::new(0, Duration::ZERO, Duration::ZERO).is_err());
         assert!(RetryPolicy::new(2, Duration::from_secs(2), Duration::from_secs(1)).is_err());
@@ -1293,6 +1347,32 @@ mod tests {
     }
 
     #[test]
+    fn an_attempt_belongs_to_its_worker_only() {
+        let attempt = Attempt {
+            id: AttemptId::new(),
+            task_id: TaskId::new(),
+            attempt_number: 1,
+            worker_id: "worker-a".to_owned(),
+            fencing_token: FencingToken::new(),
+            status: AttemptStatus::Running,
+            lease_expires_at: Some(OffsetDateTime::UNIX_EPOCH),
+            started_at: OffsetDateTime::UNIX_EPOCH,
+            finished_at: None,
+            error: None,
+            progress: None,
+            progress_updated_at: None,
+            pause_generation: 0,
+            paused_at: None,
+        };
+
+        assert!(attempt.is_owned_by("worker-a"));
+        assert!(
+            !attempt.is_owned_by("worker-b"),
+            "an attempt belongs to its worker only"
+        );
+    }
+
+    #[test]
     fn the_debug_output_of_a_task_hides_the_payload() {
         let task = Task {
             id: TaskId::new(),
@@ -1317,6 +1397,7 @@ mod tests {
             pause_state: TaskPauseState::Unpaused,
             pause_generation: 0,
             paused_attempts: 0,
+            released_attempts: 0,
         };
         let attempt = Attempt {
             id: AttemptId::new(),

@@ -43,6 +43,8 @@ pub struct Model {
     pub pause_generation: i64,
     #[sea_orm(default_value = 0)]
     pub paused_attempts: i32,
+    #[sea_orm(default_value = 0)]
+    pub released_attempts: i32,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

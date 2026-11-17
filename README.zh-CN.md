@@ -19,7 +19,7 @@ schema 中。本库不会自行执行任务：worker 运行时由应用显式启
   fencing token，
 - 显式的 schema 初始化：包含归属标记、版本化的 schema 协议和迁移校验和验证，
 - 持久化队列存储：带幂等键的入队、带租约的领取、续租、进度、完成、失败、取消、
-  手动重试、按任务的协作式暂停与恢复以及过期租约的恢复，
+  手动重试、按任务的协作式暂停与恢复、自己持有的尝试的释放以及过期租约的恢复，
 - 持久化队列策略：可选地限制队列中同时运行的尝试数量，
 - worker 运行时：有界并发、租约心跳、协作式取消、过期租约恢复、唤醒通知、
   处理函数拥有的终态结果以及优雅停机。
@@ -67,6 +67,11 @@ check_schema(&db).await?;
 两者都拒绝其他库的 schema（`ForeignSchema`）和更新的协议版本
 （`UnsupportedSchemaVersion`），不属于本库的 schema 不会被接管或覆盖。未成功完成的
 迁移记录属于脏迁移：`check_schema` 返回 `DirtyMigration`，且不会被重试。
+
+schema 协议版本 4 增加了任务的释放计数和尝试的 released 状态。该升级是追加式的，
+保留所有任务、尝试、载荷和租约。旧版本的二进制拒绝更新的协议版本，因此发布流程是
+先停止旧写入方，用新版本迁移，再启动新写入方。不支持混用协议版本，也不承诺在
+新版本写入之后回滚。
 
 ### 队列
 
@@ -148,12 +153,40 @@ queue.resume(task_id).await?;
 恢复会把已暂停的任务重新排队，并保留其可用时间、尝试历史和有效失败预算。暂停
 一个任务绝不会停止另一个任务。
 
+### 释放自己持有的尝试
+
+调度方可以停止某个 worker，并把该 worker 的任务交还队列，而不必等待租约过期。
+
+```rust
+let claim = queue.claim("worker-1").await?.expect("a task");
+// 调用方先停止并等待该次尝试的工作结束。
+queue.release(claim.attempt(), "worker-1").await?;
+```
+
+`release` 把该次尝试封为 `released`，并立即重新排队它的任务，不带退避。该次尝试
+在任务历史中保留，释放不消耗任务的失败预算：任务的有效预算是
+`attempt_count - paused_attempts - released_attempts`，因此 `max_attempts` 为 1 的
+任务在释放之后仍然可以执行一次。
+
+第二个参数是停止该工作的调用方身份。它由应用提供，并与尝试所属的 worker 独立
+匹配，因此其他 worker 的尝试永远不会被释放，即使该尝试是从队列中读到的。这个
+身份是应用的执行身份，不是认证边界。
+
+释放需要该次尝试、它的 fencing token、未过期的租约和归属身份。错误的归属、过期
+的 token、过期的租约以及已被更新的尝试取代的尝试都返回 `LeaseLost` 且不做任何
+修改。已经由同一归属方完成的释放是只读的重放：它返回当前任务且不做任何修改，
+即使此时任务已经在执行更新的尝试。先于释放提交的取消优先生效，任务以 cancelled
+结束；等待协作式暂停的任务在释放后仍然暂停且不可领取。真正的释放会通知 worker，
+即使任务仍处于暂停状态；重放不会通知。库永远不会释放正在运行的 worker 的尝试：
+调用方必须先停止并等待工作结束。
+
 ### 事务 API
 
 每个写操作都有一个在调用方事务中运行的变体：`enqueue_in`、`claim_in`、
 `renew_in`、`report_progress_in`、`complete_in`、`fail_in`、
 `request_cancel_in`、`request_pause_in`、`resume_in`、`park_paused_in`、
-`retry_failed_in`、`recover_expired_in` 和 `recover_expired_by_id_in`。
+`release_in`、`retry_failed_in`、`recover_expired_in` 和
+`recover_expired_by_id_in`。
 
 ```rust
 use sea_orm::TransactionTrait;

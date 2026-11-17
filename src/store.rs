@@ -54,6 +54,8 @@ const RETRY_FAILED: &str = include_str!("../sql/store_retry_failed.sql");
 const PAUSE_TASK: &str = include_str!("../sql/store_pause_task.sql");
 const RESUME_TASK: &str = include_str!("../sql/store_resume_task.sql");
 const PARK_PAUSED: &str = include_str!("../sql/store_park_paused.sql");
+const RELEASE: &str = include_str!("../sql/store_release.sql");
+const ATTEMPT_RELEASED: &str = include_str!("../sql/store_attempt_released.sql");
 const RECOVER_EXPIRED: &str = include_str!("../sql/store_recover_expired.sql");
 
 /// Checks that a connection belongs to the schema instance of the queue.
@@ -909,6 +911,112 @@ pub(crate) async fn park_paused<C: ConnectionTrait>(
     }
 }
 
+/// The outcome of a release of an attempt.
+pub(crate) struct ReleaseOutcome {
+    /// The task of the released attempt.
+    pub task: Task,
+    /// Whether the task was genuinely requeued and may be claimed again.
+    pub requeued: bool,
+}
+
+/// Releases the exact attempt of a task without spending its failure budget.
+///
+/// The attempt must be the one of the caller: the namespace, the queue, the
+/// task, the attempt, the fencing token and the worker of the attempt must
+/// match, the attempt must still run and its lease must not have expired. The
+/// identity of the caller is matched against the worker of the attempt
+/// independently, so the attempt of another worker is never released.
+///
+/// A release that was already applied by the same caller and the same owner is
+/// a read only replay, it returns the current task of the task and changes
+/// nothing.
+pub(crate) async fn release_attempt<C: ConnectionTrait>(
+    connection: &C,
+    namespace: &Namespace,
+    queue: &QueueName,
+    attempt: &Attempt,
+    worker_id: &str,
+) -> Result<ReleaseOutcome> {
+    if !attempt.is_owned_by(worker_id) {
+        return Err(Error::LeaseLost {
+            task_id: attempt.task_id().as_uuid(),
+        });
+    }
+    if let Err(error) = lock_task_attempt(connection, namespace, queue, attempt).await {
+        if matches!(error, Error::LeaseLost { .. })
+            && attempt_is_released(connection, namespace, queue, attempt, worker_id).await?
+        {
+            return Ok(ReleaseOutcome {
+                task: released_task(connection, namespace, queue, attempt).await?,
+                requeued: false,
+            });
+        }
+        return Err(error);
+    }
+    let row = connection
+        .query_one_raw(sql::statement(
+            RELEASE,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                attempt.task_id().as_uuid().into(),
+                attempt.id().as_uuid().into(),
+                attempt.fencing_token().as_uuid().into(),
+                attempt.worker_id().into(),
+                worker_id.into(),
+            ],
+        ))
+        .await?;
+    let row = row.ok_or(Error::LeaseLost {
+        task_id: attempt.task_id().as_uuid(),
+    })?;
+    let task = task_from_model(task_entity::Model::from_query_result(&row, "")?)?;
+    // A genuine release queues the task, also when the task stays paused: the
+    // wake up notification tells the workers that the state of the task
+    // changed, not that the task is claimable.
+    let requeued = matches!(task.status(), TaskStatus::Queued);
+    Ok(ReleaseOutcome { task, requeued })
+}
+
+/// Whether the captured attempt was already released by its owner.
+pub(crate) async fn attempt_is_released<C: ConnectionTrait>(
+    connection: &C,
+    namespace: &Namespace,
+    queue: &QueueName,
+    attempt: &Attempt,
+    worker_id: &str,
+) -> Result<bool> {
+    Ok(fetch_scalar::<bool>(
+        connection,
+        sql::statement(
+            ATTEMPT_RELEASED,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                attempt.task_id().as_uuid().into(),
+                attempt.id().as_uuid().into(),
+                attempt.fencing_token().as_uuid().into(),
+                attempt.worker_id().into(),
+                worker_id.into(),
+            ],
+        ),
+    )
+    .await?
+    .unwrap_or(false))
+}
+
+/// Reads the current task of a released attempt.
+async fn released_task<C: ConnectionTrait>(
+    connection: &C,
+    namespace: &Namespace,
+    queue: &QueueName,
+    attempt: &Attempt,
+) -> Result<Task> {
+    task_by_id(connection, namespace, queue, attempt.task_id())
+        .await?
+        .ok_or(Error::NotFound)
+}
+
 /// Seals the attempts whose lease expired and schedules their tasks again.
 pub(crate) async fn recover_expired_tasks<C: ConnectionTrait>(
     connection: &C,
@@ -983,6 +1091,7 @@ pub(crate) fn task_from_model(row: task_entity::Model) -> Result<Task> {
         pause_state: TaskPauseState::from_db(&row.pause_state)?,
         pause_generation: row.pause_generation,
         paused_attempts: u32::try_from(row.paused_attempts).unwrap_or_default(),
+        released_attempts: u32::try_from(row.released_attempts).unwrap_or_default(),
     })
 }
 

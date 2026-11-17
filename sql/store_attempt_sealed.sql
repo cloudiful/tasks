@@ -1,7 +1,8 @@
 -- Whether the captured attempt already holds a terminal seal.
 --
 -- The task, the attempt and the fencing token identify the attempt, so a
--- terminal of a newer attempt never matches.
+-- terminal of a newer attempt never matches. A released attempt holds a seal
+-- as well: it reached a final state and no write of it may follow.
 SELECT EXISTS (
     SELECT 1
     FROM cloudiful_tasks.attempts AS a
@@ -11,5 +12,5 @@ SELECT EXISTS (
       AND a.task_id = $3
       AND a.id = $4
       AND a.fencing_token = $5
-      AND a.status IN ('succeeded', 'failed', 'cancelled', 'paused')
+      AND a.status IN ('succeeded', 'failed', 'cancelled', 'paused', 'released')
 ) AS sealed

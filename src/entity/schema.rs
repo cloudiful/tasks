@@ -124,6 +124,12 @@ pub fn tasks(schema: &str) -> TableCreateStatement {
                 .not_null()
                 .default(Expr::value(0)),
         )
+        .col(
+            ColumnDef::new("released_attempts")
+                .integer()
+                .not_null()
+                .default(Expr::value(0)),
+        )
         .check(Check::named(
             "tasks_status_check",
             Expr::cust("status IN ('queued', 'running', 'cancel_requested', 'succeeded', 'failed', 'cancelled')"),
@@ -171,6 +177,14 @@ pub fn tasks(schema: &str) -> TableCreateStatement {
         .check(Check::named(
             "tasks_paused_attempts_check",
             Expr::cust("paused_attempts >= 0 AND paused_attempts <= attempt_count"),
+        ))
+        .check(Check::named(
+            "tasks_released_attempts_check",
+            Expr::cust("released_attempts >= 0 AND released_attempts <= attempt_count"),
+        ))
+        .check(Check::named(
+            "tasks_attempt_budget_check",
+            Expr::cust("paused_attempts + released_attempts <= attempt_count"),
         ));
     table
 }
@@ -215,7 +229,7 @@ pub fn attempts(schema: &str) -> TableCreateStatement {
         ))
         .check(Check::named(
             "attempts_status_check",
-            Expr::cust("status IN ('running', 'succeeded', 'failed', 'cancelled', 'interrupted', 'paused')"),
+            Expr::cust("status IN ('running', 'succeeded', 'failed', 'cancelled', 'interrupted', 'paused', 'released')"),
         ))
         .check(Check::named(
             "attempts_lease_check",
