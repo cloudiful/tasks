@@ -154,6 +154,7 @@ fn active_task(
         pause_state: NotSet,
         pause_generation: NotSet,
         paused_attempts: NotSet,
+        released_attempts: NotSet,
     }
 }
 

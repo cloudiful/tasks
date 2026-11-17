@@ -51,13 +51,13 @@ UPDATE cloudiful_tasks.tasks AS t
 SET status = CASE
         WHEN sealed.cancel_requested THEN 'cancelled'
         WHEN sealed.pause_active THEN 'queued'
-        WHEN (t.attempt_count - t.paused_attempts) < t.max_attempts THEN 'queued'
+        WHEN (t.attempt_count - t.paused_attempts - t.released_attempts) < t.max_attempts THEN 'queued'
         ELSE 'failed'
     END,
     pause_state = CASE
         WHEN sealed.cancel_requested THEN 'unpaused'
         WHEN sealed.pause_active THEN 'paused'
-        WHEN (t.attempt_count - t.paused_attempts) < t.max_attempts
+        WHEN (t.attempt_count - t.paused_attempts - t.released_attempts) < t.max_attempts
             AND t.pause_state <> 'unpaused' THEN 'paused'
         ELSE 'unpaused'
     END,
@@ -68,7 +68,7 @@ SET status = CASE
     available_at = CASE
         WHEN t.status = 'cancel_requested' THEN t.available_at
         WHEN sealed.pause_active THEN t.available_at
-        WHEN (t.attempt_count - t.paused_attempts) < t.max_attempts THEN clock_timestamp() + make_interval(
+        WHEN (t.attempt_count - t.paused_attempts - t.released_attempts) < t.max_attempts THEN clock_timestamp() + make_interval(
             secs => LEAST(
                 t.retry_initial_delay_ns::numeric
                     * power(2::numeric, LEAST(GREATEST(sealed.attempt_number - 1, 0), 31)),
@@ -80,13 +80,13 @@ SET status = CASE
     finished_at = CASE
         WHEN t.status = 'cancel_requested' THEN clock_timestamp()
         WHEN sealed.pause_active THEN NULL
-        WHEN (t.attempt_count - t.paused_attempts) >= t.max_attempts THEN clock_timestamp()
+        WHEN (t.attempt_count - t.paused_attempts - t.released_attempts) >= t.max_attempts THEN clock_timestamp()
         ELSE t.finished_at
     END,
     terminal_reason = CASE
         WHEN t.status = 'cancel_requested' THEN 'cancelled'
         WHEN sealed.pause_active THEN NULL
-        WHEN (t.attempt_count - t.paused_attempts) >= t.max_attempts THEN 'attempts_exhausted'
+        WHEN (t.attempt_count - t.paused_attempts - t.released_attempts) >= t.max_attempts THEN 'attempts_exhausted'
         ELSE t.terminal_reason
     END,
     updated_at = clock_timestamp()

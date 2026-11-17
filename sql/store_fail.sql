@@ -22,14 +22,14 @@ UPDATE cloudiful_tasks.tasks AS t
 SET status = CASE
         WHEN t.status = 'cancel_requested' THEN 'cancelled'
         WHEN $7::boolean
-            AND (t.attempt_count - t.paused_attempts) < t.max_attempts THEN 'queued'
+            AND (t.attempt_count - t.paused_attempts - t.released_attempts) < t.max_attempts THEN 'queued'
         ELSE 'failed'
     END,
     pause_state = 'unpaused',
     available_at = CASE
         WHEN t.status = 'cancel_requested' THEN t.available_at
         WHEN $7::boolean
-            AND (t.attempt_count - t.paused_attempts) < t.max_attempts
+            AND (t.attempt_count - t.paused_attempts - t.released_attempts) < t.max_attempts
             THEN clock_timestamp() + ($8::bigint * interval '1 microsecond')
         ELSE t.available_at
     END,
@@ -37,13 +37,13 @@ SET status = CASE
     finished_at = CASE
         WHEN t.status = 'cancel_requested' THEN clock_timestamp()
         WHEN $7::boolean
-            AND (t.attempt_count - t.paused_attempts) < t.max_attempts THEN NULL
+            AND (t.attempt_count - t.paused_attempts - t.released_attempts) < t.max_attempts THEN NULL
         ELSE clock_timestamp()
     END,
     terminal_reason = CASE
         WHEN t.status = 'cancel_requested' THEN 'cancelled'
         WHEN $7::boolean
-            AND (t.attempt_count - t.paused_attempts) < t.max_attempts THEN NULL
+            AND (t.attempt_count - t.paused_attempts - t.released_attempts) < t.max_attempts THEN NULL
         ELSE 'failed'
     END,
     updated_at = clock_timestamp()

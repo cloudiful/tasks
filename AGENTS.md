@@ -34,7 +34,7 @@ Never reset a shared project database.
 Every mutating queue operation has a variant that takes the transaction of the
 caller: `enqueue_in`, `claim_in`, `renew_in`, `report_progress_in`,
 `complete_in`, `fail_in`, `request_cancel_in`, `request_pause_in`, `resume_in`,
-`park_paused_in`, `retry_failed_in`, `recover_expired_in` and
+`park_paused_in`, `release_in`, `retry_failed_in`, `recover_expired_in` and
 `recover_expired_by_id_in`.
 
 The variant takes a `&mut sea_orm::DatabaseTransaction` or a
@@ -100,9 +100,48 @@ and unclaimable. A running task enters `Pausing` until its attempt parks.
   the state with the existing cancellation poll interval.
 - `attempt_count` stays the monotonic physical total. `paused_attempts` counts
   only parked checkpoints, so every claim, failure, recovery and retry budget
-  uses `attempt_count - paused_attempts`. An expired attempt of a pausing or
-  paused task is sealed `paused` (unless a cancellation was requested) and
-  never consumes the failure budget.
+  uses `attempt_count - paused_attempts - released_attempts`. An expired
+  attempt of a pausing or paused task is sealed `paused` (unless a cancellation
+  was requested) and never consumes the failure budget.
+
+## Release of an owned attempt
+
+`release` and `release_in` hand the task of a stopped worker back to the queue.
+The queue has no configured worker identity, so the caller supplies its own
+execution identity as an explicit parameter, next to the attempt:
+`release(attempt, worker_id)` and `release_in(transaction, attempt, worker_id)`.
+
+- The identity of the caller is matched against the worker of the attempt
+  independently: it is never derived from the attempt itself. The attempt must
+  still run, its lease must not have expired, its fencing token must be the
+  current one and the worker of the row must be the identity of the caller. A
+  caller with another identity is refused with `LeaseLost` and changes
+  nothing, also when it read the attempt of another worker through
+  `Queue::attempts`. The identity is an application supplied execution
+  identity, not a cryptographic authentication boundary.
+- The locks are taken in task then attempt order, like `complete`, `fail` and
+  `park_paused`. `release_in` verifies the schema instance of the queue and
+  uses the transaction of the caller without beginning, committing or rolling
+  it back.
+- A genuine release seals the attempt `released` and queues the task with
+  `available_at = now()`, without a backoff, and notifies
+  `cloudiful_tasks_ready` in the same transaction, also when the task stays
+  paused. An exact replay of the same caller, owner and fence is read only: it
+  returns the current task, it never increments a counter and it never
+  notifies. A replay never authorizes a change of a newer execution.
+- A cancellation that was requested before the release wins and seals the
+  attempt `cancelled`, the task is not requeued and no notification is sent.
+  Otherwise a pausing task becomes `paused` and a paused task stays paused, so
+  a released task is not claimable while it is paused. A release never
+  increments `paused_attempts` and never unpauses a task.
+- `tasks.released_attempts` counts the released attempts, separately from
+  `paused_attempts`. The effective failure budget of a task is
+  `attempt_count - paused_attempts - released_attempts`, so a release spends no
+  budget, also with `max_attempts` of 1. The physical attempt count stays
+  monotonic and the attempt numbers are never reused.
+- The library never releases an attempt of a running worker. The caller must
+  stop and join the work before it releases the attempt. The fence of a
+  released attempt rejects every later write of that attempt.
 
 ## Queue policies and external terminals
 
@@ -117,8 +156,8 @@ keeps an expired attempt counted until it seals it.
 
 `Outcome::ExternallyCompleted` means the handler already committed the terminal
 of the captured attempt. The worker verifies the namespace, queue, task,
-attempt, fencing token and a sealed `succeeded`, `failed`, `cancelled` or
-`paused` status with `sql/store_attempt_sealed.sql`. Only a verified seal skips the worker
+attempt, fencing token and a sealed `succeeded`, `failed`, `cancelled`,
+`paused` or `released` status with `sql/store_attempt_sealed.sql`. Only a verified seal skips the worker
 terminal; an unsealed signal uses the normal failure write and a lost lease
 never touches a newer attempt.
 
