@@ -37,6 +37,7 @@ pub mod migrate;
 pub mod model;
 pub mod progress;
 pub mod queue;
+pub mod retention;
 mod sql;
 mod transaction;
 
@@ -66,6 +67,7 @@ pub use crate::queue::{
     MAX_ACTIVITY_LEASE_GRACE, MAX_ATTEMPT_LIMIT, MAX_LIST_LIMIT, MAX_RECOVERY_LIMIT,
     MAX_TASK_BATCH_SIZE, Queue, QueuePolicy,
 };
+pub use crate::retention::{MAX_RETENTION_LIMIT, RetentionConfig};
 pub use crate::transaction::TaskTransaction;
 pub use crate::wake::{WAKE_CHANNEL, WakeListener, Wakeup};
 pub use crate::worker::{Worker, WorkerBuilder};
