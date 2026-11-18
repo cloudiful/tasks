@@ -20,6 +20,7 @@ schema 中。本库不会自行执行任务：worker 运行时由应用显式启
 - 显式的 schema 初始化：包含归属标记、版本化的 schema 协议和迁移校验和验证，
 - 持久化队列存储：带幂等键的入队、带租约的领取、续租、进度、完成、失败、取消、
   手动重试、按任务的协作式暂停与恢复、自己持有的尝试的释放以及过期租约的恢复，
+- 按队列范围删除终态任务、有界的按年龄清理以及可选的终态任务保留运行器，
 - 持久化队列策略：可选地限制队列中同时运行的尝试数量，
 - worker 运行时：有界并发、租约心跳、协作式取消、过期租约恢复、唤醒通知、
   处理函数拥有的终态结果以及优雅停机。
@@ -68,10 +69,10 @@ check_schema(&db).await?;
 （`UnsupportedSchemaVersion`），不属于本库的 schema 不会被接管或覆盖。未成功完成的
 迁移记录属于脏迁移：`check_schema` 返回 `DirtyMigration`，且不会被重试。
 
-schema 协议版本 4 增加了任务的释放计数和尝试的 released 状态。该升级是追加式的，
-保留所有任务、尝试、载荷和租约。旧版本的二进制拒绝更新的协议版本，因此发布流程是
-先停止旧写入方，用新版本迁移，再启动新写入方。不支持混用协议版本，也不承诺在
-新版本写入之后回滚。
+schema 协议版本 5 增加了终态清理所需的部分索引。该升级是追加式的，保留所有任务、
+尝试、载荷和租约。旧版本的二进制拒绝更新的协议版本，因此发布流程是先停止旧写入方，
+用新版本迁移，再启动新写入方。不支持混用协议版本，也不承诺在新版本写入之后回滚。
+仍然固定在旧协议的消费者保持旧行为，这次 schema 变更不会升级它们。
 
 ### 队列
 
@@ -180,13 +181,56 @@ queue.release(claim.attempt(), "worker-1").await?;
 即使任务仍处于暂停状态；重放不会通知。库永远不会释放正在运行的 worker 的尝试：
 调用方必须先停止并等待工作结束。
 
+### 终态清理与可选保留
+
+可以显式删除单个终态任务，也可以让应用对队列中的终态任务运行有界的保留循环。
+
+```rust
+let deleted = queue.delete_terminal(task_id).await?;
+let pruned = queue
+    .prune_terminal(TaskStatus::Succeeded, Duration::from_secs(7 * 24 * 60 * 60), 100)
+    .await?;
+```
+
+`delete_terminal` 只删除该队列中的一个终态任务；任务不存在或不在队列范围内时返回
+`false`，仍在活动的任务返回 `InvalidTaskState`。`prune_terminal` 删除某个终态状态中
+`finished_at` 早于给定年龄的最旧任务，数量上限为 1 至 1000。两个操作都会锁定任务行，
+因此不会删除被并发重试或领取重新激活的任务。
+
+保留循环必须显式启动，并且是唯一的自动清理入口：
+
+```rust
+let config = cloudiful_tasks::RetentionConfig::new(Duration::from_secs(60 * 60), 100)?
+    .with_status(TaskStatus::Succeeded, Duration::from_secs(7 * 24 * 60 * 60))?
+    .with_status(TaskStatus::Failed, Duration::from_secs(30 * 24 * 60 * 60))?;
+
+let shutdown = CancellationToken::new();
+let runner = tokio::spawn({
+    let queue = queue.clone();
+    async move { queue.run_retention(config, shutdown.clone()).await }
+});
+// 之后：shutdown.cancel(); 并 join 该运行器。
+```
+
+在返回的 future 被轮询之前不会执行任何清理，第一个周期会先等待完整的间隔。每个周期
+总共最多删除 `max_per_cycle` 个任务，并在所有启用的状态中按全局最旧顺序选择，因此
+某个状态不会在另一个状态已经足够旧时耗尽全部预算。未配置年龄的状态永远不会被删除。
+取消在周期之间观察：正在执行的周期会完成其事务，然后调用返回 `Ok(())`。某个周期
+出错时会返回给调用方，由调用方负责任务、监督和日志。迁移、打开队列或启动 worker
+都不会自动启动保留清理。
+
+上面的年龄只是示例，不是库默认值。删除是永久的：载荷、结果和尝试历史都会消失，
+被删除的失败任务不能重试，之后的 `get` 返回 `None`，释放的幂等键可以创建新任务。
+队列范围不是授权边界；调用方负责授权，任何引用已删除任务的应用记录都必须容忍任务
+不存在。
+
 ### 事务 API
 
 每个写操作都有一个在调用方事务中运行的变体：`enqueue_in`、`claim_in`、
 `renew_in`、`report_progress_in`、`complete_in`、`fail_in`、
 `request_cancel_in`、`request_pause_in`、`resume_in`、`park_paused_in`、
-`release_in`、`retry_failed_in`、`recover_expired_in` 和
-`recover_expired_by_id_in`。
+`release_in`、`retry_failed_in`、`delete_terminal_in`、`prune_terminal_in`、
+`recover_expired_in` 和 `recover_expired_by_id_in`。
 
 ```rust
 use sea_orm::TransactionTrait;

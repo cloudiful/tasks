@@ -25,7 +25,7 @@ pub const SCHEMA_NAME: &str = "cloudiful_tasks";
 pub const LIBRARY_ID: &str = "cloudiful-tasks";
 
 /// Schema protocol version implemented by this build.
-pub const PROTOCOL_VERSION: i32 = 4;
+pub const PROTOCOL_VERSION: i32 = 5;
 
 /// Table holding the ownership marker of the schema.
 const OWNERSHIP_TABLE: &str = "schema_ownership";
@@ -74,6 +74,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 20261117221355,
         description: "task_release",
         sql: include_str!("../migrations/20261117221355_task_release.sql"),
+    },
+    Migration {
+        version: 20261118093609,
+        description: "terminal_retention",
+        sql: include_str!("../migrations/20261118093609_terminal_retention.sql"),
     },
 ];
 

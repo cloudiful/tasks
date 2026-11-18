@@ -27,6 +27,7 @@ use crate::model::{
     ProgressUpdate, QueueName, Task, TaskId, TaskKind, TaskPauseState, TaskStatus,
 };
 use crate::queue::QueuePolicy;
+use crate::retention::RetentionAges;
 use crate::sql;
 
 const MARKER_PRESENT: &str = include_str!("../sql/store_marker_present.sql");
@@ -57,6 +58,8 @@ const PARK_PAUSED: &str = include_str!("../sql/store_park_paused.sql");
 const RELEASE: &str = include_str!("../sql/store_release.sql");
 const ATTEMPT_RELEASED: &str = include_str!("../sql/store_attempt_released.sql");
 const RECOVER_EXPIRED: &str = include_str!("../sql/store_recover_expired.sql");
+const DELETE_TERMINAL: &str = include_str!("../sql/store_delete_terminal.sql");
+const PRUNE_TERMINAL: &str = include_str!("../sql/store_prune_terminal.sql");
 
 /// Checks that a connection belongs to the schema instance of the queue.
 ///
@@ -809,6 +812,78 @@ pub(crate) async fn retry_failed_task<C: ConnectionTrait>(
         }),
         None => Err(Error::NotFound),
     }
+}
+
+/// Deletes one terminal task of the queue.
+///
+/// The task row is locked before its status is read, so a concurrent retry or
+/// claim either completes before the check or waits for the deletion. A task
+/// that is absent or out of scope yields `false`, an active task of the scope
+/// is refused and a terminal task is deleted with its attempt history.
+pub(crate) async fn delete_terminal_task<C: ConnectionTrait>(
+    connection: &C,
+    namespace: &Namespace,
+    queue: &QueueName,
+    task_id: TaskId,
+) -> Result<bool> {
+    let task = match lock_task(connection, namespace, queue, task_id).await {
+        Ok(task) => task,
+        Err(Error::NotFound) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !task.status().is_terminal() {
+        return Err(Error::InvalidTaskState {
+            task_id: task_id.as_uuid(),
+            status: task.status().to_string(),
+            action: "deleted",
+        });
+    }
+    let result = connection
+        .execute_raw(sql::statement(
+            DELETE_TERMINAL,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                task_id.as_uuid().into(),
+            ],
+        ))
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Deletes a bounded batch of old terminal tasks, globally oldest first.
+///
+/// Every optional age is a microsecond cutoff before the clock of the
+/// database. The candidate rows are locked with `FOR UPDATE SKIP LOCKED`
+/// before they are deleted, so concurrent retention instances skip a locked
+/// row instead of blocking on it.
+pub(crate) async fn prune_terminal_tasks<C: ConnectionTrait>(
+    connection: &C,
+    namespace: &Namespace,
+    queue: &QueueName,
+    ages: RetentionAges,
+    limit: u32,
+) -> Result<Vec<TaskId>> {
+    let rows = connection
+        .query_all_raw(sql::statement(
+            PRUNE_TERMINAL,
+            vec![
+                namespace.as_str().into(),
+                queue.as_str().into(),
+                ages.succeeded.into(),
+                ages.failed.into(),
+                ages.cancelled.into(),
+                i64::from(limit).into(),
+            ],
+        ))
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            row.try_get_by::<Uuid, usize>(0)
+                .map(TaskId::from_uuid)
+                .map_err(Error::from)
+        })
+        .collect()
 }
 
 /// Requests the cooperative pause of one task.

@@ -25,6 +25,8 @@ the fencing token of the attempt.
   renewal, progress, completion, failure, cancellation, manual retry,
   cooperative per-task pause and resume, release of an owned attempt, and
   recovery of expired leases,
+- scoped deletion of a terminal task, bounded age pruning and an opt-in
+  retention runner for terminal tasks,
 - durable queue policies with an optional limit on running attempts,
 - the worker runtime: bounded concurrency, lease heartbeat, cooperative
   cancellation, recovery of expired leases, wake up notifications, a
@@ -80,12 +82,13 @@ that the library does not own is never adopted or overwritten. A ledger row that
 did not complete successfully is a dirty migration: it is reported as
 `DirtyMigration` and never retried.
 
-The schema protocol version 4 adds the release counter of a task and the
-released state of an attempt. The upgrade is additive and keeps every task,
-attempt, payload and lease. A binary of an older version refuses a schema of a
-newer protocol version, so a rollout stops the old writers, migrates with the
-new version and starts the new writers. Mixed protocol versions are not
-supported and a rollback after the new version wrote is not promised.
+The schema protocol version 5 adds the partial index of the terminal cleanup.
+The upgrade is additive and keeps every task, attempt, payload and lease. A
+binary of an older version refuses a schema of a newer protocol version, so a
+rollout stops the old writers, migrates with the new version and starts the new
+writers. Mixed protocol versions are not supported and a rollback after the new
+version wrote is not promised. A consumer that stays pinned to an older protocol
+keeps its old behavior; it is not upgraded by this schema change.
 
 ### The queue
 
@@ -210,13 +213,65 @@ paused and unclaimable. A genuine release notifies the workers, also when the
 task stays paused; a replay never notifies. The library never releases an
 attempt of a running worker: the caller must stop and join the work first.
 
+### Terminal cleanup and opt-in retention
+
+A terminal task can be deleted explicitly, or an application can run a bounded
+retention loop over the terminal tasks of a queue.
+
+```rust
+let deleted = queue.delete_terminal(task_id).await?;
+let pruned = queue
+    .prune_terminal(TaskStatus::Succeeded, Duration::from_secs(7 * 24 * 60 * 60), 100)
+    .await?;
+```
+
+`delete_terminal` deletes exactly one terminal task of the queue and reports
+`false` for an absent or out-of-scope task. A task that is still active is
+refused with `InvalidTaskState`. `prune_terminal` deletes the oldest tasks of
+one terminal status whose `finished_at` is older than the given age, up to the
+limit of 1 through 1000. Both operations lock the task rows, so they never
+delete a task that a concurrent retry or claim reactivated.
+
+A retention loop is started explicitly and is the only automatic cleanup entry
+point:
+
+```rust
+let config = cloudiful_tasks::RetentionConfig::new(Duration::from_secs(60 * 60), 100)?
+    .with_status(TaskStatus::Succeeded, Duration::from_secs(7 * 24 * 60 * 60))?
+    .with_status(TaskStatus::Failed, Duration::from_secs(30 * 24 * 60 * 60))?;
+
+let shutdown = CancellationToken::new();
+let runner = tokio::spawn({
+    let queue = queue.clone();
+    async move { queue.run_retention(config, shutdown.clone()).await }
+});
+// Later: shutdown.cancel(); and join the runner.
+```
+
+Nothing runs before the returned future is polled, and the first cycle waits a
+full interval. A cycle deletes at most `max_per_cycle` tasks in total and
+chooses the globally oldest eligible tasks across the enabled statuses, so one
+status never spends the whole budget while another is old enough for deletion.
+A status without a configured age is never deleted. Cancellation is observed
+between cycles: the running cycle finishes its transaction and the call returns
+`Ok(())`. An error of a cycle is returned to the caller, which owns the task,
+supervision and logging. No retention starts on migration, on opening a queue
+or with a worker.
+
+The ages above are examples, not library defaults. Deletion is permanent: the
+payload, the result and the attempt history disappear, a deleted failure cannot
+be retried, a later `get` reports `None`, and the freed idempotency key can
+create a new task. The queue scope is not an authorization boundary; the caller
+owns authorization and any application record that references a deleted task
+must tolerate the missing task.
+
 ### The transaction API
 
 Every mutating operation has a variant that runs inside the transaction of the
 caller: `enqueue_in`, `claim_in`, `renew_in`, `report_progress_in`,
 `complete_in`, `fail_in`, `request_cancel_in`, `request_pause_in`, `resume_in`,
-`park_paused_in`, `release_in`, `retry_failed_in`, `recover_expired_in` and
-`recover_expired_by_id_in`.
+`park_paused_in`, `release_in`, `retry_failed_in`, `delete_terminal_in`,
+`prune_terminal_in`, `recover_expired_in` and `recover_expired_by_id_in`.
 
 ```rust
 use sea_orm::TransactionTrait;

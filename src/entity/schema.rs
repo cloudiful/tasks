@@ -334,6 +334,17 @@ pub fn indexes(schema: &str) -> Vec<IndexCreateStatement> {
             .col(("id", IndexOrder::Desc))
             .to_owned(),
         Index::create()
+            .name("tasks_terminal_finished_idx")
+            .table((schema.clone(), "tasks"))
+            .col("namespace")
+            .col("queue")
+            .col("finished_at")
+            .col("id")
+            .and_where(Expr::cust(
+                "status IN ('succeeded', 'failed', 'cancelled') AND finished_at IS NOT NULL",
+            ))
+            .to_owned(),
+        Index::create()
             .name("attempts_one_active_per_task")
             .unique()
             .table((schema.clone(), "attempts"))

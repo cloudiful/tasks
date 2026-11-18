@@ -11,6 +11,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, TransactionTrait};
 use serde_json::Value;
 use std::time::Duration;
 use time::OffsetDateTime;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::backoff;
@@ -19,7 +20,10 @@ use crate::error::{Error, Result};
 use crate::migrate::check_schema;
 use crate::model::{
     Attempt, Claim, EnqueueOutcome, EnqueueRequest, Failure, ListCursor, Namespace, ProgressUpdate,
-    QueueName, Task, TaskId, TaskKind, validate_idempotency_key,
+    QueueName, Task, TaskId, TaskKind, TaskStatus, validate_idempotency_key,
+};
+use crate::retention::{
+    MAX_RETENTION_LIMIT, RetentionAges, RetentionConfig, retention_micros, validate_terminal_status,
 };
 use crate::transaction::TaskTransaction;
 use crate::{idempotency, progress, store};
@@ -912,6 +916,148 @@ impl Queue {
             .await
     }
 
+    /// Deletes one terminal task of the queue.
+    ///
+    /// Only a task whose status is succeeded, failed or cancelled is deleted.
+    /// A task of the queue that is still active is refused with
+    /// [`Error::InvalidTaskState`], and a task that is absent or belongs to
+    /// another namespace or queue is reported as `false`. A repeated deletion
+    /// is therefore harmless.
+    ///
+    /// The task row is locked for update before its status is read and the
+    /// row is deleted, so a concurrent retry or claim either completes before
+    /// the check or waits for the deletion. The attempt history of the task is
+    /// removed by the foreign key cascade.
+    ///
+    /// The deletion is permanent: the payload, the result and the attempt
+    /// history disappear, a deleted failure cannot be retried and its
+    /// idempotency key becomes free for a later enqueue.
+    pub async fn delete_terminal(&self, task_id: TaskId) -> Result<bool> {
+        let transaction = self.db.begin().await?;
+        let outcome = self.delete_terminal_on(&transaction, task_id).await;
+        match outcome {
+            Ok(deleted) => {
+                transaction.commit().await?;
+                Ok(deleted)
+            }
+            Err(error) => {
+                transaction.rollback().await.ok();
+                Err(error)
+            }
+        }
+    }
+
+    /// Deletes one terminal task in the transaction of the caller.
+    ///
+    /// The deletion is only durable when the caller commits the transaction.
+    /// The transaction must belong to the schema instance of this queue,
+    /// otherwise the call is refused. The status and scope rules are the same
+    /// as [`Queue::delete_terminal`].
+    pub async fn delete_terminal_in(
+        &self,
+        transaction: impl Into<TaskTransaction<'_>>,
+        task_id: TaskId,
+    ) -> Result<bool> {
+        let transaction = transaction.into();
+        self.delete_terminal_on(transaction.connection(), task_id)
+            .await
+    }
+
+    /// Deletes a bounded batch of old terminal tasks of one status.
+    ///
+    /// The status must be succeeded, failed or cancelled. A task is eligible
+    /// when it carries that status and its `finished_at` is older than
+    /// `older_than` before the clock of the database; a terminal task without
+    /// `finished_at` is never eligible. The oldest eligible tasks are locked
+    /// with `FOR UPDATE SKIP LOCKED` and deleted in one transaction, so
+    /// concurrent retention instances skip the same rows instead of blocking.
+    ///
+    /// The limit must be between 1 and [`MAX_RETENTION_LIMIT`]. The result
+    /// holds the identifiers of the deleted tasks ordered by `finished_at` and
+    /// id. A full batch does not promise that no further candidate remains.
+    ///
+    /// The deletion has the permanent effects of [`Queue::delete_terminal`].
+    pub async fn prune_terminal(
+        &self,
+        status: TaskStatus,
+        older_than: Duration,
+        limit: u32,
+    ) -> Result<Vec<TaskId>> {
+        let ages = prune_ages(status, older_than)?;
+        let limit = validate_limit(limit, MAX_RETENTION_LIMIT, "limit")?;
+        let transaction = self.db.begin().await?;
+        let outcome = self.prune_terminal_on(&transaction, ages, limit).await;
+        match outcome {
+            Ok(deleted) => {
+                transaction.commit().await?;
+                Ok(deleted)
+            }
+            Err(error) => {
+                transaction.rollback().await.ok();
+                Err(error)
+            }
+        }
+    }
+
+    /// Deletes old terminal tasks of one status in the transaction of the
+    /// caller.
+    ///
+    /// The deletion is only durable when the caller commits the transaction.
+    /// The transaction must belong to the schema instance of this queue,
+    /// otherwise the call is refused. The selection and the permanent effects
+    /// are the same as [`Queue::prune_terminal`].
+    pub async fn prune_terminal_in(
+        &self,
+        transaction: impl Into<TaskTransaction<'_>>,
+        status: TaskStatus,
+        older_than: Duration,
+        limit: u32,
+    ) -> Result<Vec<TaskId>> {
+        let ages = prune_ages(status, older_than)?;
+        let limit = validate_limit(limit, MAX_RETENTION_LIMIT, "limit")?;
+        let transaction = transaction.into();
+        self.prune_terminal_on(transaction.connection(), ages, limit)
+            .await
+    }
+
+    /// Runs the opt-in retention of terminal tasks until the token is
+    /// cancelled.
+    ///
+    /// Nothing is deleted before a full interval elapsed. Each following cycle
+    /// deletes at most [`RetentionConfig::max_per_cycle`] tasks in total across
+    /// the enabled statuses, choosing the globally oldest eligible tasks, so a
+    /// single enabled status never spends the whole budget while another is
+    /// old enough for deletion.
+    ///
+    /// Cancellation is observed between cycles: a running cycle completes its
+    /// transaction and the call then returns `Ok(())`. An error of any cycle is
+    /// returned to the caller and the caller owns the future, its supervision
+    /// and any logging. The library starts no retention on migration, on
+    /// opening a queue or with a worker.
+    pub async fn run_retention(
+        &self,
+        config: RetentionConfig,
+        shutdown: CancellationToken,
+    ) -> Result<()> {
+        config.validate()?;
+        let ages = config.ages()?;
+        let interval = config.interval();
+        let limit = config.max_per_cycle();
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(interval) => {}
+            }
+            if shutdown.is_cancelled() {
+                return Ok(());
+            }
+            self.prune_terminal_on(&self.db, ages, limit).await?;
+            if shutdown.is_cancelled() {
+                return Ok(());
+            }
+        }
+    }
+
     /// Seals the attempts whose lease expired and schedules their tasks again.
     ///
     /// The pass is bounded and only touches the tasks of this queue. A task
@@ -1099,6 +1245,25 @@ impl Queue {
         .await
     }
 
+    async fn delete_terminal_on<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+        task_id: TaskId,
+    ) -> Result<bool> {
+        self.verify_instance(connection).await?;
+        store::delete_terminal_task(connection, &self.namespace, &self.queue, task_id).await
+    }
+
+    async fn prune_terminal_on<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+        ages: RetentionAges,
+        limit: u32,
+    ) -> Result<Vec<TaskId>> {
+        self.verify_instance(connection).await?;
+        store::prune_terminal_tasks(connection, &self.namespace, &self.queue, ages, limit).await
+    }
+
     async fn recover_expired_on<C: ConnectionTrait>(
         &self,
         connection: &C,
@@ -1153,6 +1318,12 @@ fn validate_limit(limit: u32, max: u32, field: &'static str) -> Result<u32> {
         });
     }
     Ok(limit)
+}
+
+fn prune_ages(status: TaskStatus, older_than: Duration) -> Result<RetentionAges> {
+    let status = validate_terminal_status(status)?;
+    let micros = retention_micros(older_than, "older_than")?;
+    Ok(RetentionAges::from_status(status, micros))
 }
 
 fn validate_task_ids(task_ids: &[TaskId]) -> Result<Vec<Uuid>> {
@@ -1241,5 +1412,17 @@ mod tests {
         assert!(validate_lease_grace(Duration::from_micros(1)).is_ok());
         assert!(validate_lease_grace(MAX_ACTIVITY_LEASE_GRACE).is_ok());
         assert!(validate_lease_grace(MAX_ACTIVITY_LEASE_GRACE + Duration::from_micros(1)).is_err());
+    }
+
+    #[test]
+    fn manual_pruning_accepts_only_terminal_statuses_and_positive_ages() {
+        let ages = prune_ages(TaskStatus::Failed, Duration::from_micros(2_500)).unwrap();
+        assert_eq!(ages.failed, Some(2_500));
+        assert_eq!(ages.succeeded, None);
+        assert_eq!(ages.cancelled, None);
+
+        assert!(prune_ages(TaskStatus::Queued, Duration::from_secs(60)).is_err());
+        assert!(prune_ages(TaskStatus::Failed, Duration::ZERO).is_err());
+        assert!(prune_ages(TaskStatus::Failed, Duration::from_nanos(1)).is_err());
     }
 }
