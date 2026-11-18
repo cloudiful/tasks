@@ -820,7 +820,7 @@ pub(crate) async fn retry_failed_task<C: ConnectionTrait>(
 /// claim either completes before the check or waits for the deletion. A task
 /// that is absent or out of scope yields `false`, an active task of the scope
 /// is refused and a terminal task is deleted with its attempt history.
-pub(crate) async fn delete_terminal_task<C: ConnectionTrait>(
+pub(crate) async fn delete_task<C: ConnectionTrait>(
     connection: &C,
     namespace: &Namespace,
     queue: &QueueName,

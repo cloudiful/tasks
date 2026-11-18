@@ -932,9 +932,9 @@ impl Queue {
     /// The deletion is permanent: the payload, the result and the attempt
     /// history disappear, a deleted failure cannot be retried and its
     /// idempotency key becomes free for a later enqueue.
-    pub async fn delete_terminal(&self, task_id: TaskId) -> Result<bool> {
+    pub async fn delete(&self, task_id: TaskId) -> Result<bool> {
         let transaction = self.db.begin().await?;
-        let outcome = self.delete_terminal_on(&transaction, task_id).await;
+        let outcome = self.delete_on(&transaction, task_id).await;
         match outcome {
             Ok(deleted) => {
                 transaction.commit().await?;
@@ -952,15 +952,14 @@ impl Queue {
     /// The deletion is only durable when the caller commits the transaction.
     /// The transaction must belong to the schema instance of this queue,
     /// otherwise the call is refused. The status and scope rules are the same
-    /// as [`Queue::delete_terminal`].
-    pub async fn delete_terminal_in(
+    /// as [`Queue::delete`].
+    pub async fn delete_in(
         &self,
         transaction: impl Into<TaskTransaction<'_>>,
         task_id: TaskId,
     ) -> Result<bool> {
         let transaction = transaction.into();
-        self.delete_terminal_on(transaction.connection(), task_id)
-            .await
+        self.delete_on(transaction.connection(), task_id).await
     }
 
     /// Deletes a bounded batch of old terminal tasks of one status.
@@ -976,7 +975,7 @@ impl Queue {
     /// holds the identifiers of the deleted tasks ordered by `finished_at` and
     /// id. A full batch does not promise that no further candidate remains.
     ///
-    /// The deletion has the permanent effects of [`Queue::delete_terminal`].
+    /// The deletion has the permanent effects of [`Queue::delete`].
     pub async fn prune_terminal(
         &self,
         status: TaskStatus,
@@ -1245,13 +1244,9 @@ impl Queue {
         .await
     }
 
-    async fn delete_terminal_on<C: ConnectionTrait>(
-        &self,
-        connection: &C,
-        task_id: TaskId,
-    ) -> Result<bool> {
+    async fn delete_on<C: ConnectionTrait>(&self, connection: &C, task_id: TaskId) -> Result<bool> {
         self.verify_instance(connection).await?;
-        store::delete_terminal_task(connection, &self.namespace, &self.queue, task_id).await
+        store::delete_task(connection, &self.namespace, &self.queue, task_id).await
     }
 
     async fn prune_terminal_on<C: ConnectionTrait>(

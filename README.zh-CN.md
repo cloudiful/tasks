@@ -186,13 +186,13 @@ queue.release(claim.attempt(), "worker-1").await?;
 可以显式删除单个终态任务，也可以让应用对队列中的终态任务运行有界的保留循环。
 
 ```rust
-let deleted = queue.delete_terminal(task_id).await?;
+let deleted = queue.delete(task_id).await?;
 let pruned = queue
     .prune_terminal(TaskStatus::Succeeded, Duration::from_secs(7 * 24 * 60 * 60), 100)
     .await?;
 ```
 
-`delete_terminal` 只删除该队列中的一个终态任务；任务不存在或不在队列范围内时返回
+`delete` 只删除该队列中的一个终态任务；任务不存在或不在队列范围内时返回
 `false`，仍在活动的任务返回 `InvalidTaskState`。`prune_terminal` 删除某个终态状态中
 `finished_at` 早于给定年龄的最旧任务，数量上限为 1 至 1000。两个操作都会锁定任务行，
 因此不会删除被并发重试或领取重新激活的任务。
@@ -229,7 +229,7 @@ let runner = tokio::spawn({
 每个写操作都有一个在调用方事务中运行的变体：`enqueue_in`、`claim_in`、
 `renew_in`、`report_progress_in`、`complete_in`、`fail_in`、
 `request_cancel_in`、`request_pause_in`、`resume_in`、`park_paused_in`、
-`release_in`、`retry_failed_in`、`delete_terminal_in`、`prune_terminal_in`、
+`release_in`、`retry_failed_in`、`delete_in`、`prune_terminal_in`、
 `recover_expired_in` 和 `recover_expired_by_id_in`。
 
 ```rust

@@ -219,13 +219,13 @@ A terminal task can be deleted explicitly, or an application can run a bounded
 retention loop over the terminal tasks of a queue.
 
 ```rust
-let deleted = queue.delete_terminal(task_id).await?;
+let deleted = queue.delete(task_id).await?;
 let pruned = queue
     .prune_terminal(TaskStatus::Succeeded, Duration::from_secs(7 * 24 * 60 * 60), 100)
     .await?;
 ```
 
-`delete_terminal` deletes exactly one terminal task of the queue and reports
+`delete` deletes exactly one terminal task of the queue and reports
 `false` for an absent or out-of-scope task. A task that is still active is
 refused with `InvalidTaskState`. `prune_terminal` deletes the oldest tasks of
 one terminal status whose `finished_at` is older than the given age, up to the
@@ -270,7 +270,7 @@ must tolerate the missing task.
 Every mutating operation has a variant that runs inside the transaction of the
 caller: `enqueue_in`, `claim_in`, `renew_in`, `report_progress_in`,
 `complete_in`, `fail_in`, `request_cancel_in`, `request_pause_in`, `resume_in`,
-`park_paused_in`, `release_in`, `retry_failed_in`, `delete_terminal_in`,
+`park_paused_in`, `release_in`, `retry_failed_in`, `delete_in`,
 `prune_terminal_in`, `recover_expired_in` and `recover_expired_by_id_in`.
 
 ```rust
